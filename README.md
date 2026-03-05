@@ -97,6 +97,9 @@ Starter template:
 output_dir = "~/houseofagents-output"
 default_max_tokens = 4096
 max_history_messages = 50
+http_timeout_seconds = 120
+model_fetch_timeout_seconds = 30
+cli_timeout_seconds = 300
 
 # Optional: set one diagnostics provider ("anthropic", "openai", "gemini")
 # diagnostic_provider = "openai"
@@ -150,6 +153,9 @@ Field notes:
 - `output_dir`: base directory for run folders.
 - `default_max_tokens`: request token budget sent to providers.
 - `max_history_messages`: max chat history kept per provider session.
+- `http_timeout_seconds`: timeout for provider API calls (`use_cli = false`).
+- `model_fetch_timeout_seconds`: timeout for model list fetch in config editor.
+- `cli_timeout_seconds`: timeout for provider CLI calls (`use_cli = true`).
 - `use_cli = true`: use local CLI binary instead of HTTP API.
 - `extra_cli_args`: single raw string appended as one extra CLI argument.
 - `reasoning_effort`: OpenAI-only effort setting (`low|medium|high`).

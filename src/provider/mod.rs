@@ -91,6 +91,7 @@ pub fn create_provider(
     client: reqwest::Client,
     max_tokens: u32,
     max_history_messages: usize,
+    cli_timeout_seconds: u64,
 ) -> Box<dyn Provider> {
     if config.use_cli {
         return Box::new(cli::CliProvider::new(
@@ -100,6 +101,7 @@ pub fn create_provider(
             config.thinking_effort.clone(),
             config.extra_cli_args.clone(),
             vec![],
+            cli_timeout_seconds,
             max_history_messages,
         ));
     }

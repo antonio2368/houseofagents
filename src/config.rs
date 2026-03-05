@@ -10,6 +10,12 @@ pub struct AppConfig {
     pub default_max_tokens: u32,
     #[serde(default = "default_max_history_messages")]
     pub max_history_messages: usize,
+    #[serde(default = "default_http_timeout_seconds")]
+    pub http_timeout_seconds: u64,
+    #[serde(default = "default_model_fetch_timeout_seconds")]
+    pub model_fetch_timeout_seconds: u64,
+    #[serde(default = "default_cli_timeout_seconds")]
+    pub cli_timeout_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic_provider: Option<String>,
     #[serde(default)]
@@ -42,6 +48,18 @@ fn default_max_tokens() -> u32 {
 
 fn default_max_history_messages() -> usize {
     50
+}
+
+fn default_http_timeout_seconds() -> u64 {
+    120
+}
+
+fn default_model_fetch_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_cli_timeout_seconds() -> u64 {
+    300
 }
 
 impl AppConfig {
@@ -120,6 +138,9 @@ impl AppConfig {
 output_dir = "~/houseofagents-output"
 default_max_tokens = 4096
 max_history_messages = 50
+http_timeout_seconds = 120
+model_fetch_timeout_seconds = 30
+cli_timeout_seconds = 300
 
 # Optional: set one diagnostics provider ("anthropic", "openai", "gemini")
 # diagnostic_provider = "openai"

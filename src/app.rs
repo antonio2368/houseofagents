@@ -87,6 +87,7 @@ pub struct App {
 
     // Help popup
     pub show_help_popup: bool,
+    pub help_popup_scroll: u16,
 
     // Error modal
     pub error_modal: Option<String>,
@@ -224,6 +225,7 @@ impl App {
             config_save_rx: None,
             cli_available,
             show_help_popup: false,
+            help_popup_scroll: 0,
             error_modal: None,
             progress_rx: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),

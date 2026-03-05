@@ -62,7 +62,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Help popup overlay
     if app.show_help_popup {
-        draw_help_popup(f);
+        draw_help_popup(f, app);
     }
 
     // Edit popup overlay
@@ -224,28 +224,47 @@ fn help_lines() -> &'static [Line<'static>] {
             Line::from("  Best for: comparing models head-to-head, getting"),
             Line::from("  diverse independent answers to the same question."),
             Line::from(""),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Press any key to close",
-                Style::default().fg(Color::DarkGray),
-            )),
         ]
     });
     &LINES
 }
 
-fn draw_help_popup(f: &mut Frame) {
+fn draw_help_popup(f: &mut Frame, app: &App) {
     let area = centered_rect(70, 70, f.area());
     let block = Block::default()
         .title(" Execution Modes ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
+    f.render_widget(ratatui::widgets::Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    let content_height = sections[0].height as usize;
+    let max_scroll = help_lines().len().saturating_sub(content_height);
+    let scroll = (app.help_popup_scroll as usize).min(max_scroll) as u16;
+
     let text = Paragraph::new(help_lines().to_vec())
         .wrap(Wrap { trim: false })
-        .block(block);
-    f.render_widget(ratatui::widgets::Clear, area);
-    f.render_widget(text, area);
+        .scroll((scroll, 0));
+    f.render_widget(text, sections[0]);
+
+    let help = Paragraph::new(Line::from(vec![
+        Span::styled("j/k, arrows, PgUp/PgDn", Style::default().fg(Color::Yellow)),
+        Span::raw(": scroll  "),
+        Span::styled("Esc/q/?", Style::default().fg(Color::Yellow)),
+        Span::raw(": close"),
+    ]));
+    f.render_widget(help, sections[1]);
 }
 
 fn draw_edit_popup(f: &mut Frame, app: &App) {

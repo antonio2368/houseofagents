@@ -17,6 +17,7 @@ pub struct CliProvider {
     add_dirs: Vec<String>,
     session_id: Option<String>,
     session_started: bool,
+    timeout_seconds: u64,
     max_history_messages: usize,
     history: Vec<Message>,
 }
@@ -29,6 +30,7 @@ impl CliProvider {
         thinking_effort: Option<String>,
         extra_cli_args: String,
         add_dirs: Vec<String>,
+        timeout_seconds: u64,
         max_history_messages: usize,
     ) -> Self {
         Self {
@@ -43,6 +45,7 @@ impl CliProvider {
                 _ => None,
             },
             session_started: false,
+            timeout_seconds: timeout_seconds.max(1),
             max_history_messages,
             history: Vec::new(),
         }
@@ -249,9 +252,13 @@ impl Provider for CliProvider {
             // Drop stdin to close it, signaling EOF
         }
 
-        // 5-minute timeout
         let output =
-            match tokio::time::timeout(Duration::from_secs(300), child.wait_with_output()).await {
+            match tokio::time::timeout(
+                Duration::from_secs(self.timeout_seconds),
+                child.wait_with_output(),
+            )
+            .await
+            {
                 Ok(Ok(output)) => output,
                 Ok(Err(e)) => {
                     return Err(AppError::Provider {
@@ -262,7 +269,7 @@ impl Provider for CliProvider {
                 Err(_) => {
                     return Err(AppError::Provider {
                         provider: bin.to_string(),
-                        message: "Timed out after 5 minutes".into(),
+                        message: format!("Timed out after {} seconds", self.timeout_seconds),
                     })
                 }
             };

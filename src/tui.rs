@@ -130,9 +130,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Dismiss help popup with any key
+    // Help popup has dedicated scroll + close handling
     if app.show_help_popup {
-        app.show_help_popup = false;
+        handle_help_popup_key(app, key);
         return;
     }
 
@@ -156,6 +156,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => {
             app.show_help_popup = true;
+            app.help_popup_scroll = 0;
         }
         KeyCode::Char('e') => {
             app.show_edit_popup = true;
@@ -215,6 +216,33 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_help_popup_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') => {
+            app.show_help_popup = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.help_popup_scroll = app.help_popup_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.help_popup_scroll = app.help_popup_scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => {
+            app.help_popup_scroll = app.help_popup_scroll.saturating_sub(8);
+        }
+        KeyCode::PageDown => {
+            app.help_popup_scroll = app.help_popup_scroll.saturating_add(8);
+        }
+        KeyCode::Home => {
+            app.help_popup_scroll = 0;
+        }
+        KeyCode::End => {
+            app.help_popup_scroll = u16::MAX;
+        }
+        _ => {}
+    }
+}
+
 fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
@@ -249,7 +277,7 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('r')
             if app.selected_mode != ExecutionMode::Solo
-                && app.prompt_focus != PromptFocus::Text =>
+                && app.prompt_focus == PromptFocus::Iterations =>
         {
             app.resume_previous = !app.resume_previous;
         }
@@ -746,8 +774,9 @@ fn start_model_fetch(app: &mut App) {
 
     let (tx, rx) = mpsc::unbounded_channel();
     app.model_picker_rx = Some(rx);
+    let timeout_secs = app.config.model_fetch_timeout_seconds.max(1);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(timeout_secs))
         .build()
         .expect("Failed to create HTTP client");
 
@@ -1020,7 +1049,7 @@ fn start_execution(app: &mut App) {
     };
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(config.http_timeout_seconds.max(1)))
         .build()
         .expect("Failed to create HTTP client");
 
@@ -1069,6 +1098,7 @@ fn start_execution(app: &mut App) {
             client.clone(),
             config.default_max_tokens,
             config.max_history_messages,
+            config.cli_timeout_seconds,
         ));
     }
 
@@ -1526,7 +1556,7 @@ fn start_consolidation(app: &mut App) {
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(app.config.http_timeout_seconds.max(1)))
         .build()
         .expect("Failed to create HTTP client");
 
@@ -1536,6 +1566,7 @@ fn start_consolidation(app: &mut App) {
         client,
         app.config.default_max_tokens,
         app.config.max_history_messages,
+        app.config.cli_timeout_seconds,
     );
 
     app.progress_events.push(ProgressEvent::AgentStarted {
@@ -1664,7 +1695,7 @@ fn maybe_start_diagnostics(app: &mut App) {
     let prompt = build_diagnostic_prompt(&report_files, &app_errors, pconfig.use_cli);
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(app.config.http_timeout_seconds.max(1)))
         .build()
         .expect("Failed to create HTTP client");
     let provider = provider::create_provider(
@@ -1673,6 +1704,7 @@ fn maybe_start_diagnostics(app: &mut App) {
         client,
         app.config.default_max_tokens,
         app.config.max_history_messages,
+        app.config.cli_timeout_seconds,
     );
 
     app.progress_events.push(ProgressEvent::AgentLog {
