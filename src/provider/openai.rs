@@ -33,6 +33,46 @@ impl OpenAIProvider {
     }
 }
 
+fn extract_content(resp_body: &serde_json::Value) -> Result<String, AppError> {
+    let choices = resp_body
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AppError::Provider {
+            provider: "OpenAI".into(),
+            message: "Missing `choices` array in response".into(),
+        })?;
+
+    for choice in choices {
+        let content = choice
+            .get("message")
+            .and_then(|msg| msg.get("content"))
+            .ok_or_else(|| AppError::Provider {
+                provider: "OpenAI".into(),
+                message: "Missing `message.content` in response choice".into(),
+            })?;
+
+        if let Some(text) = content.as_str() {
+            return Ok(text.to_string());
+        }
+
+        if let Some(parts) = content.as_array() {
+            let joined = parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .concat();
+            if !joined.is_empty() {
+                return Ok(joined);
+            }
+        }
+    }
+
+    Err(AppError::Provider {
+        provider: "OpenAI".into(),
+        message: "No text content found in response".into(),
+    })
+}
+
 #[async_trait]
 impl Provider for OpenAIProvider {
     fn kind(&self) -> ProviderKind {
@@ -98,10 +138,7 @@ impl Provider for OpenAIProvider {
                 message: format!("Failed to parse response: {e}"),
             })?;
 
-        let content = resp_body["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let content = extract_content(&resp_body)?;
 
         self.history.push(Message {
             role: Role::Assistant,
@@ -147,4 +184,55 @@ pub async fn list_models(api_key: &str, client: &reqwest::Client) -> Result<Vec<
 
     entries.sort_by(|a, b| b.1.cmp(&a.1));
     Ok(entries.into_iter().map(|(id, _)| id).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_content;
+    use serde_json::json;
+
+    #[test]
+    fn extract_content_reads_string_content() {
+        let body = json!({
+            "choices": [
+                { "message": { "content": "answer" } }
+            ]
+        });
+        let content = extract_content(&body).expect("extract");
+        assert_eq!(content, "answer");
+    }
+
+    #[test]
+    fn extract_content_reads_text_parts_array() {
+        let body = json!({
+            "choices": [
+                { "message": { "content": [
+                    { "type": "output_text", "text": "part 1 "},
+                    { "type": "output_text", "text": "part 2"}
+                ] } }
+            ]
+        });
+        let content = extract_content(&body).expect("extract");
+        assert_eq!(content, "part 1 part 2");
+    }
+
+    #[test]
+    fn extract_content_errors_when_choices_missing() {
+        let body = json!({});
+        let err = extract_content(&body).expect_err("expected error");
+        assert!(err.to_string().contains("Missing `choices` array"));
+    }
+
+    #[test]
+    fn extract_content_errors_when_no_text() {
+        let body = json!({
+            "choices": [
+                { "message": { "content": [] } }
+            ]
+        });
+        let err = extract_content(&body).expect_err("expected error");
+        assert!(err
+            .to_string()
+            .contains("No text content found in response"));
+    }
 }

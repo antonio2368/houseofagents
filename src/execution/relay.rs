@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_relay(
     prompt: &str,
     mut providers: Vec<Box<dyn Provider>>,
@@ -247,7 +248,7 @@ mod tests {
     #[tokio::test]
     async fn run_relay_one_iteration_passes_previous_output_to_next_agent() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), Some("relay")).expect("out");
+        let out = OutputManager::new(dir.path(), Some("relay")).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![
@@ -295,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn run_relay_uses_file_instruction_for_cli_receivers() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![
@@ -327,7 +328,7 @@ mod tests {
     #[tokio::test]
     async fn run_relay_uses_initial_last_output_for_resumed_run() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
@@ -359,7 +360,7 @@ mod tests {
     #[tokio::test]
     async fn run_relay_starting_later_without_seed_uses_prompt_for_first_agent() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
@@ -391,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn run_relay_error_stops_and_writes_error_log() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
@@ -420,7 +421,7 @@ mod tests {
     #[tokio::test]
     async fn run_relay_cancel_before_iteration_sends_all_done() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
@@ -443,7 +444,7 @@ mod tests {
     #[tokio::test]
     async fn run_relay_write_failure_emits_agent_error_and_stops() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         std::fs::create_dir_all(out.run_dir().join("anthropic_iter1.md")).expect("mkdir");
         let recv = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(

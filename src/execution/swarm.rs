@@ -8,6 +8,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+type SwarmWorkerResult = (usize, Box<dyn Provider>, Option<(ProviderKind, String)>);
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_swarm(
     prompt: &str,
     mut providers: Vec<Box<dyn Provider>>,
@@ -50,10 +53,8 @@ pub async fn run_swarm(
             .collect();
 
         // Take ownership of providers for parallel execution
-        let taken: Vec<Box<dyn Provider>> = providers.drain(..).collect();
-        let mut spawn_handles: Vec<
-            JoinHandle<(usize, Box<dyn Provider>, Option<(ProviderKind, String)>)>,
-        > = Vec::new();
+        let taken: Vec<Box<dyn Provider>> = std::mem::take(&mut providers);
+        let mut spawn_handles: Vec<JoinHandle<SwarmWorkerResult>> = Vec::new();
 
         for (i, (mut provider, message)) in taken.into_iter().zip(messages.into_iter()).enumerate()
         {
@@ -311,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn run_swarm_single_iteration_writes_outputs_and_events() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), Some("swarm")).expect("out");
+        let out = OutputManager::new(dir.path(), Some("swarm")).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![
@@ -355,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn run_swarm_second_round_receives_prior_outputs() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![
@@ -398,7 +399,7 @@ mod tests {
     #[tokio::test]
     async fn run_swarm_cli_mode_uses_file_messages_in_followup_rounds() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![
@@ -440,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn run_swarm_handles_agent_error_without_failing_run() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![
@@ -485,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn run_swarm_cancel_before_start_sends_all_done() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
@@ -518,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn run_swarm_write_failure_emits_agent_error() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         std::fs::create_dir_all(out.run_dir().join("anthropic_iter1.md")).expect("mkdir");
         let recv = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(

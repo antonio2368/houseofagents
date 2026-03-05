@@ -208,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn run_solo_success_writes_outputs_and_all_done() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), Some("solo")).expect("out");
+        let out = OutputManager::new(dir.path(), Some("solo")).expect("out");
         let received = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![
             Box::new(MockProvider::ok(
@@ -254,7 +254,7 @@ mod tests {
     #[tokio::test]
     async fn run_solo_provider_error_emits_agent_error() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let received = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> =
             vec![Box::new(MockProvider::err(ProviderKind::Gemini, received))];
@@ -281,7 +281,7 @@ mod tests {
     #[tokio::test]
     async fn run_solo_write_failure_emits_agent_error() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         std::fs::create_dir_all(out.run_dir().join("anthropic_iter1.md")).expect("mkdir");
         let received = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::ok(
@@ -318,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn run_solo_cancelled_before_start_skips_agent_work() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let received = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::ok(
             ProviderKind::Anthropic,
@@ -341,7 +341,7 @@ mod tests {
     #[tokio::test]
     async fn run_solo_emits_live_cli_log_lines() {
         let dir = tempdir().expect("tempdir");
-        let out = OutputManager::new(&dir.path().to_path_buf(), None).expect("out");
+        let out = OutputManager::new(dir.path(), None).expect("out");
         let received = Arc::new(Mutex::new(Vec::new()));
         let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::ok(
             ProviderKind::Anthropic,

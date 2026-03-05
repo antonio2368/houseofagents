@@ -195,7 +195,7 @@ extra_cli_args = ""
     }
 
     pub fn resolved_output_dir(&self) -> PathBuf {
-        let expanded = if self.output_dir.starts_with("~/") {
+        if self.output_dir.starts_with("~/") {
             if let Some(home) = dirs::home_dir() {
                 home.join(&self.output_dir[2..])
             } else {
@@ -203,8 +203,7 @@ extra_cli_args = ""
             }
         } else {
             PathBuf::from(&self.output_dir)
-        };
-        expanded
+        }
     }
 }
 

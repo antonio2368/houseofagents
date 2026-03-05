@@ -11,9 +11,9 @@ pub struct OutputManager {
 }
 
 impl OutputManager {
-    pub fn new(base_dir: &PathBuf, session_name: Option<&str>) -> Result<Self, AppError> {
+    pub fn new(base_dir: &Path, session_name: Option<&str>) -> Result<Self, AppError> {
         let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let suffix: u16 = rand::thread_rng().gen_range(100..999);
+        let suffix: u16 = rand::rng().random_range(100..999);
         let dir_name = match session_name {
             Some(name) if !name.is_empty() => {
                 let sanitized = Self::sanitize_session_name(name);
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn new_creates_run_dir_without_session_name() {
         let base = tempdir().expect("tempdir");
-        let mgr = OutputManager::new(&base.path().to_path_buf(), None).expect("new");
+        let mgr = OutputManager::new(base.path(), None).expect("new");
         assert!(mgr.run_dir().exists());
         assert!(mgr.run_dir().starts_with(base.path()));
     }
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn new_creates_run_dir_with_sanitized_session_name() {
         let base = tempdir().expect("tempdir");
-        let mgr = OutputManager::new(&base.path().to_path_buf(), Some("my session")).expect("new");
+        let mgr = OutputManager::new(base.path(), Some("my session")).expect("new");
         let name = mgr
             .run_dir()
             .file_name()
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn write_prompt_creates_prompt_file() {
         let base = tempdir().expect("tempdir");
-        let mgr = OutputManager::new(&base.path().to_path_buf(), Some("s")).expect("new");
+        let mgr = OutputManager::new(base.path(), Some("s")).expect("new");
         mgr.write_prompt("hello prompt").expect("write");
         let content = std::fs::read_to_string(mgr.run_dir().join("prompt.md")).expect("read");
         assert_eq!(content, "hello prompt");
@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn write_session_info_writes_expected_fields() {
         let base = tempdir().expect("tempdir");
-        let mgr = OutputManager::new(&base.path().to_path_buf(), Some("sess")).expect("new");
+        let mgr = OutputManager::new(base.path(), Some("sess")).expect("new");
         mgr.write_session_info(
             &ExecutionMode::Relay,
             &[ProviderKind::Anthropic, ProviderKind::OpenAI],
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn write_agent_output_writes_file_with_expected_name() {
         let base = tempdir().expect("tempdir");
-        let mgr = OutputManager::new(&base.path().to_path_buf(), None).expect("new");
+        let mgr = OutputManager::new(base.path(), None).expect("new");
         let path = mgr
             .write_agent_output(ProviderKind::Gemini, 7, "answer")
             .expect("write");
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn append_error_appends_multiple_lines() {
         let base = tempdir().expect("tempdir");
-        let mgr = OutputManager::new(&base.path().to_path_buf(), None).expect("new");
+        let mgr = OutputManager::new(base.path(), None).expect("new");
         mgr.append_error("one").expect("append");
         mgr.append_error("two").expect("append");
         let content = std::fs::read_to_string(mgr.run_dir().join("_errors.log")).expect("read");

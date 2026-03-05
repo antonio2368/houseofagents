@@ -1530,16 +1530,14 @@ fn start_execution(app: &mut App) {
             app.is_running = false;
             return;
         }
-    } else {
-        if let Err(e) = output.append_error(&format!(
-            "Resumed {} mode for {} additional iteration(s), starting at iter {}",
-            mode, iterations, start_iteration
-        )) {
-            app.error_modal = Some(format!("Failed to write resume log entry: {e}"));
-            app.screen = Screen::Prompt;
-            app.is_running = false;
-            return;
-        }
+    } else if let Err(e) = output.append_error(&format!(
+        "Resumed {} mode for {} additional iteration(s), starting at iter {}",
+        mode, iterations, start_iteration
+    )) {
+        app.error_modal = Some(format!("Failed to write resume log entry: {e}"));
+        app.screen = Screen::Prompt;
+        app.is_running = false;
+        return;
     }
 
     // Store run dir for results screen

@@ -26,6 +26,7 @@ pub struct CliProvider {
 }
 
 impl CliProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         kind: ProviderKind,
         model: String,
@@ -626,5 +627,25 @@ mod tests {
         });
         let found = CliProvider::find_session_id(&value);
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn extract_session_id_from_jsonl_ignores_invalid_lines() {
+        let stdout = r#"
+not json
+{"event":"noop"}
+{"meta":{"thread_id":"123e4567-e89b-12d3-a456-426614174000"}}
+"#;
+        let found = CliProvider::extract_session_id_from_jsonl(stdout);
+        assert_eq!(
+            found.as_deref(),
+            Some("123e4567-e89b-12d3-a456-426614174000")
+        );
+    }
+
+    #[test]
+    fn short_session_formats_long_id() {
+        let short = CliProvider::short_session("1234567890abcdef");
+        assert_eq!(short, "123456...cdef");
     }
 }
