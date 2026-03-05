@@ -8,6 +8,7 @@ use crate::error::AppError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ProviderKind {
@@ -63,11 +64,13 @@ pub enum Role {
 
 pub struct CompletionResponse {
     pub content: String,
+    pub debug_logs: Vec<String>,
 }
 
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
+    fn set_live_log_sender(&mut self, _tx: Option<mpsc::UnboundedSender<String>>) {}
     async fn send(&mut self, message: &str) -> Result<CompletionResponse, AppError>;
 }
 

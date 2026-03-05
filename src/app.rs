@@ -21,6 +21,9 @@ pub struct App {
     pub config_path_override: Option<String>,
     pub session_overrides: HashMap<String, ProviderConfig>,
     pub session_diagnostic_overrides: HashMap<String, ProviderConfig>,
+    pub session_http_timeout_seconds: Option<u64>,
+    pub session_model_fetch_timeout_seconds: Option<u64>,
+    pub session_cli_timeout_seconds: Option<u64>,
     pub screen: Screen,
     pub should_quit: bool,
 
@@ -32,6 +35,7 @@ pub struct App {
 
     // Prompt screen state
     pub prompt_text: String,
+    pub prompt_cursor: usize,
     pub session_name: String,
     pub iterations: u32,
     pub iterations_buf: String,
@@ -65,6 +69,7 @@ pub struct App {
     pub edit_popup_section: EditPopupSection,
     pub edit_popup_cursor: usize,
     pub edit_popup_diagnostic_cursor: usize,
+    pub edit_popup_timeout_cursor: usize,
     pub edit_popup_field: EditField,
     pub edit_popup_editing: bool,
     pub edit_buffer: String,
@@ -118,12 +123,14 @@ pub enum EditField {
     Model,
     ExtraCliArgs,
     OutputDir,
+    TimeoutSeconds,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditPopupSection {
     Providers,
     Diagnostics,
+    Timeouts,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +186,9 @@ impl App {
             config_path_override: None,
             session_overrides,
             session_diagnostic_overrides: HashMap::new(),
+            session_http_timeout_seconds: None,
+            session_model_fetch_timeout_seconds: None,
+            session_cli_timeout_seconds: None,
             screen: Screen::Home,
             should_quit: false,
             selected_agents: Vec::new(),
@@ -186,6 +196,7 @@ impl App {
             home_cursor: 0,
             home_section: HomeSection::Agents,
             prompt_text: String::new(),
+            prompt_cursor: 0,
             session_name: String::new(),
             iterations: 1,
             iterations_buf: "1".into(),
@@ -211,6 +222,7 @@ impl App {
             edit_popup_section: EditPopupSection::Providers,
             edit_popup_cursor: 0,
             edit_popup_diagnostic_cursor: 0,
+            edit_popup_timeout_cursor: 0,
             edit_popup_field: EditField::ApiKey,
             edit_popup_editing: false,
             edit_buffer: String::new(),
@@ -259,6 +271,21 @@ impl App {
         self.session_diagnostic_overrides
             .get(key)
             .or_else(|| self.config.diagnostics.get(key))
+    }
+
+    pub fn effective_http_timeout_seconds(&self) -> u64 {
+        self.session_http_timeout_seconds
+            .unwrap_or(self.config.http_timeout_seconds)
+    }
+
+    pub fn effective_model_fetch_timeout_seconds(&self) -> u64 {
+        self.session_model_fetch_timeout_seconds
+            .unwrap_or(self.config.model_fetch_timeout_seconds)
+    }
+
+    pub fn effective_cli_timeout_seconds(&self) -> u64 {
+        self.session_cli_timeout_seconds
+            .unwrap_or(self.config.cli_timeout_seconds)
     }
 
     pub fn toggle_agent(&mut self, kind: ProviderKind) {

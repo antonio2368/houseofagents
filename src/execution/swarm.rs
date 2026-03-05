@@ -76,19 +76,43 @@ pub async fn run_swarm(
                 }
 
                 let kind = provider.kind();
+                let (live_tx, mut live_rx) = mpsc::unbounded_channel::<String>();
+                provider.set_live_log_sender(Some(live_tx));
+                let live_progress_tx = tx.clone();
+                let live_forward = tokio::spawn(async move {
+                    while let Some(line) = live_rx.recv().await {
+                        let _ = live_progress_tx.send(ProgressEvent::AgentLog {
+                            kind,
+                            iteration: iter,
+                            message: format!("CLI {line}"),
+                        });
+                    }
+                });
 
                 let result = tokio::select! {
-                    res = provider.send(&message) => res,
+                    res = provider.send(&message) => Some(res),
                     _ = wait_for_cancel(&cancel_flag) => {
                         let _ = tx.send(ProgressEvent::AgentLog {
                             kind, iteration: iter, message: "Cancelled".into(),
                         });
-                        return (i, provider, None);
+                        None
                     }
+                };
+                provider.set_live_log_sender(None);
+                let _ = live_forward.await;
+                let Some(result) = result else {
+                    return (i, provider, None);
                 };
 
                 match result {
                     Ok(resp) => {
+                        for log in &resp.debug_logs {
+                            let _ = tx.send(ProgressEvent::AgentLog {
+                                kind,
+                                iteration: iter,
+                                message: format!("CLI {log}"),
+                            });
+                        }
                         let preview = resp.content.lines().take(3).collect::<Vec<_>>().join(" | ");
                         let _ = tx.send(ProgressEvent::AgentLog {
                             kind,
@@ -178,4 +202,3 @@ fn build_swarm_file_message(
     msg.push_str("\nUse the file contents as the source of truth.");
     msg
 }
-

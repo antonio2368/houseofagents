@@ -165,6 +165,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
             app.edit_popup_diagnostic_cursor = diagnostic_provider_kind(app)
                 .and_then(|kind| ProviderKind::all().iter().position(|k| *k == kind))
                 .unwrap_or(0);
+            app.edit_popup_timeout_cursor = 0;
             app.edit_popup_editing = false;
             app.edit_buffer.clear();
         }
@@ -208,6 +209,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.screen = Screen::Prompt;
                 app.prompt_focus = PromptFocus::Text;
+                app.prompt_cursor = app.prompt_text.len();
                 app.iterations_buf = app.iterations.to_string();
                 app.resume_previous = false;
             }
@@ -304,14 +306,7 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
             }
         }
         _ => match app.prompt_focus {
-            PromptFocus::Text => match key.code {
-                KeyCode::Char(c) => app.prompt_text.push(c),
-                KeyCode::Backspace => {
-                    app.prompt_text.pop();
-                }
-                KeyCode::Enter => app.prompt_text.push('\n'),
-                _ => {}
-            },
+            PromptFocus::Text => handle_prompt_text_key(app, key),
             PromptFocus::SessionName => match key.code {
                 KeyCode::Char(c) => app.session_name.push(c),
                 KeyCode::Backspace => {
@@ -351,6 +346,179 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
             }
         },
     }
+}
+
+fn handle_prompt_text_key(app: &mut App, key: KeyEvent) {
+    clamp_prompt_cursor(app);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    match key.code {
+        KeyCode::Left => {
+            if alt {
+                move_prompt_cursor_word_left(app);
+            } else {
+                app.prompt_cursor = prev_char_boundary(&app.prompt_text, app.prompt_cursor);
+            }
+        }
+        KeyCode::Right => {
+            if alt {
+                move_prompt_cursor_word_right(app);
+            } else {
+                app.prompt_cursor = next_char_boundary(&app.prompt_text, app.prompt_cursor);
+            }
+        }
+        KeyCode::Home => app.prompt_cursor = 0,
+        KeyCode::End => app.prompt_cursor = app.prompt_text.len(),
+        KeyCode::Backspace => {
+            if alt {
+                delete_prompt_word_left(app);
+            } else {
+                delete_prompt_char_left(app);
+            }
+        }
+        KeyCode::Enter => {
+            app.prompt_text.insert(app.prompt_cursor, '\n');
+            app.prompt_cursor += '\n'.len_utf8();
+        }
+        KeyCode::Char(c) if !alt && !ctrl => {
+            app.prompt_text.insert(app.prompt_cursor, c);
+            app.prompt_cursor += c.len_utf8();
+        }
+        _ => {}
+    }
+}
+
+fn clamp_prompt_cursor(app: &mut App) {
+    app.prompt_cursor = app.prompt_cursor.min(app.prompt_text.len());
+    while app.prompt_cursor > 0 && !app.prompt_text.is_char_boundary(app.prompt_cursor) {
+        app.prompt_cursor -= 1;
+    }
+}
+
+fn prev_char_boundary(s: &str, idx: usize) -> usize {
+    if idx == 0 {
+        return 0;
+    }
+    s[..idx].char_indices().last().map(|(i, _)| i).unwrap_or(0)
+}
+
+fn next_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut iter = s[idx..].char_indices();
+    let _ = iter.next();
+    if let Some((offset, _)) = iter.next() {
+        idx + offset
+    } else {
+        s.len()
+    }
+}
+
+fn char_before(s: &str, idx: usize) -> Option<char> {
+    if idx == 0 {
+        None
+    } else {
+        s[..idx].chars().next_back()
+    }
+}
+
+fn char_at(s: &str, idx: usize) -> Option<char> {
+    if idx >= s.len() {
+        None
+    } else {
+        s[idx..].chars().next()
+    }
+}
+
+fn move_prompt_cursor_word_left(app: &mut App) {
+    let mut idx = app.prompt_cursor;
+    while idx > 0 {
+        let Some(ch) = char_before(&app.prompt_text, idx) else {
+            break;
+        };
+        if ch.is_whitespace() {
+            idx = prev_char_boundary(&app.prompt_text, idx);
+        } else {
+            break;
+        }
+    }
+    while idx > 0 {
+        let Some(ch) = char_before(&app.prompt_text, idx) else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            idx = prev_char_boundary(&app.prompt_text, idx);
+        } else {
+            break;
+        }
+    }
+    app.prompt_cursor = idx;
+}
+
+fn move_prompt_cursor_word_right(app: &mut App) {
+    let mut idx = app.prompt_cursor;
+    let len = app.prompt_text.len();
+    while idx < len {
+        let Some(ch) = char_at(&app.prompt_text, idx) else {
+            break;
+        };
+        if ch.is_whitespace() {
+            idx = next_char_boundary(&app.prompt_text, idx);
+        } else {
+            break;
+        }
+    }
+    while idx < len {
+        let Some(ch) = char_at(&app.prompt_text, idx) else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            idx = next_char_boundary(&app.prompt_text, idx);
+        } else {
+            break;
+        }
+    }
+    app.prompt_cursor = idx;
+}
+
+fn delete_prompt_char_left(app: &mut App) {
+    if app.prompt_cursor == 0 {
+        return;
+    }
+    let start = prev_char_boundary(&app.prompt_text, app.prompt_cursor);
+    app.prompt_text.replace_range(start..app.prompt_cursor, "");
+    app.prompt_cursor = start;
+}
+
+fn delete_prompt_word_left(app: &mut App) {
+    if app.prompt_cursor == 0 {
+        return;
+    }
+    let mut start = app.prompt_cursor;
+    while start > 0 {
+        let Some(ch) = char_before(&app.prompt_text, start) else {
+            break;
+        };
+        if ch.is_whitespace() {
+            start = prev_char_boundary(&app.prompt_text, start);
+        } else {
+            break;
+        }
+    }
+    while start > 0 {
+        let Some(ch) = char_before(&app.prompt_text, start) else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            start = prev_char_boundary(&app.prompt_text, start);
+        } else {
+            break;
+        }
+    }
+    app.prompt_text.replace_range(start..app.prompt_cursor, "");
+    app.prompt_cursor = start;
 }
 
 fn handle_order_key(app: &mut App, key: KeyEvent) {
@@ -502,6 +670,7 @@ fn handle_results_key(app: &mut App, key: KeyEvent) {
 fn reset_to_home(app: &mut App) {
     app.screen = Screen::Home;
     app.prompt_text.clear();
+    app.prompt_cursor = 0;
     app.session_name.clear();
     app.selected_agents.clear();
     app.progress_events.clear();
@@ -539,7 +708,8 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
         KeyCode::Tab if !app.edit_popup_editing => {
             app.edit_popup_section = match app.edit_popup_section {
                 EditPopupSection::Providers => EditPopupSection::Diagnostics,
-                EditPopupSection::Diagnostics => EditPopupSection::Providers,
+                EditPopupSection::Diagnostics => EditPopupSection::Timeouts,
+                EditPopupSection::Timeouts => EditPopupSection::Providers,
             };
             app.edit_buffer.clear();
         }
@@ -552,24 +722,36 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                     app.edit_popup_diagnostic_cursor =
                         app.edit_popup_diagnostic_cursor.saturating_sub(1);
                 }
+                EditPopupSection::Timeouts => {
+                    app.edit_popup_timeout_cursor = app.edit_popup_timeout_cursor.saturating_sub(1);
+                }
             }
         }
         KeyCode::Down | KeyCode::Char('j') if !app.edit_popup_editing => {
-            let max = ProviderKind::all().len().saturating_sub(1);
             match app.edit_popup_section {
                 EditPopupSection::Providers => {
+                    let max = ProviderKind::all().len().saturating_sub(1);
                     if app.edit_popup_cursor < max {
                         app.edit_popup_cursor += 1;
                     }
                 }
                 EditPopupSection::Diagnostics => {
+                    let max = ProviderKind::all().len().saturating_sub(1);
                     if app.edit_popup_diagnostic_cursor < max {
                         app.edit_popup_diagnostic_cursor += 1;
                     }
                 }
+                EditPopupSection::Timeouts => {
+                    let max = timeout_field_count().saturating_sub(1);
+                    if app.edit_popup_timeout_cursor < max {
+                        app.edit_popup_timeout_cursor += 1;
+                    }
+                }
             }
         }
-        KeyCode::Char('a') if !app.edit_popup_editing => {
+        KeyCode::Char('a')
+            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+        {
             app.edit_popup_field = EditField::ApiKey;
             app.edit_buffer = selected_kind_for_edit(app)
                 .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
@@ -577,7 +759,9 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
-        KeyCode::Char('m') if !app.edit_popup_editing => {
+        KeyCode::Char('m')
+            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+        {
             if app.edit_popup_section == EditPopupSection::Diagnostics
                 && !is_selected_diagnostic_active(app)
             {
@@ -591,7 +775,9 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
-        KeyCode::Char('x') if !app.edit_popup_editing => {
+        KeyCode::Char('x')
+            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+        {
             app.edit_popup_field = EditField::ExtraCliArgs;
             app.edit_buffer = selected_kind_for_edit(app)
                 .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
@@ -599,7 +785,9 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
-        KeyCode::Char('l') if !app.edit_popup_editing => {
+        KeyCode::Char('l')
+            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+        {
             if app.edit_popup_section == EditPopupSection::Diagnostics
                 && !is_selected_diagnostic_active(app)
             {
@@ -617,10 +805,14 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('s') if !app.edit_popup_editing => {
             save_config_globally(app);
         }
-        KeyCode::Char('c') if !app.edit_popup_editing => {
+        KeyCode::Char('c')
+            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+        {
             toggle_cli_mode(app);
         }
-        KeyCode::Char('d') if !app.edit_popup_editing => {
+        KeyCode::Char('d')
+            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+        {
             if app.edit_popup_section == EditPopupSection::Diagnostics {
                 cycle_diagnostic_provider(app);
             } else {
@@ -629,7 +821,9 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 );
             }
         }
-        KeyCode::Char('t') if !app.edit_popup_editing => {
+        KeyCode::Char('t')
+            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+        {
             if app.edit_popup_section == EditPopupSection::Diagnostics
                 && !is_selected_diagnostic_active(app)
             {
@@ -638,9 +832,16 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             }
             cycle_reasoning(app);
         }
+        KeyCode::Char('e') if !app.edit_popup_editing => {
+            if app.edit_popup_section == EditPopupSection::Timeouts {
+                begin_timeout_edit(app);
+            }
+        }
         KeyCode::Enter if !app.edit_popup_editing => {
             if app.edit_popup_section == EditPopupSection::Diagnostics {
                 cycle_diagnostic_provider(app);
+            } else if app.edit_popup_section == EditPopupSection::Timeouts {
+                begin_timeout_edit(app);
             } else {
                 app.edit_popup_field = EditField::ApiKey;
                 app.edit_buffer = selected_kind_for_edit(app)
@@ -658,6 +859,13 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 } else {
                     app.config.output_dir = new_output_dir.to_string();
                 }
+            } else if app.edit_popup_section == EditPopupSection::Timeouts
+                || matches!(app.edit_popup_field, EditField::TimeoutSeconds)
+            {
+                if let Err(e) = set_timeout_override_from_buffer(app) {
+                    app.error_modal = Some(e);
+                    return;
+                }
             } else if let Some(kind) = selected_kind_for_edit(app) {
                 let mut config = effective_section_config(app, app.edit_popup_section, kind)
                     .cloned()
@@ -666,7 +874,7 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                     EditField::ApiKey => config.api_key = app.edit_buffer.clone(),
                     EditField::Model => config.model = app.edit_buffer.clone(),
                     EditField::ExtraCliArgs => config.extra_cli_args = app.edit_buffer.clone(),
-                    EditField::OutputDir => {}
+                    EditField::OutputDir | EditField::TimeoutSeconds => {}
                 }
                 set_section_config_override(app, app.edit_popup_section, kind, config);
             }
@@ -677,7 +885,13 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             app.edit_buffer.pop();
         }
         KeyCode::Char(c) if app.edit_popup_editing => {
-            app.edit_buffer.push(c);
+            if matches!(app.edit_popup_field, EditField::TimeoutSeconds) {
+                if c.is_ascii_digit() {
+                    app.edit_buffer.push(c);
+                }
+            } else {
+                app.edit_buffer.push(c);
+            }
         }
         _ => {}
     }
@@ -774,7 +988,7 @@ fn start_model_fetch(app: &mut App) {
 
     let (tx, rx) = mpsc::unbounded_channel();
     app.model_picker_rx = Some(rx);
-    let timeout_secs = app.config.model_fetch_timeout_seconds.max(1);
+    let timeout_secs = app.effective_model_fetch_timeout_seconds().max(1);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .build()
@@ -830,6 +1044,15 @@ fn save_config_globally(app: &mut App) {
             app.config.diagnostics.insert(key, override_config.clone());
         }
     }
+    if let Some(value) = app.session_http_timeout_seconds {
+        app.config.http_timeout_seconds = value;
+    }
+    if let Some(value) = app.session_model_fetch_timeout_seconds {
+        app.config.model_fetch_timeout_seconds = value;
+    }
+    if let Some(value) = app.session_cli_timeout_seconds {
+        app.config.cli_timeout_seconds = value;
+    }
     app.config_save_in_progress = true;
     let config_to_save = app.config.clone();
     let path_override = app.config_path_override.clone();
@@ -862,6 +1085,9 @@ fn handle_config_save_result(app: &mut App, result: Result<(), String>) {
         Ok(()) => {
             app.session_overrides.clear();
             app.session_diagnostic_overrides.clear();
+            app.session_http_timeout_seconds = None;
+            app.session_model_fetch_timeout_seconds = None;
+            app.session_cli_timeout_seconds = None;
             app.error_modal = Some("Config saved to disk".into());
         }
         Err(e) => {
@@ -937,12 +1163,51 @@ fn toggle_cli_mode(app: &mut App) {
     set_section_config_override(app, app.edit_popup_section, kind, config);
 }
 
+fn timeout_field_count() -> usize {
+    3
+}
+
+fn begin_timeout_edit(app: &mut App) {
+    app.edit_popup_field = EditField::TimeoutSeconds;
+    app.edit_buffer = match app.edit_popup_timeout_cursor {
+        0 => app.effective_http_timeout_seconds(),
+        1 => app.effective_model_fetch_timeout_seconds(),
+        2 => app.effective_cli_timeout_seconds(),
+        _ => app.effective_http_timeout_seconds(),
+    }
+    .to_string();
+    app.edit_popup_editing = true;
+}
+
+fn set_timeout_override_from_buffer(app: &mut App) -> Result<(), String> {
+    let raw = app.edit_buffer.trim();
+    if raw.is_empty() {
+        return Err("Timeout cannot be empty".into());
+    }
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| "Timeout must be a positive integer (seconds)".to_string())?;
+    if parsed == 0 {
+        return Err("Timeout must be at least 1 second".into());
+    }
+
+    match app.edit_popup_timeout_cursor {
+        0 => app.session_http_timeout_seconds = Some(parsed),
+        1 => app.session_model_fetch_timeout_seconds = Some(parsed),
+        2 => app.session_cli_timeout_seconds = Some(parsed),
+        _ => return Err("Invalid timeout field".into()),
+    }
+
+    Ok(())
+}
+
 fn selected_kind_for_edit(app: &App) -> Option<ProviderKind> {
     match app.edit_popup_section {
         EditPopupSection::Providers => ProviderKind::all().get(app.edit_popup_cursor).copied(),
         EditPopupSection::Diagnostics => ProviderKind::all()
             .get(app.edit_popup_diagnostic_cursor)
             .copied(),
+        EditPopupSection::Timeouts => None,
     }
 }
 
@@ -960,6 +1225,7 @@ fn effective_section_config(
     match section {
         EditPopupSection::Providers => app.effective_provider_config(kind),
         EditPopupSection::Diagnostics => app.effective_diagnostic_config(kind),
+        EditPopupSection::Timeouts => None,
     }
 }
 
@@ -977,6 +1243,7 @@ fn set_section_config_override(
         EditPopupSection::Diagnostics => {
             app.session_diagnostic_overrides.insert(key, config);
         }
+        EditPopupSection::Timeouts => {}
     }
 }
 
@@ -1015,6 +1282,8 @@ fn start_execution(app: &mut App) {
     app.diagnostic_rx = None;
 
     let config = app.config.clone();
+    let http_timeout_secs = app.effective_http_timeout_seconds().max(1);
+    let cli_timeout_secs = app.effective_cli_timeout_seconds().max(1);
     let has_any_cli = app.selected_agents.iter().any(|kind| {
         app.effective_provider_config(*kind)
             .map(|c| c.use_cli)
@@ -1049,7 +1318,7 @@ fn start_execution(app: &mut App) {
     };
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(config.http_timeout_seconds.max(1)))
+        .timeout(Duration::from_secs(http_timeout_secs))
         .build()
         .expect("Failed to create HTTP client");
 
@@ -1098,7 +1367,7 @@ fn start_execution(app: &mut App) {
             client.clone(),
             config.default_max_tokens,
             config.max_history_messages,
-            config.cli_timeout_seconds,
+            cli_timeout_secs,
         ));
     }
 
@@ -1556,7 +1825,9 @@ fn start_consolidation(app: &mut App) {
     }
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(app.config.http_timeout_seconds.max(1)))
+        .timeout(Duration::from_secs(
+            app.effective_http_timeout_seconds().max(1),
+        ))
         .build()
         .expect("Failed to create HTTP client");
 
@@ -1566,7 +1837,7 @@ fn start_consolidation(app: &mut App) {
         client,
         app.config.default_max_tokens,
         app.config.max_history_messages,
-        app.config.cli_timeout_seconds,
+        app.effective_cli_timeout_seconds().max(1),
     );
 
     app.progress_events.push(ProgressEvent::AgentStarted {
@@ -1695,7 +1966,9 @@ fn maybe_start_diagnostics(app: &mut App) {
     let prompt = build_diagnostic_prompt(&report_files, &app_errors, pconfig.use_cli);
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(app.config.http_timeout_seconds.max(1)))
+        .timeout(Duration::from_secs(
+            app.effective_http_timeout_seconds().max(1),
+        ))
         .build()
         .expect("Failed to create HTTP client");
     let provider = provider::create_provider(
@@ -1704,7 +1977,7 @@ fn maybe_start_diagnostics(app: &mut App) {
         client,
         app.config.default_max_tokens,
         app.config.max_history_messages,
-        app.config.cli_timeout_seconds,
+        app.effective_cli_timeout_seconds().max(1),
     );
 
     app.progress_events.push(ProgressEvent::AgentLog {

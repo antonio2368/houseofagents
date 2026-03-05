@@ -226,4 +226,5 @@ Global:
 
 - When any selected agent uses CLI mode, the app prepends working directory context to the prompt.
 - API model list picker is available from config edit popup (`l`) when API key is present.
-- Session edits in popup are in-memory until you save with `s`.
+- Config popup has three sections (`Tab`): Run Providers, Diagnostics, and Timeouts.
+- Session edits in popup (including timeout overrides) are in-memory until you save with `s`.

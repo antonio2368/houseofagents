@@ -65,6 +65,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let (scroll_y, cursor_col, cursor_row) = if app.prompt_focus == PromptFocus::Text {
         prompt_cursor_layout(
             app.prompt_text.as_str(),
+            app.prompt_cursor,
             prompt_inner.width as usize,
             prompt_inner.height as usize,
         )
@@ -193,6 +194,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         PromptFocus::Text => {
             vec![
+                Span::styled("←/→", Style::default().fg(Color::Yellow)),
+                Span::raw(": move  "),
+                Span::styled("Alt+←/→", Style::default().fg(Color::Yellow)),
+                Span::raw(": move word  "),
+                Span::styled("Alt+Backspace", Style::default().fg(Color::Yellow)),
+                Span::raw(": delete word  "),
                 Span::styled("Tab", Style::default().fg(Color::Yellow)),
                 Span::raw(": next field  "),
                 Span::styled("r", Style::default().fg(Color::Yellow)),
@@ -220,14 +227,27 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(help, chunks[5]);
 }
 
-fn prompt_cursor_layout(text: &str, width: usize, height: usize) -> (u16, usize, usize) {
+fn prompt_cursor_layout(
+    text: &str,
+    cursor: usize,
+    width: usize,
+    height: usize,
+) -> (u16, usize, usize) {
     if width == 0 || height == 0 {
         return (0, 0, 0);
     }
 
+    let mut cursor = cursor.min(text.len());
+    while cursor > 0 && !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+
     let mut row = 0usize;
     let mut col = 0usize;
-    for ch in text.chars() {
+    for (idx, ch) in text.char_indices() {
+        if idx >= cursor {
+            break;
+        }
         if ch == '\n' {
             row += 1;
             col = 0;

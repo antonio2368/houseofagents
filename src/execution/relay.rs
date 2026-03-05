@@ -70,19 +70,43 @@ pub async fn run_relay(
             };
 
             // Use select! so cancel aborts the in-flight request
+            let (live_tx, mut live_rx) = mpsc::unbounded_channel::<String>();
+            providers[i].set_live_log_sender(Some(live_tx));
+            let live_progress_tx = progress_tx.clone();
+            let live_forward = tokio::spawn(async move {
+                while let Some(line) = live_rx.recv().await {
+                    let _ = live_progress_tx.send(ProgressEvent::AgentLog {
+                        kind,
+                        iteration,
+                        message: format!("CLI {line}"),
+                    });
+                }
+            });
             let result = tokio::select! {
-                res = providers[i].send(&message) => res,
+                res = providers[i].send(&message) => Some(res),
                 _ = wait_for_cancel(&cancel) => {
                     let _ = progress_tx.send(ProgressEvent::AgentLog {
                         kind, iteration, message: "Cancelled".into(),
                     });
-                    let _ = progress_tx.send(ProgressEvent::AllDone);
-                    return Ok(());
+                    None
                 }
+            };
+            providers[i].set_live_log_sender(None);
+            let _ = live_forward.await;
+            let Some(result) = result else {
+                let _ = progress_tx.send(ProgressEvent::AllDone);
+                return Ok(());
             };
 
             match result {
                 Ok(resp) => {
+                    for log in &resp.debug_logs {
+                        let _ = progress_tx.send(ProgressEvent::AgentLog {
+                            kind,
+                            iteration,
+                            message: format!("CLI {log}"),
+                        });
+                    }
                     let preview = resp.content.lines().take(3).collect::<Vec<_>>().join(" | ");
                     let _ = progress_tx.send(ProgressEvent::AgentLog {
                         kind,
@@ -119,4 +143,3 @@ pub async fn run_relay(
     let _ = progress_tx.send(ProgressEvent::AllDone);
     Ok(())
 }
-

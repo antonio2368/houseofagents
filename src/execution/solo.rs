@@ -54,18 +54,44 @@ async fn solo_agent(
         message: "Sending request...".into(),
     });
 
+    let (live_tx, mut live_rx) = mpsc::unbounded_channel::<String>();
+    provider.set_live_log_sender(Some(live_tx));
+    let live_progress_tx = tx.clone();
+    let live_forward = tokio::spawn(async move {
+        while let Some(line) = live_rx.recv().await {
+            let _ = live_progress_tx.send(ProgressEvent::AgentLog {
+                kind,
+                iteration: 1,
+                message: format!("CLI {line}"),
+            });
+        }
+    });
+
     let result = tokio::select! {
-        res = provider.send(prompt) => res,
+        res = provider.send(prompt) => Some(res),
         _ = wait_for_cancel(&cancel) => {
             let _ = tx.send(ProgressEvent::AgentLog {
                 kind, iteration: 1, message: "Cancelled".into(),
             });
-            return;
+            None
         }
+    };
+    provider.set_live_log_sender(None);
+    let _ = live_forward.await;
+
+    let Some(result) = result else {
+        return;
     };
 
     match result {
         Ok(resp) => {
+            for log in &resp.debug_logs {
+                let _ = tx.send(ProgressEvent::AgentLog {
+                    kind,
+                    iteration: 1,
+                    message: format!("CLI {log}"),
+                });
+            }
             let preview = resp.content.lines().take(3).collect::<Vec<_>>().join(" | ");
             let _ = tx.send(ProgressEvent::AgentLog {
                 kind,
@@ -92,4 +118,3 @@ async fn solo_agent(
         }
     }
 }
-

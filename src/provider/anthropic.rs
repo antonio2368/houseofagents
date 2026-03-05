@@ -1,4 +1,6 @@
-use super::{effort_to_budget, prune_history, CompletionResponse, Message, Provider, ProviderKind, Role};
+use super::{
+    effort_to_budget, prune_history, CompletionResponse, Message, Provider, ProviderKind, Role,
+};
 use crate::error::AppError;
 use async_trait::async_trait;
 
@@ -109,7 +111,10 @@ impl Provider for AnthropicProvider {
         });
 
         let content = self.history.last().unwrap().content.clone();
-        Ok(CompletionResponse { content })
+        Ok(CompletionResponse {
+            content,
+            debug_logs: Vec::new(),
+        })
     }
 }
 

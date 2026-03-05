@@ -109,7 +109,10 @@ impl Provider for OpenAIProvider {
         });
 
         let content = self.history.last().unwrap().content.clone();
-        Ok(CompletionResponse { content })
+        Ok(CompletionResponse {
+            content,
+            debug_logs: Vec::new(),
+        })
     }
 }
 

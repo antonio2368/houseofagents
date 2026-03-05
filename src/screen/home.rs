@@ -274,15 +274,16 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
     let selected_cursor = match app.edit_popup_section {
         EditPopupSection::Providers => app.edit_popup_cursor,
         EditPopupSection::Diagnostics => app.edit_popup_diagnostic_cursor,
+        EditPopupSection::Timeouts => app.edit_popup_timeout_cursor,
     };
 
     let mut header_lines = vec![
         Line::from(Span::styled(
-            "j/k: navigate providers  Tab: switch section  [o]: output dir  [s]: save to disk",
+            "j/k: navigate entries  Tab: switch section  [o]: output dir  [s]: save to disk",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "[c]: CLI/API  [a]: key  [m]: model  [x]: extra CLI args  [l]: list models  [t]: effort/reasoning  [d]: set/clear diagnostic provider  Esc: keep for session",
+            "[c]: CLI/API  [a]: key  [m]: model  [x]: extra CLI args  [l]: list models  [t]: effort/reasoning  [d]: set/clear diagnostic provider  [e]/Enter: edit selected in Timeouts  Esc: keep for session",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -292,6 +293,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                 match app.edit_popup_section {
                     EditPopupSection::Providers => "Run Providers",
                     EditPopupSection::Diagnostics => "Diagnostics",
+                    EditPopupSection::Timeouts => "Timeouts",
                 },
                 Style::default()
                     .fg(Color::Cyan)
@@ -495,6 +497,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                         crate::app::EditField::Model => "model",
                         crate::app::EditField::ExtraCliArgs => "extra cli args",
                         crate::app::EditField::OutputDir => "output dir",
+                        crate::app::EditField::TimeoutSeconds => "timeout",
                     };
                     selected_line_idx = body_lines.len();
                     body_lines.push(Line::from(Span::styled(
@@ -642,6 +645,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     crate::app::EditField::Model => "model",
                     crate::app::EditField::ExtraCliArgs => "extra cli args",
                     crate::app::EditField::OutputDir => "output dir",
+                    crate::app::EditField::TimeoutSeconds => "timeout",
                 };
                 selected_line_idx = body_lines.len();
                 body_lines.push(Line::from(Span::styled(
@@ -651,6 +655,87 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     ),
                     Style::default().fg(Color::Yellow),
                 )));
+            }
+        }
+        EditPopupSection::Timeouts => {
+            let timeout_rows = [
+                (
+                    "HTTP/API timeout",
+                    "Applied to provider API calls when CLI mode is off.",
+                    app.effective_http_timeout_seconds(),
+                    app.session_http_timeout_seconds,
+                ),
+                (
+                    "Model fetch timeout",
+                    "Applied when fetching model lists from the config popup.",
+                    app.effective_model_fetch_timeout_seconds(),
+                    app.session_model_fetch_timeout_seconds,
+                ),
+                (
+                    "CLI timeout",
+                    "Applied to provider CLI calls when CLI mode is on.",
+                    app.effective_cli_timeout_seconds(),
+                    app.session_cli_timeout_seconds,
+                ),
+            ];
+
+            body_lines.push(Line::from(Span::styled(
+                "Press Enter or [e] to edit selected timeout.",
+                Style::default().fg(Color::DarkGray),
+            )));
+            body_lines.push(Line::from(""));
+
+            for (i, (label, description, value, session_override)) in
+                timeout_rows.iter().enumerate()
+            {
+                let is_selected = i == selected_cursor;
+                let style = if is_selected {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                if is_selected {
+                    selected_line_idx = body_lines.len();
+                }
+
+                body_lines.push(Line::from(vec![
+                    Span::styled(if is_selected { "▸ " } else { "  " }, style),
+                    Span::styled(format!("{label}: {value}s"), style),
+                    Span::styled(
+                        if session_override.is_some() {
+                            "  (session override)"
+                        } else {
+                            "  (global default)"
+                        },
+                        if session_override.is_some() {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ),
+                ]));
+                body_lines.push(Line::from(vec![
+                    Span::raw("   "),
+                    Span::styled(*description, Style::default().fg(Color::DarkGray)),
+                ]));
+
+                if is_selected
+                    && app.edit_popup_editing
+                    && matches!(app.edit_popup_field, crate::app::EditField::TimeoutSeconds)
+                {
+                    selected_line_idx = body_lines.len();
+                    body_lines.push(Line::from(Span::styled(
+                        format!(
+                            "   New timeout: {}_ (seconds, Enter: save, Esc: cancel)",
+                            app.edit_buffer
+                        ),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
+
+                body_lines.push(Line::from(""));
             }
         }
     }
@@ -703,6 +788,7 @@ fn draw_model_picker(f: &mut Frame, app: &App) {
     let cursor = match app.edit_popup_section {
         EditPopupSection::Providers => app.edit_popup_cursor,
         EditPopupSection::Diagnostics => app.edit_popup_diagnostic_cursor,
+        EditPopupSection::Timeouts => app.edit_popup_cursor,
     };
     let provider_name = ProviderKind::all()
         .get(cursor)
