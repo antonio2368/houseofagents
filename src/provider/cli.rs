@@ -221,8 +221,8 @@ impl Provider for CliProvider {
             args.push("--model".to_string());
             args.push(self.model.clone());
         }
-        if !self.extra_cli_args.trim().is_empty() {
-            args.push(self.extra_cli_args.clone());
+        for arg in self.extra_cli_args.split_whitespace() {
+            args.push(arg.to_string());
         }
 
         let mut child = Command::new(bin)
@@ -300,10 +300,11 @@ impl Provider for CliProvider {
         };
         self.history.push(Message {
             role: Role::Assistant,
-            content: content.clone(),
+            content,
         });
         prune_history(&mut self.history, self.max_history_messages);
 
+        let content = self.history.last().unwrap().content.clone();
         Ok(CompletionResponse { content })
     }
 }

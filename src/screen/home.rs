@@ -174,6 +174,66 @@ fn draw_error_modal(f: &mut Frame, message: &str) {
     f.render_widget(text, area);
 }
 
+fn help_lines() -> &'static [Line<'static>] {
+    use std::sync::LazyLock;
+    static LINES: LazyLock<Vec<Line<'static>>> = LazyLock::new(|| {
+        vec![
+            Line::from(Span::styled(
+                "Relay",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("  Agents run one after another in sequence. Each agent"),
+            Line::from("  receives the previous agent's full output and builds"),
+            Line::from("  on it. Over multiple iterations the baton passes around"),
+            Line::from("  the ring, progressively refining the result."),
+            Line::from(""),
+            Line::from("  Best for: deep refinement, iterative improvement,"),
+            Line::from("  tasks where each step should build on the last."),
+            Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Swarm",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("  All agents run in parallel each round. After a round"),
+            Line::from("  completes, every agent receives all other agents'"),
+            Line::from("  outputs and produces an updated analysis. This repeats"),
+            Line::from("  for the configured number of iterations."),
+            Line::from(""),
+            Line::from("  Best for: multi-perspective analysis, debates,"),
+            Line::from("  cross-checking, consensus-building."),
+            Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Solo",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("  Each selected agent runs independently in parallel on"),
+            Line::from("  the same prompt. No context is shared between agents."),
+            Line::from("  Always runs exactly one iteration."),
+            Line::from(""),
+            Line::from("  Best for: comparing models head-to-head, getting"),
+            Line::from("  diverse independent answers to the same question."),
+            Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press any key to close",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]
+    });
+    &LINES
+}
+
 fn draw_help_popup(f: &mut Frame) {
     let area = centered_rect(70, 70, f.area());
     let block = Block::default()
@@ -181,61 +241,7 @@ fn draw_help_popup(f: &mut Frame) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let lines = vec![
-        Line::from(Span::styled(
-            "Relay",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("  Agents run one after another in sequence. Each agent"),
-        Line::from("  receives the previous agent's full output and builds"),
-        Line::from("  on it. Over multiple iterations the baton passes around"),
-        Line::from("  the ring, progressively refining the result."),
-        Line::from(""),
-        Line::from("  Best for: deep refinement, iterative improvement,"),
-        Line::from("  tasks where each step should build on the last."),
-        Line::from(""),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Swarm",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("  All agents run in parallel each round. After a round"),
-        Line::from("  completes, every agent receives all other agents'"),
-        Line::from("  outputs and produces an updated analysis. This repeats"),
-        Line::from("  for the configured number of iterations."),
-        Line::from(""),
-        Line::from("  Best for: multi-perspective analysis, debates,"),
-        Line::from("  cross-checking, consensus-building."),
-        Line::from(""),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Solo",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("  Each selected agent runs independently in parallel on"),
-        Line::from("  the same prompt. No context is shared between agents."),
-        Line::from("  Always runs exactly one iteration."),
-        Line::from(""),
-        Line::from("  Best for: comparing models head-to-head, getting"),
-        Line::from("  diverse independent answers to the same question."),
-        Line::from(""),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Press any key to close",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    let text = Paragraph::new(lines)
+    let text = Paragraph::new(help_lines().to_vec())
         .wrap(Wrap { trim: false })
         .block(block);
     f.render_widget(ratatui::widgets::Clear, area);
@@ -325,8 +331,8 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
             for (i, (kind, _available)) in providers.iter().enumerate() {
                 let config = app.effective_provider_config(*kind);
                 let cli_installed = app.cli_available.get(kind).copied().unwrap_or(false);
-                let use_cli = config.as_ref().map(|c| c.use_cli).unwrap_or(false);
-                let (key, model, extra_cli_args, thinking_label, has_api_key) = match &config {
+                let use_cli = config.map(|c| c.use_cli).unwrap_or(false);
+                let (key, model, extra_cli_args, thinking_label, has_api_key) = match config {
                     Some(c) => {
                         let thinking = match kind {
                             ProviderKind::OpenAI => match c.reasoning_effort.as_deref() {
@@ -408,11 +414,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                         Span::raw(model.clone()),
                         Span::styled("  [m] [l]", Style::default().fg(Color::DarkGray)),
                     ]));
-                    let extra_cli_style = if use_cli {
-                        Style::default()
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
+                    let extra_cli_style = cli_dependent_style(use_cli);
                     body_lines.push(Line::from(vec![
                         Span::styled("  Extra CLI:", extra_cli_style),
                         Span::styled(format!(" {extra_cli_args}"), extra_cli_style),
@@ -454,11 +456,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                         Span::styled(key, key_style),
                     ]));
                     body_lines.push(Line::from(format!("  Model:    {model}")));
-                    let extra_cli_style = if use_cli {
-                        Style::default()
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    };
+                    let extra_cli_style = cli_dependent_style(use_cli);
                     body_lines.push(Line::from(vec![
                         Span::styled("  Extra CLI:", extra_cli_style),
                         Span::styled(format!(" {extra_cli_args}"), extra_cli_style),
@@ -499,8 +497,8 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                 .unwrap_or(ProviderKind::Anthropic);
             let config = app.effective_diagnostic_config(kind);
             let cli_installed = app.cli_available.get(&kind).copied().unwrap_or(false);
-            let use_cli = config.as_ref().map(|c| c.use_cli).unwrap_or(false);
-            let (key, model, extra_cli_args, thinking_label, has_api_key) = match &config {
+            let use_cli = config.map(|c| c.use_cli).unwrap_or(false);
+            let (key, model, extra_cli_args, thinking_label, has_api_key) = match config {
                 Some(c) => {
                     let thinking = match kind {
                         ProviderKind::OpenAI => match c.reasoning_effort.as_deref() {
@@ -581,11 +579,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                 Span::styled(key, key_style),
                 Span::styled("  [a]", Style::default().fg(Color::DarkGray)),
             ]));
-            let extra_cli_style = if use_cli {
-                Style::default()
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
+            let extra_cli_style = cli_dependent_style(use_cli);
             body_lines.push(Line::from(vec![
                 Span::styled("  Extra CLI:", extra_cli_style),
                 Span::styled(format!(" {extra_cli_args}"), extra_cli_style),
@@ -786,6 +780,14 @@ fn draw_model_picker(f: &mut Frame, app: &App) {
     let list = List::new(all_lines).block(block);
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(list, area);
+}
+
+fn cli_dependent_style(use_cli: bool) -> Style {
+    if use_cli {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 fn mask_key(key: &str) -> String {

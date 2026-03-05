@@ -105,9 +105,10 @@ impl Provider for AnthropicProvider {
 
         self.history.push(Message {
             role: Role::Assistant,
-            content: content.clone(),
+            content,
         });
 
+        let content = self.history.last().unwrap().content.clone();
         Ok(CompletionResponse { content })
     }
 }

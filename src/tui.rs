@@ -545,7 +545,7 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             app.edit_popup_field = EditField::ApiKey;
             app.edit_buffer = selected_kind_for_edit(app)
                 .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
-                .map(|c| c.api_key)
+                .map(|c| c.api_key.clone())
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
@@ -559,7 +559,7 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             app.edit_popup_field = EditField::Model;
             app.edit_buffer = selected_kind_for_edit(app)
                 .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
-                .map(|c| c.model)
+                .map(|c| c.model.clone())
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
@@ -567,7 +567,7 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             app.edit_popup_field = EditField::ExtraCliArgs;
             app.edit_buffer = selected_kind_for_edit(app)
                 .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
-                .map(|c| c.extra_cli_args)
+                .map(|c| c.extra_cli_args.clone())
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
@@ -617,7 +617,7 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 app.edit_popup_field = EditField::ApiKey;
                 app.edit_buffer = selected_kind_for_edit(app)
                     .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
-                    .map(|c| c.api_key)
+                    .map(|c| c.api_key.clone())
                     .unwrap_or_default();
                 app.edit_popup_editing = true;
             }
@@ -632,6 +632,7 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 }
             } else if let Some(kind) = selected_kind_for_edit(app) {
                 let mut config = effective_section_config(app, app.edit_popup_section, kind)
+                    .cloned()
                     .unwrap_or_else(empty_provider_config);
                 match app.edit_popup_field {
                     EditField::ApiKey => config.api_key = app.edit_buffer.clone(),
@@ -684,6 +685,7 @@ fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
             if let Some(model) = app.model_picker_list.get(app.model_picker_cursor).cloned() {
                 if let Some(kind) = selected_kind_for_edit(app) {
                     let mut config = effective_section_config(app, app.edit_popup_section, kind)
+                        .cloned()
                         .unwrap_or_else(empty_provider_config);
                     config.model = model;
                     set_section_config_override(app, app.edit_popup_section, kind, config);
@@ -725,23 +727,15 @@ fn start_model_fetch(app: &mut App) {
         Some(k) => k,
         None => return,
     };
-    let config = match effective_section_config(app, app.edit_popup_section, kind) {
-        Some(c) => c,
-        None => {
+    let api_key = match effective_section_config(app, app.edit_popup_section, kind) {
+        Some(c) if !c.api_key.is_empty() => c.api_key.clone(),
+        _ => {
             app.error_modal = Some(
                 "Add API key to fetch model list. You can type model manually with [m].".into(),
             );
             return;
         }
     };
-
-    let has_key = !config.api_key.is_empty();
-
-    if !has_key {
-        app.error_modal =
-            Some("Add API key to fetch model list. You can type model manually with [m].".into());
-        return;
-    }
 
     app.model_picker_active = true;
     app.model_picker_loading = true;
@@ -752,8 +746,6 @@ fn start_model_fetch(app: &mut App) {
 
     let (tx, rx) = mpsc::unbounded_channel();
     app.model_picker_rx = Some(rx);
-
-    let api_key = config.api_key.clone();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -777,7 +769,7 @@ fn handle_model_list_result(app: &mut App, result: Result<Vec<String>, String>) 
             // Pre-select the current model if it's in the list
             let current_model = selected_kind_for_edit(app)
                 .and_then(|k| effective_section_config(app, app.edit_popup_section, k))
-                .map(|c| c.model);
+                .map(|c| c.model.as_str());
             app.model_picker_cursor = current_model
                 .and_then(|m| models.iter().position(|x| *x == m))
                 .unwrap_or(0);
@@ -855,6 +847,7 @@ fn cycle_reasoning(app: &mut App) {
         None => return,
     };
     let mut config = effective_section_config(app, app.edit_popup_section, kind)
+        .cloned()
         .unwrap_or_else(empty_provider_config);
 
     match kind {
@@ -902,6 +895,7 @@ fn toggle_cli_mode(app: &mut App) {
     };
     let cli_installed = app.cli_available.get(&kind).copied().unwrap_or(false);
     let mut config = effective_section_config(app, app.edit_popup_section, kind)
+        .cloned()
         .unwrap_or_else(empty_provider_config);
 
     // Allow turning CLI mode off even when binary is missing, but block turning it on.
@@ -933,7 +927,7 @@ fn effective_section_config(
     app: &App,
     section: EditPopupSection,
     kind: ProviderKind,
-) -> Option<ProviderConfig> {
+) -> Option<&ProviderConfig> {
     match section {
         EditPopupSection::Providers => app.effective_provider_config(kind),
         EditPopupSection::Diagnostics => app.effective_diagnostic_config(kind),
@@ -1035,7 +1029,7 @@ fn start_execution(app: &mut App) {
         std::collections::HashMap::new();
     let mut run_models: Vec<(ProviderKind, String)> = Vec::new();
     for kind in &agents {
-        let pconfig = match app.effective_provider_config(*kind) {
+        let pconfig = match app.effective_provider_config(*kind).cloned() {
             Some(cfg) => cfg,
             None => {
                 app.error_modal = Some(format!("{} is not configured", kind.display_name()));
@@ -1470,7 +1464,7 @@ fn start_consolidation(app: &mut App) {
         }
     };
 
-    let pconfig = match app.effective_provider_config(provider_kind) {
+    let pconfig = match app.effective_provider_config(provider_kind).cloned() {
         Some(cfg) => cfg,
         None => {
             app.error_modal = Some(format!(
@@ -1633,7 +1627,7 @@ fn maybe_start_diagnostics(app: &mut App) {
         Some(path) => path,
         None => return,
     };
-    let pconfig = match app.effective_diagnostic_config(diagnostic_kind) {
+    let pconfig = match app.effective_diagnostic_config(diagnostic_kind).cloned() {
         Some(cfg) => cfg,
         None => {
             app.error_modal = Some(format!(

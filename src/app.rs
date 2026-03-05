@@ -236,11 +236,8 @@ impl App {
             .iter()
             .map(|&kind| {
                 let config = self.effective_provider_config(kind);
-                let has_key = config
-                    .as_ref()
-                    .map(|c| !c.api_key.is_empty())
-                    .unwrap_or(false);
-                let using_cli = config.as_ref().map(|c| c.use_cli).unwrap_or(false);
+                let has_key = config.map(|c| !c.api_key.is_empty()).unwrap_or(false);
+                let using_cli = config.map(|c| c.use_cli).unwrap_or(false);
                 let cli_ok = self.cli_available.get(&kind).copied().unwrap_or(false);
                 let available = if using_cli { cli_ok } else { has_key };
                 (kind, available)
@@ -248,20 +245,18 @@ impl App {
             .collect()
     }
 
-    pub fn effective_provider_config(&self, kind: ProviderKind) -> Option<ProviderConfig> {
+    pub fn effective_provider_config(&self, kind: ProviderKind) -> Option<&ProviderConfig> {
         let key = kind.config_key();
-        if let Some(override_config) = self.session_overrides.get(key) {
-            return Some(override_config.clone());
-        }
-        self.config.providers.get(key).cloned()
+        self.session_overrides
+            .get(key)
+            .or_else(|| self.config.providers.get(key))
     }
 
-    pub fn effective_diagnostic_config(&self, kind: ProviderKind) -> Option<ProviderConfig> {
+    pub fn effective_diagnostic_config(&self, kind: ProviderKind) -> Option<&ProviderConfig> {
         let key = kind.config_key();
-        if let Some(override_config) = self.session_diagnostic_overrides.get(key) {
-            return Some(override_config.clone());
-        }
-        self.config.diagnostics.get(key).cloned()
+        self.session_diagnostic_overrides
+            .get(key)
+            .or_else(|| self.config.diagnostics.get(key))
     }
 
     pub fn toggle_agent(&mut self, kind: ProviderKind) {
