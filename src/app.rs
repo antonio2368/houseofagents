@@ -85,6 +85,9 @@ pub struct App {
     // CLI availability per provider
     pub cli_available: HashMap<ProviderKind, bool>,
 
+    // Help popup
+    pub show_help_popup: bool,
+
     // Error modal
     pub error_modal: Option<String>,
 
@@ -112,6 +115,7 @@ pub enum PromptFocus {
 pub enum EditField {
     ApiKey,
     Model,
+    ExtraCliArgs,
     OutputDir,
 }
 
@@ -162,6 +166,7 @@ impl App {
                     reasoning_effort: None,
                     thinking_effort: None,
                     use_cli: false,
+                    extra_cli_args: String::new(),
                 });
                 cfg.use_cli = true;
                 session_overrides.insert(key.to_string(), cfg);
@@ -218,6 +223,7 @@ impl App {
             config_save_in_progress: false,
             config_save_rx: None,
             cli_available,
+            show_help_popup: false,
             error_modal: None,
             progress_rx: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),

@@ -31,6 +31,9 @@ pub struct ProviderConfig {
     /// Use CLI tool instead of API for this provider
     #[serde(default)]
     pub use_cli: bool,
+    /// Extra CLI argument appended as a single raw token to provider CLI calls
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra_cli_args: String,
 }
 
 fn default_max_tokens() -> u32 {
@@ -126,18 +129,21 @@ api_key = ""
 model = "claude-sonnet-4-5"
 thinking_effort = "medium"
 use_cli = false
+extra_cli_args = ""
 
 [providers.openai]
 api_key = ""
 model = "gpt-5"
 reasoning_effort = "medium"
 use_cli = false
+extra_cli_args = ""
 
 [providers.gemini]
 api_key = ""
 model = "gemini-2.5-pro"
 thinking_effort = "medium"
 use_cli = false
+extra_cli_args = ""
 
 # Diagnostics are configured separately from run providers.
 [diagnostics.anthropic]
@@ -145,18 +151,21 @@ api_key = ""
 model = "claude-sonnet-4-5"
 thinking_effort = "low"
 use_cli = false
+extra_cli_args = ""
 
 [diagnostics.openai]
 api_key = ""
 model = "gpt-5-mini"
 reasoning_effort = "low"
 use_cli = false
+extra_cli_args = ""
 
 [diagnostics.gemini]
 api_key = ""
 model = "gemini-2.5-pro"
 thinking_effort = "low"
 use_cli = false
+extra_cli_args = ""
 "#;
 
         std::fs::write(&path, TEMPLATE)

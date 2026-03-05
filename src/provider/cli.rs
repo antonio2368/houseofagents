@@ -13,6 +13,7 @@ pub struct CliProvider {
     model: String,
     reasoning_effort: Option<String>,
     thinking_effort: Option<String>,
+    extra_cli_args: String,
     add_dirs: Vec<String>,
     session_id: Option<String>,
     session_started: bool,
@@ -26,6 +27,7 @@ impl CliProvider {
         model: String,
         reasoning_effort: Option<String>,
         thinking_effort: Option<String>,
+        extra_cli_args: String,
         add_dirs: Vec<String>,
         max_history_messages: usize,
     ) -> Self {
@@ -34,6 +36,7 @@ impl CliProvider {
             model,
             reasoning_effort,
             thinking_effort,
+            extra_cli_args,
             add_dirs,
             session_id: match kind {
                 ProviderKind::Anthropic => Some(Uuid::new_v4().to_string()),
@@ -217,6 +220,9 @@ impl Provider for CliProvider {
         if self.kind != ProviderKind::OpenAI && !self.model.is_empty() {
             args.push("--model".to_string());
             args.push(self.model.clone());
+        }
+        if !self.extra_cli_args.trim().is_empty() {
+            args.push(self.extra_cli_args.clone());
         }
 
         let mut child = Command::new(bin)

@@ -98,6 +98,7 @@ pub fn create_provider(
             config.model.clone(),
             config.reasoning_effort.clone(),
             config.thinking_effort.clone(),
+            config.extra_cli_args.clone(),
             vec![],
             max_history_messages,
         ));

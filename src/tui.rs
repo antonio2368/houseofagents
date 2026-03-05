@@ -130,6 +130,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Dismiss help popup with any key
+    if app.show_help_popup {
+        app.show_help_popup = false;
+        return;
+    }
+
     // Edit popup handling
     if app.show_edit_popup {
         handle_edit_popup_key(app, key);
@@ -148,6 +154,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 fn handle_home_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('?') => {
+            app.show_help_popup = true;
+        }
         KeyCode::Char('e') => {
             app.show_edit_popup = true;
             app.edit_popup_section = EditPopupSection::Providers;
@@ -554,6 +563,14 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
+        KeyCode::Char('x') if !app.edit_popup_editing => {
+            app.edit_popup_field = EditField::ExtraCliArgs;
+            app.edit_buffer = selected_kind_for_edit(app)
+                .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
+                .map(|c| c.extra_cli_args)
+                .unwrap_or_default();
+            app.edit_popup_editing = true;
+        }
         KeyCode::Char('l') if !app.edit_popup_editing => {
             if app.edit_popup_section == EditPopupSection::Diagnostics
                 && !is_selected_diagnostic_active(app)
@@ -619,6 +636,7 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 match app.edit_popup_field {
                     EditField::ApiKey => config.api_key = app.edit_buffer.clone(),
                     EditField::Model => config.model = app.edit_buffer.clone(),
+                    EditField::ExtraCliArgs => config.extra_cli_args = app.edit_buffer.clone(),
                     EditField::OutputDir => {}
                 }
                 set_section_config_override(app, app.edit_popup_section, kind, config);
@@ -946,6 +964,7 @@ fn empty_provider_config() -> ProviderConfig {
         reasoning_effort: None,
         thinking_effort: None,
         use_cli: false,
+        extra_cli_args: String::new(),
     }
 }
 

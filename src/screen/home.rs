@@ -47,6 +47,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::raw(": proceed  "),
         Span::styled("e", Style::default().fg(Color::Yellow)),
         Span::raw(": edit config  "),
+        Span::styled("?", Style::default().fg(Color::Yellow)),
+        Span::raw(": help  "),
         Span::styled("q", Style::default().fg(Color::Yellow)),
         Span::raw(": quit"),
     ]))
@@ -56,6 +58,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Error modal overlay
     if let Some(ref err) = app.error_modal {
         draw_error_modal(f, err);
+    }
+
+    // Help popup overlay
+    if app.show_help_popup {
+        draw_help_popup(f);
     }
 
     // Edit popup overlay
@@ -167,6 +174,74 @@ fn draw_error_modal(f: &mut Frame, message: &str) {
     f.render_widget(text, area);
 }
 
+fn draw_help_popup(f: &mut Frame) {
+    let area = centered_rect(70, 70, f.area());
+    let block = Block::default()
+        .title(" Execution Modes ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Relay",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  Agents run one after another in sequence. Each agent"),
+        Line::from("  receives the previous agent's full output and builds"),
+        Line::from("  on it. Over multiple iterations the baton passes around"),
+        Line::from("  the ring, progressively refining the result."),
+        Line::from(""),
+        Line::from("  Best for: deep refinement, iterative improvement,"),
+        Line::from("  tasks where each step should build on the last."),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Swarm",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  All agents run in parallel each round. After a round"),
+        Line::from("  completes, every agent receives all other agents'"),
+        Line::from("  outputs and produces an updated analysis. This repeats"),
+        Line::from("  for the configured number of iterations."),
+        Line::from(""),
+        Line::from("  Best for: multi-perspective analysis, debates,"),
+        Line::from("  cross-checking, consensus-building."),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Solo",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("  Each selected agent runs independently in parallel on"),
+        Line::from("  the same prompt. No context is shared between agents."),
+        Line::from("  Always runs exactly one iteration."),
+        Line::from(""),
+        Line::from("  Best for: comparing models head-to-head, getting"),
+        Line::from("  diverse independent answers to the same question."),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press any key to close",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let text = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block);
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(text, area);
+}
+
 fn draw_edit_popup(f: &mut Frame, app: &App) {
     let area = centered_rect(70, 60, f.area());
     let mut selected_line_idx = 0usize;
@@ -182,7 +257,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "[c]: CLI/API  [a]: key  [m]: model  [l]: list models  [t]: effort/reasoning  [d]: set/clear diagnostic provider  Esc: keep for session",
+            "[c]: CLI/API  [a]: key  [m]: model  [x]: extra CLI args  [l]: list models  [t]: effort/reasoning  [d]: set/clear diagnostic provider  Esc: keep for session",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -251,7 +326,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                 let config = app.effective_provider_config(*kind);
                 let cli_installed = app.cli_available.get(kind).copied().unwrap_or(false);
                 let use_cli = config.as_ref().map(|c| c.use_cli).unwrap_or(false);
-                let (key, model, thinking_label, has_api_key) = match &config {
+                let (key, model, extra_cli_args, thinking_label, has_api_key) = match &config {
                     Some(c) => {
                         let thinking = match kind {
                             ProviderKind::OpenAI => match c.reasoning_effort.as_deref() {
@@ -266,11 +341,22 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                         (
                             mask_key(&c.api_key),
                             c.model.clone(),
+                            if c.extra_cli_args.trim().is_empty() {
+                                "(none)".into()
+                            } else {
+                                c.extra_cli_args.clone()
+                            },
                             thinking,
                             !c.api_key.trim().is_empty(),
                         )
                     }
-                    None => ("(not set)".into(), "(not set)".into(), "off".into(), false),
+                    None => (
+                        "(not set)".into(),
+                        "(not set)".into(),
+                        "(none)".into(),
+                        "off".into(),
+                        false,
+                    ),
                 };
 
                 let (mode_text, mode_style) = if use_cli {
@@ -322,6 +408,16 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                         Span::raw(model.clone()),
                         Span::styled("  [m] [l]", Style::default().fg(Color::DarkGray)),
                     ]));
+                    let extra_cli_style = if use_cli {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    body_lines.push(Line::from(vec![
+                        Span::styled("  Extra CLI:", extra_cli_style),
+                        Span::styled(format!(" {extra_cli_args}"), extra_cli_style),
+                        Span::styled("  [x]", Style::default().fg(Color::DarkGray)),
+                    ]));
                     if !has_api_key {
                         body_lines.push(Line::from(Span::styled(
                             "            Add API key to fetch model list",
@@ -358,6 +454,15 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                         Span::styled(key, key_style),
                     ]));
                     body_lines.push(Line::from(format!("  Model:    {model}")));
+                    let extra_cli_style = if use_cli {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    body_lines.push(Line::from(vec![
+                        Span::styled("  Extra CLI:", extra_cli_style),
+                        Span::styled(format!(" {extra_cli_args}"), extra_cli_style),
+                    ]));
                     body_lines.push(Line::from(vec![
                         Span::raw(format!("  {effort_title}: ").to_string()),
                         Span::styled(thinking_label, thinking_style),
@@ -371,6 +476,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     let field_name = match app.edit_popup_field {
                         crate::app::EditField::ApiKey => "key",
                         crate::app::EditField::Model => "model",
+                        crate::app::EditField::ExtraCliArgs => "extra cli args",
                         crate::app::EditField::OutputDir => "output dir",
                     };
                     selected_line_idx = body_lines.len();
@@ -394,7 +500,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
             let config = app.effective_diagnostic_config(kind);
             let cli_installed = app.cli_available.get(&kind).copied().unwrap_or(false);
             let use_cli = config.as_ref().map(|c| c.use_cli).unwrap_or(false);
-            let (key, model, thinking_label, has_api_key) = match &config {
+            let (key, model, extra_cli_args, thinking_label, has_api_key) = match &config {
                 Some(c) => {
                     let thinking = match kind {
                         ProviderKind::OpenAI => match c.reasoning_effort.as_deref() {
@@ -409,11 +515,22 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     (
                         mask_key(&c.api_key),
                         c.model.clone(),
+                        if c.extra_cli_args.trim().is_empty() {
+                            "(none)".into()
+                        } else {
+                            c.extra_cli_args.clone()
+                        },
                         thinking,
                         !c.api_key.trim().is_empty(),
                     )
                 }
-                None => ("(not set)".into(), "(not set)".into(), "off".into(), false),
+                None => (
+                    "(not set)".into(),
+                    "(not set)".into(),
+                    "(none)".into(),
+                    "off".into(),
+                    false,
+                ),
             };
             let (mode_text, mode_style) = if use_cli {
                 ("CLI", Style::default().fg(Color::Green))
@@ -464,6 +581,16 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                 Span::styled(key, key_style),
                 Span::styled("  [a]", Style::default().fg(Color::DarkGray)),
             ]));
+            let extra_cli_style = if use_cli {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            body_lines.push(Line::from(vec![
+                Span::styled("  Extra CLI:", extra_cli_style),
+                Span::styled(format!(" {extra_cli_args}"), extra_cli_style),
+                Span::styled("  [x]", Style::default().fg(Color::DarkGray)),
+            ]));
             if !active {
                 body_lines.push(Line::from(Span::styled(
                     "  Diagnostics are currently off for this provider",
@@ -500,6 +627,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                 let field_name = match app.edit_popup_field {
                     crate::app::EditField::ApiKey => "key",
                     crate::app::EditField::Model => "model",
+                    crate::app::EditField::ExtraCliArgs => "extra cli args",
                     crate::app::EditField::OutputDir => "output dir",
                 };
                 selected_line_idx = body_lines.len();

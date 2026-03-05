@@ -106,18 +106,21 @@ api_key = ""
 model = "claude-sonnet-4-5"
 thinking_effort = "medium"
 use_cli = false
+extra_cli_args = ""
 
 [providers.openai]
 api_key = ""
 model = "gpt-5"
 reasoning_effort = "medium"
 use_cli = false
+extra_cli_args = ""
 
 [providers.gemini]
 api_key = ""
 model = "gemini-2.5-pro"
 thinking_effort = "medium"
 use_cli = false
+extra_cli_args = ""
 
 # Diagnostics are configured separately from run providers.
 [diagnostics.anthropic]
@@ -125,18 +128,21 @@ api_key = ""
 model = "claude-sonnet-4-5"
 thinking_effort = "low"
 use_cli = false
+extra_cli_args = ""
 
 [diagnostics.openai]
 api_key = ""
 model = "gpt-5-mini"
 reasoning_effort = "low"
 use_cli = false
+extra_cli_args = ""
 
 [diagnostics.gemini]
 api_key = ""
 model = "gemini-2.5-pro"
 thinking_effort = "low"
 use_cli = false
+extra_cli_args = ""
 ```
 
 Field notes:
@@ -145,6 +151,7 @@ Field notes:
 - `default_max_tokens`: request token budget sent to providers.
 - `max_history_messages`: max chat history kept per provider session.
 - `use_cli = true`: use local CLI binary instead of HTTP API.
+- `extra_cli_args`: single raw string appended as one extra CLI argument.
 - `reasoning_effort`: OpenAI-only effort setting (`low|medium|high`).
 - `thinking_effort`: Anthropic/Gemini effort setting (`low|medium|high`).
 - `diagnostic_provider`: optional provider key used for automatic diagnostics pass.
@@ -211,6 +218,6 @@ Global:
 
 ## Notes
 
-- The app prepends current working directory context to your prompt before execution.
+- When any selected agent uses CLI mode, the app prepends working directory context to the prompt.
 - API model list picker is available from config edit popup (`l`) when API key is present.
 - Session edits in popup are in-memory until you save with `s`.
