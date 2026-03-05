@@ -157,7 +157,7 @@ Field notes:
 - `model_fetch_timeout_seconds`: timeout for model list fetch in config editor.
 - `cli_timeout_seconds`: timeout for provider CLI calls (`use_cli = true`).
 - `use_cli = true`: use local CLI binary instead of HTTP API.
-- `extra_cli_args`: single raw string appended as one extra CLI argument.
+- `extra_cli_args`: single raw string appended as one extra CLI argument (no shell-style splitting).
 - `reasoning_effort`: OpenAI-only effort setting (`low|medium|high`).
 - `thinking_effort`: Anthropic/Gemini effort setting (`low|medium|high`).
 - `diagnostic_provider`: optional provider key used for automatic diagnostics pass.

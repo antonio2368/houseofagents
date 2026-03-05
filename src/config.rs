@@ -37,7 +37,7 @@ pub struct ProviderConfig {
     /// Use CLI tool instead of API for this provider
     #[serde(default)]
     pub use_cli: bool,
-    /// Extra CLI argument appended as a single raw token to provider CLI calls
+    /// Extra CLI argument appended as a single raw argument to provider CLI calls (no splitting)
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub extra_cli_args: String,
 }
@@ -240,8 +240,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "not = [valid").expect("write");
-        let err =
-            AppConfig::load_with_override(path.to_str()).expect_err("expected parse failure");
+        let err = AppConfig::load_with_override(path.to_str()).expect_err("expected parse failure");
         assert!(err.to_string().contains("Failed to parse config"));
     }
 

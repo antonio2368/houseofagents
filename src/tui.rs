@@ -979,6 +979,21 @@ fn start_model_fetch(app: &mut App) {
         }
     };
 
+    let timeout_secs = app.effective_model_fetch_timeout_seconds().max(1);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            app.model_picker_active = false;
+            app.model_picker_loading = false;
+            app.model_picker_rx = None;
+            app.error_modal = Some(format!("Failed to create HTTP client: {e}"));
+            return;
+        }
+    };
+
     app.model_picker_active = true;
     app.model_picker_loading = true;
     app.model_picker_all_models.clear();
@@ -988,11 +1003,6 @@ fn start_model_fetch(app: &mut App) {
 
     let (tx, rx) = mpsc::unbounded_channel();
     app.model_picker_rx = Some(rx);
-    let timeout_secs = app.effective_model_fetch_timeout_seconds().max(1);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .build()
-        .expect("Failed to create HTTP client");
 
     tokio::spawn(async move {
         let result = provider::list_models(kind, &api_key, &client).await;
@@ -1317,10 +1327,18 @@ fn start_execution(app: &mut App) {
         app.iterations
     };
 
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
         .build()
-        .expect("Failed to create HTTP client");
+    {
+        Ok(client) => client,
+        Err(e) => {
+            app.error_modal = Some(format!("Failed to create HTTP client: {e}"));
+            app.screen = Screen::Prompt;
+            app.is_running = false;
+            return;
+        }
+    };
 
     let mut providers: Vec<Box<dyn provider::Provider>> = Vec::new();
     let mut use_cli_by_kind: std::collections::HashMap<ProviderKind, bool> =
@@ -1843,12 +1861,18 @@ fn start_consolidation(app: &mut App) {
         prompt.push('\n');
     }
 
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(
             app.effective_http_timeout_seconds().max(1),
         ))
         .build()
-        .expect("Failed to create HTTP client");
+    {
+        Ok(client) => client,
+        Err(e) => {
+            app.error_modal = Some(format!("Failed to create HTTP client: {e}"));
+            return;
+        }
+    };
 
     let provider = provider::create_provider(
         provider_kind,
@@ -1984,12 +2008,18 @@ fn maybe_start_diagnostics(app: &mut App) {
     let app_errors = collect_application_errors(app, &run_dir);
     let prompt = build_diagnostic_prompt(&report_files, &app_errors, pconfig.use_cli);
 
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(
             app.effective_http_timeout_seconds().max(1),
         ))
         .build()
-        .expect("Failed to create HTTP client");
+    {
+        Ok(client) => client,
+        Err(e) => {
+            app.error_modal = Some(format!("Failed to create HTTP client: {e}"));
+            return;
+        }
+    };
     let provider = provider::create_provider(
         diagnostic_kind,
         &pconfig,

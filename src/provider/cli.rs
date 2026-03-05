@@ -66,6 +66,15 @@ impl CliProvider {
         self.thinking_effort.as_deref()
     }
 
+    fn extra_cli_arg(&self) -> Option<String> {
+        let trimmed = self.extra_cli_args.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
     fn build_prompt_from_history(&self) -> String {
         let mut prompt = String::new();
         for msg in &self.history {
@@ -333,8 +342,8 @@ impl Provider for CliProvider {
             args.push("--model".to_string());
             args.push(self.model.clone());
         }
-        for arg in self.extra_cli_args.split_whitespace() {
-            args.push(arg.to_string());
+        if let Some(extra_arg) = self.extra_cli_arg() {
+            args.push(extra_arg);
         }
         self.push_command_debug(&mut debug_logs, bin, &args);
         self.emit_live_log(format!("start {} (timeout {}s)", bin, self.timeout_seconds));
@@ -547,5 +556,48 @@ impl Provider for CliProvider {
             content,
             debug_logs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CliProvider;
+    use crate::provider::ProviderKind;
+
+    fn provider_with_extra(extra: &str) -> CliProvider {
+        CliProvider::new(
+            ProviderKind::OpenAI,
+            String::new(),
+            None,
+            None,
+            extra.to_string(),
+            Vec::new(),
+            30,
+            50,
+        )
+    }
+
+    #[test]
+    fn extra_cli_arg_none_when_blank() {
+        let provider = provider_with_extra("   ");
+        assert_eq!(provider.extra_cli_arg(), None);
+    }
+
+    #[test]
+    fn extra_cli_arg_uses_single_trimmed_argument_without_splitting() {
+        let provider = provider_with_extra("  --config key=value with spaces  ");
+        assert_eq!(
+            provider.extra_cli_arg(),
+            Some("--config key=value with spaces".to_string())
+        );
+    }
+
+    #[test]
+    fn extra_cli_arg_preserves_quote_characters() {
+        let provider = provider_with_extra("--opt \"quoted value\"");
+        assert_eq!(
+            provider.extra_cli_arg(),
+            Some("--opt \"quoted value\"".to_string())
+        );
     }
 }
