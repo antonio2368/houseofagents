@@ -4,10 +4,9 @@
 
 **Multi-agent prompt runner with a terminal UI**
 
-Run Claude, Codex, and Gemini in collaborative execution modes, save all artifacts to disk,
-and optionally generate a diagnostics report.
+Run Claude, Codex, and Gemini in collaborative execution modes and save all artifacts to disk.
 
-[![Rust](https://img.shields.io/badge/Rust-1.80%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange?logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
@@ -43,7 +42,7 @@ Each provider can run in API mode or CLI mode (`use_cli = true`). Mix and match 
 
 ## Requirements
 
-- **Rust 1.80+** and Cargo
+- **Rust 1.85+** and Cargo
 - A terminal with TUI support
 - At least one provider configured via API key **or** locally-installed CLI with auth set up
 
