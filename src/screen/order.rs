@@ -10,14 +10,18 @@ pub fn draw(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Title
-            Constraint::Min(0),   // Order list
+            Constraint::Min(0),    // Order list
             Constraint::Length(3), // Help bar
         ])
         .split(f.area());
 
     // Title
     let title = Paragraph::new("Relay Order — arrange agent execution sequence")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(title, chunks[0]);
 
@@ -30,9 +34,9 @@ pub fn draw(f: &mut Frame, app: &App) {
             let is_cursor = i == app.order_cursor;
             let is_grabbed = app.order_grabbed == Some(i);
             let prefix = if is_grabbed {
-                ">> "
+                ">> ".to_string()
             } else {
-                format!("{}. ", i + 1).leak()
+                format!("{}. ", i + 1)
             };
 
             let style = if is_grabbed {
@@ -66,7 +70,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::styled("Space", Style::default().fg(Color::Yellow)),
         Span::raw(": grab/release  "),
         Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(": confirm  "),
+        Span::raw(": start (cursor can be first)  "),
         Span::styled("Esc", Style::default().fg(Color::Yellow)),
         Span::raw(": back"),
     ]))

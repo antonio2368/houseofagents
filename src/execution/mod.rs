@@ -5,6 +5,8 @@ pub mod swarm;
 use crate::provider::ProviderKind;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionMode {
@@ -31,17 +33,25 @@ impl ExecutionMode {
     }
 
     pub fn all() -> &'static [ExecutionMode] {
-        &[ExecutionMode::Relay, ExecutionMode::Swarm, ExecutionMode::Solo]
+        &[
+            ExecutionMode::Relay,
+            ExecutionMode::Swarm,
+            ExecutionMode::Solo,
+        ]
     }
 }
 
 impl fmt::Display for ExecutionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", match self {
-            ExecutionMode::Relay => "Relay",
-            ExecutionMode::Swarm => "Swarm",
-            ExecutionMode::Solo => "Solo",
-        })
+        write!(
+            f,
+            "{}",
+            match self {
+                ExecutionMode::Relay => "Relay",
+                ExecutionMode::Swarm => "Swarm",
+                ExecutionMode::Solo => "Solo",
+            }
+        )
     }
 }
 
@@ -51,6 +61,11 @@ pub enum ProgressEvent {
         kind: ProviderKind,
         iteration: u32,
     },
+    AgentLog {
+        kind: ProviderKind,
+        iteration: u32,
+        message: String,
+    },
     AgentFinished {
         kind: ProviderKind,
         iteration: u32,
@@ -59,6 +74,8 @@ pub enum ProgressEvent {
         kind: ProviderKind,
         iteration: u32,
         error: String,
+        /// Full error body/details for display
+        details: Option<String>,
     },
     IterationComplete {
         iteration: u32,
@@ -66,3 +83,20 @@ pub enum ProgressEvent {
     AllDone,
 }
 
+pub async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    }
+}
+
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let out: String = s.chars().take(max_chars).collect();
+    if s.chars().count() > max_chars {
+        format!("{out}...")
+    } else {
+        out
+    }
+}

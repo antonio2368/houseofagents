@@ -16,6 +16,14 @@ struct Cli {
     /// Path to config file (default: ~/.config/houseofagents/config.toml)
     #[arg(short, long)]
     config: Option<String>,
+
+    /// Write a starter config file and exit
+    #[arg(long)]
+    init_config: bool,
+
+    /// Overwrite config when used with --init-config
+    #[arg(long)]
+    force: bool,
 }
 
 #[tokio::main]
@@ -27,11 +35,23 @@ async fn main() -> anyhow::Result<()> {
         original_hook(panic_info);
     }));
 
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
+    let config_path_override = cli.config.clone();
 
-    let config = config::AppConfig::load()?;
+    if cli.init_config {
+        let path =
+            config::AppConfig::write_template_with_override(cli.config.as_deref(), cli.force)?;
+        println!("Wrote config template to {}", path.display());
+        return Ok(());
+    }
+
+    let config = match cli.config.as_deref() {
+        Some(path) => config::AppConfig::load_with_override(Some(path))?,
+        None => config::AppConfig::load()?,
+    };
 
     let mut app = app::App::new(config);
+    app.config_path_override = config_path_override;
     tui::run(&mut app).await?;
 
     Ok(())

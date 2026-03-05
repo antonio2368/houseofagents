@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod cli;
 pub mod gemini;
 pub mod openai;
 
@@ -33,7 +34,11 @@ impl ProviderKind {
     }
 
     pub fn all() -> &'static [ProviderKind] {
-        &[ProviderKind::Anthropic, ProviderKind::OpenAI, ProviderKind::Gemini]
+        &[
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAI,
+            ProviderKind::Gemini,
+        ]
     }
 }
 
@@ -87,6 +92,16 @@ pub fn create_provider(
     max_tokens: u32,
     max_history_messages: usize,
 ) -> Box<dyn Provider> {
+    if config.use_cli {
+        return Box::new(cli::CliProvider::new(
+            kind,
+            config.model.clone(),
+            config.reasoning_effort.clone(),
+            config.thinking_effort.clone(),
+            vec![],
+            max_history_messages,
+        ));
+    }
     match kind {
         ProviderKind::Anthropic => Box::new(anthropic::AnthropicProvider::new(
             config.api_key.clone(),
@@ -94,6 +109,7 @@ pub fn create_provider(
             client,
             max_tokens,
             max_history_messages,
+            config.thinking_effort.clone(),
         )),
         ProviderKind::OpenAI => Box::new(openai::OpenAIProvider::new(
             config.api_key.clone(),
@@ -101,6 +117,7 @@ pub fn create_provider(
             client,
             max_tokens,
             max_history_messages,
+            config.reasoning_effort.clone(),
         )),
         ProviderKind::Gemini => Box::new(gemini::GeminiProvider::new(
             config.api_key.clone(),
@@ -108,6 +125,33 @@ pub fn create_provider(
             client,
             max_tokens,
             max_history_messages,
+            config.thinking_effort.clone(),
         )),
+    }
+}
+
+pub fn effort_to_budget(effort: &str) -> u32 {
+    match effort {
+        "low" => 4096,
+        "medium" => 8192,
+        _ => 16384,
+    }
+}
+
+pub async fn list_models(
+    kind: ProviderKind,
+    api_key: &str,
+    client: &reqwest::Client,
+) -> Result<Vec<String>, String> {
+    if api_key.is_empty() {
+        return Err(
+            "Add API key to fetch model list. You can still type any model manually.".into(),
+        );
+    }
+
+    match kind {
+        ProviderKind::Anthropic => anthropic::list_models(api_key, client).await,
+        ProviderKind::OpenAI => openai::list_models(api_key, client).await,
+        ProviderKind::Gemini => gemini::list_models(api_key, client).await,
     }
 }

@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::execution::ProgressEvent;
+use crate::execution::{truncate_chars, wait_for_cancel, ProgressEvent};
 use crate::output::OutputManager;
 use crate::provider::{Provider, ProviderKind};
 use std::collections::HashMap;
@@ -12,13 +12,17 @@ pub async fn run_swarm(
     prompt: &str,
     mut providers: Vec<Box<dyn Provider>>,
     iterations: u32,
+    start_iteration: u32,
+    initial_last_round_outputs: HashMap<ProviderKind, String>,
+    use_cli_by_kind: HashMap<ProviderKind, bool>,
     output: &OutputManager,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
-    let mut last_round_outputs: HashMap<ProviderKind, String> = HashMap::new();
+    let mut last_round_outputs = initial_last_round_outputs;
 
-    for iteration in 1..=iterations {
+    for offset in 0..iterations {
+        let iteration = start_iteration + offset;
         if cancel.load(Ordering::Relaxed) {
             let _ = progress_tx.send(ProgressEvent::AllDone);
             return Ok(());
@@ -31,18 +35,35 @@ pub async fn run_swarm(
                 if iteration == 1 {
                     prompt.to_string()
                 } else {
-                    build_swarm_message(p.kind(), &last_round_outputs)
+                    let kind = p.kind();
+                    if use_cli_by_kind.get(&kind).copied().unwrap_or(false) {
+                        build_swarm_file_message(
+                            &last_round_outputs,
+                            output.run_dir(),
+                            iteration - 1,
+                        )
+                    } else {
+                        build_swarm_message(kind, &last_round_outputs)
+                    }
                 }
             })
             .collect();
 
         // Take ownership of providers for parallel execution
         let taken: Vec<Box<dyn Provider>> = providers.drain(..).collect();
-        let mut spawn_handles: Vec<JoinHandle<(usize, Box<dyn Provider>, Option<(ProviderKind, String)>)>> = Vec::new();
+        let mut spawn_handles: Vec<
+            JoinHandle<(usize, Box<dyn Provider>, Option<(ProviderKind, String)>)>,
+        > = Vec::new();
 
-        for (i, (mut provider, message)) in taken.into_iter().zip(messages.into_iter()).enumerate() {
+        for (i, (mut provider, message)) in taken.into_iter().zip(messages.into_iter()).enumerate()
+        {
             let kind = provider.kind();
             let _ = progress_tx.send(ProgressEvent::AgentStarted { kind, iteration });
+            let _ = progress_tx.send(ProgressEvent::AgentLog {
+                kind,
+                iteration,
+                message: "Sending request...".into(),
+            });
 
             let tx = progress_tx.clone();
             let cancel_flag = cancel.clone();
@@ -55,8 +76,29 @@ pub async fn run_swarm(
                 }
 
                 let kind = provider.kind();
-                match provider.send(&message).await {
+
+                let result = tokio::select! {
+                    res = provider.send(&message) => res,
+                    _ = wait_for_cancel(&cancel_flag) => {
+                        let _ = tx.send(ProgressEvent::AgentLog {
+                            kind, iteration: iter, message: "Cancelled".into(),
+                        });
+                        return (i, provider, None);
+                    }
+                };
+
+                match result {
                     Ok(resp) => {
+                        let preview = resp.content.lines().take(3).collect::<Vec<_>>().join(" | ");
+                        let _ = tx.send(ProgressEvent::AgentLog {
+                            kind,
+                            iteration: iter,
+                            message: format!(
+                                "Response received ({} chars): {}",
+                                resp.content.len(),
+                                truncate_chars(&preview, 80)
+                            ),
+                        });
                         let filename = format!("{}_iter{}.md", kind.config_key(), iter);
                         let path = run_dir.join(&filename);
                         let _ = std::fs::write(&path, &resp.content);
@@ -71,7 +113,8 @@ pub async fn run_swarm(
                         let _ = tx.send(ProgressEvent::AgentError {
                             kind,
                             iteration: iter,
-                            error: err_str,
+                            error: err_str.clone(),
+                            details: Some(err_str),
                         });
                         (i, provider, None)
                     }
@@ -103,10 +146,7 @@ pub async fn run_swarm(
     Ok(())
 }
 
-fn build_swarm_message(
-    _current: ProviderKind,
-    outputs: &HashMap<ProviderKind, String>,
-) -> String {
+fn build_swarm_message(_current: ProviderKind, outputs: &HashMap<ProviderKind, String>) -> String {
     let mut msg = String::from("Here are the outputs from all agents in the previous round:\n\n");
     for kind in ProviderKind::all() {
         if let Some(output) = outputs.get(kind) {
@@ -120,3 +160,22 @@ fn build_swarm_message(
     msg.push_str("Review all perspectives and provide your updated analysis.");
     msg
 }
+
+fn build_swarm_file_message(
+    outputs: &HashMap<ProviderKind, String>,
+    run_dir: &std::path::Path,
+    prev_iteration: u32,
+) -> String {
+    let mut msg = String::from(
+        "Read the previous round agent outputs from files and synthesize them into an updated analysis.\n\nFiles:\n",
+    );
+    for kind in ProviderKind::all() {
+        if outputs.contains_key(kind) {
+            let path = run_dir.join(format!("{}_iter{}.md", kind.config_key(), prev_iteration));
+            msg.push_str(&format!("- {}: {}\n", kind.display_name(), path.display()));
+        }
+    }
+    msg.push_str("\nUse the file contents as the source of truth.");
+    msg
+}
+
