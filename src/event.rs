@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 #[allow(dead_code)]
 pub enum Event {
     Key(KeyEvent),
+    Paste(String),
     Tick,
     Resize(u16, u16),
 }
@@ -41,6 +42,11 @@ impl EventHandler {
                     match event::read() {
                         Ok(CrosstermEvent::Key(key)) => {
                             if sender.send(Event::Key(key)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(CrosstermEvent::Paste(text)) => {
+                            if sender.send(Event::Paste(text)).is_err() {
                                 break;
                             }
                         }

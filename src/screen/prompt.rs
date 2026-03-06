@@ -1,20 +1,26 @@
 use crate::app::{App, PromptFocus};
+use crate::execution::ExecutionMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 pub fn draw(f: &mut Frame, app: &App) {
+    let is_solo = app.selected_mode == ExecutionMode::Solo;
+    let options_height = if is_solo { 0 } else { 3 };
+    let iterations_height = if is_solo { 0 } else { 3 };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(0),    // Prompt text area
-            Constraint::Length(3), // Session name
-            Constraint::Length(3), // Iterations
-            Constraint::Length(3), // Resume previous
-            Constraint::Length(3), // Help bar
+            Constraint::Length(3),                // Title
+            Constraint::Min(0),                   // Prompt text area
+            Constraint::Length(3),                // Session name
+            Constraint::Length(iterations_height), // Iterations
+            Constraint::Length(options_height),    // Options row (Resume / Forward Prompt)
+            Constraint::Length(3),                // Help bar
         ])
         .split(f.area());
 
@@ -130,7 +136,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let iter_info = if app.selected_mode == crate::execution::ExecutionMode::Solo {
+    let iter_info = if is_solo {
         "(Solo mode: always 1 iteration)".to_string()
     } else if app.prompt_focus == PromptFocus::Iterations {
         format!("{}_", app.iterations_buf)
@@ -146,35 +152,72 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
     f.render_widget(iterations, chunks[3]);
 
-    // Resume previous session (relay/swarm only)
-    let resume_available = app.selected_mode != crate::execution::ExecutionMode::Solo;
-    let resume_text = if resume_available {
-        if app.resume_previous {
+    // Options row: Resume + Forward Prompt (hidden for Solo)
+    if !is_solo {
+        let is_relay = app.selected_mode == ExecutionMode::Relay;
+        let option_cols = if is_relay {
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[4])
+        } else {
+            // Swarm: only Resume, full width
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(100), Constraint::Min(0)])
+                .split(chunks[4])
+        };
+
+        // Resume box
+        let resume_border = if app.prompt_focus == PromptFocus::Resume {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let resume_text = if app.resume_previous {
             "on (uses session name, or latest compatible run if empty)"
         } else {
             "off"
+        };
+        let resume_style = if app.resume_previous {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        let resume = Paragraph::new(resume_text).style(resume_style).block(
+            Block::default()
+                .title(" Resume ")
+                .borders(Borders::ALL)
+                .border_style(resume_border),
+        );
+        f.render_widget(resume, option_cols[0]);
+
+        // Forward Prompt box (Relay only)
+        if is_relay {
+            let fp_border = if app.prompt_focus == PromptFocus::ForwardPrompt {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let fp_text = if app.forward_prompt { "on" } else { "off" };
+            let fp_style = if app.forward_prompt {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default()
+            };
+            let fp = Paragraph::new(fp_text).style(fp_style).block(
+                Block::default()
+                    .title(" Forward Prompt ")
+                    .borders(Borders::ALL)
+                    .border_style(fp_border),
+            );
+            f.render_widget(fp, option_cols[1]);
         }
-    } else {
-        "(not available in Solo mode)"
-    };
-    let resume_style = if resume_available && app.resume_previous {
-        Style::default().fg(Color::Green)
-    } else if !resume_available {
-        Style::default().fg(Color::DarkGray)
-    } else {
-        Style::default()
-    };
-    let resume = Paragraph::new(resume_text).style(resume_style).block(
-        Block::default()
-            .title(" Resume Previous [r] ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    f.render_widget(resume, chunks[4]);
+    }
 
     // Help bar
     let help_spans: Vec<Span> = match app.prompt_focus {
-        PromptFocus::Iterations if app.selected_mode != crate::execution::ExecutionMode::Solo => {
+        PromptFocus::Iterations if !is_solo => {
             vec![
                 Span::styled("Type", Style::default().fg(Color::Yellow)),
                 Span::raw(": set value  "),
@@ -184,8 +227,6 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Span::raw(": decrease  "),
                 Span::styled("Tab", Style::default().fg(Color::Yellow)),
                 Span::raw(": next field  "),
-                Span::styled("r", Style::default().fg(Color::Yellow)),
-                Span::raw(": toggle resume  "),
                 Span::styled("Enter/F5", Style::default().fg(Color::Yellow)),
                 Span::raw(": run  "),
                 Span::styled("Esc", Style::default().fg(Color::Yellow)),
@@ -194,6 +235,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         PromptFocus::Text => {
             vec![
+                Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
+                Span::raw(": line  "),
                 Span::styled("←/→", Style::default().fg(Color::Yellow)),
                 Span::raw(": move  "),
                 Span::styled("Alt+←/→", Style::default().fg(Color::Yellow)),
@@ -202,9 +245,19 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Span::raw(": delete word  "),
                 Span::styled("Tab", Style::default().fg(Color::Yellow)),
                 Span::raw(": next field  "),
-                Span::styled("r", Style::default().fg(Color::Yellow)),
-                Span::raw(": toggle resume  "),
                 Span::styled("F5", Style::default().fg(Color::Yellow)),
+                Span::raw(": run  "),
+                Span::styled("Esc", Style::default().fg(Color::Yellow)),
+                Span::raw(": back"),
+            ]
+        }
+        PromptFocus::Resume | PromptFocus::ForwardPrompt => {
+            vec![
+                Span::styled("Space", Style::default().fg(Color::Yellow)),
+                Span::raw(": toggle  "),
+                Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                Span::raw(": next field  "),
+                Span::styled("Enter/F5", Style::default().fg(Color::Yellow)),
                 Span::raw(": run  "),
                 Span::styled("Esc", Style::default().fg(Color::Yellow)),
                 Span::raw(": back"),
@@ -214,8 +267,6 @@ pub fn draw(f: &mut Frame, app: &App) {
             vec![
                 Span::styled("Tab", Style::default().fg(Color::Yellow)),
                 Span::raw(": next field  "),
-                Span::styled("r", Style::default().fg(Color::Yellow)),
-                Span::raw(": toggle resume  "),
                 Span::styled("Enter/F5", Style::default().fg(Color::Yellow)),
                 Span::raw(": run  "),
                 Span::styled("Esc", Style::default().fg(Color::Yellow)),
@@ -254,11 +305,22 @@ fn prompt_cursor_layout(
             continue;
         }
 
-        col += 1;
-        if col >= width {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).min(width);
+        if ch_width == 0 {
+            continue;
+        }
+
+        if col >= width || col + ch_width > width {
             row += 1;
             col = 0;
         }
+
+        col += ch_width;
+    }
+
+    if col >= width {
+        row += col / width;
+        col %= width;
     }
 
     let scroll = row.saturating_sub(height - 1) as u16;
@@ -288,6 +350,26 @@ mod tests {
     #[test]
     fn prompt_cursor_layout_handles_newline() {
         assert_eq!(prompt_cursor_layout("ab\ncd", 4, 10, 5), (0, 1, 1));
+    }
+
+    #[test]
+    fn prompt_cursor_layout_handles_wide_characters() {
+        assert_eq!(prompt_cursor_layout("中a", "中".len(), 2, 5), (0, 0, 1));
+    }
+
+    #[test]
+    fn prompt_cursor_layout_wide_char_before_newline_no_extra_row() {
+        assert_eq!(prompt_cursor_layout("中\na", "中\n".len(), 2, 5), (0, 0, 1));
+    }
+
+    #[test]
+    fn prompt_cursor_layout_newline_after_exact_wrap_does_not_double_advance() {
+        assert_eq!(prompt_cursor_layout("abc\ndef", 4, 3, 5), (0, 0, 1));
+    }
+
+    #[test]
+    fn prompt_cursor_layout_trailing_newline_after_exact_wrap() {
+        assert_eq!(prompt_cursor_layout("abc\n", 4, 3, 5), (0, 0, 1));
     }
 
     #[test]

@@ -35,6 +35,7 @@ Each provider can run in API mode or CLI mode (`use_cli = true`). Mix and match 
 
 - **Terminal UI** — select agents, mode, prompt, and iteration count from an interactive TUI
 - **Resume runs** — pick up where you left off in relay or swarm sessions
+- **Forward Prompt** — relay mode option to include the original prompt in every handoff
 - **Consolidation** — merge multi-agent output into a single final markdown file
 - **Diagnostics** — optional post-run analysis pass that writes `errors.md`
 - **Config editor** — edit provider settings, timeouts, and models live with a popup (`e`)
@@ -205,9 +206,11 @@ extra_cli_args = ""
 | Key | Action |
 |-----|--------|
 | `Tab` | Cycle input fields |
-| `r` | Toggle resume (relay / swarm only) |
+| `Space` | Toggle focused option (Resume / Forward Prompt) |
 | `Enter` / `F5` | Start run |
 | `Esc` | Back |
+
+Fields vary by mode: Solo shows only Prompt and Session Name; Swarm adds Iterations and Resume; Relay adds Forward Prompt alongside Resume.
 
 ### Order Screen (relay with 2+ agents)
 
@@ -254,8 +257,9 @@ Directory names follow the pattern `YYYYMMDD_HHMMSS_<rand>` (with optional `_<se
 
 ## Resume, Consolidation & Diagnostics
 
-- **Resume** (`r` on Prompt screen) — available for relay and swarm modes
+- **Resume** (toggle with `Space` on Prompt screen) — available for relay and swarm modes
   - With a session name: resumes the latest run matching that name
   - Without: resumes the latest compatible run (matching mode + agents)
+- **Forward Prompt** (toggle with `Space` on Prompt screen) — relay mode only; when enabled, downstream agents receive the original prompt alongside the previous agent's output, preventing context loss in the handoff chain
 - **Consolidation** — offered after non-cancelled swarm/solo runs; produces a single merged markdown
 - **Diagnostics** — when `diagnostic_provider` is set, a final analysis pass writes `errors.md`

@@ -14,6 +14,7 @@ pub async fn run_relay(
     iterations: u32,
     start_iteration: u32,
     initial_last_output: Option<String>,
+    forward_prompt: bool,
     use_cli_by_kind: HashMap<ProviderKind, bool>,
     output: &OutputManager,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
@@ -51,6 +52,11 @@ pub async fn run_relay(
                     agent_kinds[i - 1]
                 };
                 let receiver_is_cli = use_cli_by_kind.get(&kind).copied().unwrap_or(false);
+                let task_prefix = if forward_prompt {
+                    format!("Original task: {}\n\n", prompt)
+                } else {
+                    String::new()
+                };
                 if receiver_is_cli {
                     let prev_iteration = if i == 0 { iteration - 1 } else { iteration };
                     let prev_path = output.run_dir().join(format!(
@@ -59,14 +65,15 @@ pub async fn run_relay(
                         prev_iteration
                     ));
                     format!(
-                        "Read the previous agent output from file and build on it.\n\nPrevious agent: {}\nFile: {}\n\nUse that file as the source of truth and provide an improved response.",
+                        "{}Read the previous agent output from file and build on it.\n\nPrevious agent: {}\nFile: {}\n\nUse that file as the source of truth and provide an improved response.",
+                        task_prefix,
                         prev_kind.display_name(),
                         prev_path.display()
                     )
                 } else {
                     format!(
-                        "Here is the output from {} (the previous agent):\n\n---\n{}\n---\n\nPlease build upon and improve this work.",
-                        prev_kind.display_name(), last_output
+                        "{}Here is the output from {} (the previous agent):\n\n---\n{}\n---\n\nPlease build upon and improve this work.",
+                        task_prefix, prev_kind.display_name(), last_output
                     )
                 }
             };
@@ -206,6 +213,7 @@ mod tests {
             1,
             1,
             None,
+            false,
             HashMap::new(),
             &out,
             tx,
@@ -250,7 +258,7 @@ mod tests {
         let mut use_cli = HashMap::new();
         use_cli.insert(ProviderKind::OpenAI, true);
 
-        run_relay("p", providers, 1, 1, None, use_cli, &out, tx, cancel)
+        run_relay("p", providers, 1, 1, None, false, use_cli, &out, tx, cancel)
             .await
             .expect("run");
 
@@ -278,6 +286,7 @@ mod tests {
             1,
             2,
             Some("resume seed".to_string()),
+            false,
             HashMap::new(),
             &out,
             tx,
@@ -310,6 +319,7 @@ mod tests {
             1,
             3,
             None,
+            false,
             HashMap::new(),
             &out,
             tx,
@@ -336,7 +346,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        run_relay("p", providers, 2, 1, None, HashMap::new(), &out, tx, cancel)
+        run_relay("p", providers, 2, 1, None, false, HashMap::new(), &out, tx, cancel)
             .await
             .expect("run");
 
@@ -362,7 +372,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(true));
 
-        run_relay("p", providers, 1, 1, None, HashMap::new(), &out, tx, cancel)
+        run_relay("p", providers, 1, 1, None, false, HashMap::new(), &out, tx, cancel)
             .await
             .expect("run");
 
@@ -386,7 +396,7 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        run_relay("p", providers, 2, 1, None, HashMap::new(), &out, tx, cancel)
+        run_relay("p", providers, 2, 1, None, false, HashMap::new(), &out, tx, cancel)
             .await
             .expect("run");
 
@@ -408,5 +418,93 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn run_relay_forward_prompt_prepends_original_task() {
+        let dir = tempdir().expect("tempdir");
+        let out = OutputManager::new(dir.path(), None).expect("out");
+        let recv_a = Arc::new(Mutex::new(Vec::new()));
+        let recv_b = Arc::new(Mutex::new(Vec::new()));
+        let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(MockProvider::with_responses(
+                ProviderKind::Anthropic,
+                vec![ok_response("first output")],
+                recv_a.clone(),
+            )),
+            Box::new(MockProvider::with_responses(
+                ProviderKind::OpenAI,
+                vec![ok_response("second output")],
+                recv_b.clone(),
+            )),
+        ];
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        run_relay(
+            "write a poem",
+            providers,
+            1,
+            1,
+            None,
+            true,
+            HashMap::new(),
+            &out,
+            tx,
+            cancel,
+        )
+        .await
+        .expect("run");
+
+        let a_msgs = recv_a.lock().expect("lock");
+        assert_eq!(a_msgs[0], "write a poem");
+        let b_msgs = recv_b.lock().expect("lock");
+        assert!(b_msgs[0].contains("Original task: write a poem"));
+        assert!(b_msgs[0].contains("first output"));
+        assert!(b_msgs[0].contains("Please build upon and improve this work."));
+    }
+
+    #[tokio::test]
+    async fn run_relay_forward_prompt_for_cli_receiver_includes_original_task() {
+        let dir = tempdir().expect("tempdir");
+        let out = OutputManager::new(dir.path(), None).expect("out");
+        let recv_a = Arc::new(Mutex::new(Vec::new()));
+        let recv_b = Arc::new(Mutex::new(Vec::new()));
+        let providers: Vec<Box<dyn Provider>> = vec![
+            Box::new(MockProvider::with_responses(
+                ProviderKind::Anthropic,
+                vec![ok_response("first output")],
+                recv_a,
+            )),
+            Box::new(MockProvider::with_responses(
+                ProviderKind::OpenAI,
+                vec![ok_response("second output")],
+                recv_b.clone(),
+            )),
+        ];
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut use_cli = HashMap::new();
+        use_cli.insert(ProviderKind::OpenAI, true);
+
+        run_relay(
+            "write a poem",
+            providers,
+            1,
+            1,
+            None,
+            true,
+            use_cli,
+            &out,
+            tx,
+            cancel,
+        )
+        .await
+        .expect("run");
+
+        let b_msgs = recv_b.lock().expect("lock");
+        assert!(b_msgs[0].contains("Original task: write a poem"));
+        assert!(b_msgs[0].contains("Read the previous agent output from file"));
+        assert!(b_msgs[0].contains("anthropic_iter1.md"));
     }
 }

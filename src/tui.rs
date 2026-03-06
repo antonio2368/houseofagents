@@ -10,7 +10,9 @@ use crate::execution::{ExecutionMode, ProgressEvent};
 use crate::output::OutputManager;
 use crate::provider::{self, ProviderKind};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::backend::CrosstermBackend;
@@ -23,13 +25,13 @@ use tokio::sync::mpsc;
 
 pub fn restore_terminal() -> io::Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen)?;
+    execute!(stdout(), LeaveAlternateScreen, DisableBracketedPaste)?;
     Ok(())
 }
 
 pub async fn run(app: &mut App) -> anyhow::Result<()> {
     terminal::enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
     let _terminal_guard = TerminalRestoreGuard;
 
     let backend = CrosstermBackend::new(stdout());
@@ -47,6 +49,7 @@ pub async fn run(app: &mut App) -> anyhow::Result<()> {
                     Event::Key(key) => {
                         handle_key(app, key);
                     }
+                    Event::Paste(text) => handle_paste(app, &text),
                     Event::Tick => {}
                     Event::Resize(_, _) => {}
                 }
@@ -151,6 +154,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_paste(app: &mut App, text: &str) {
+    if app.error_modal.is_some() {
+        app.error_modal = None;
+        return;
+    }
+
+    if app.show_help_popup || app.show_edit_popup {
+        return;
+    }
+
+    if app.screen == Screen::Prompt && app.prompt_focus == PromptFocus::Text {
+        insert_prompt_text(app, text);
+    }
+}
+
 fn handle_home_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Char('q') => app.should_quit = true,
@@ -212,6 +230,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
                 app.prompt_cursor = app.prompt_text.len();
                 app.iterations_buf = app.iterations.to_string();
                 app.resume_previous = false;
+                app.forward_prompt = false;
             }
         }
         _ => {}
@@ -252,36 +271,48 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
             app.screen = Screen::Home;
         }
         KeyCode::Tab => {
-            app.prompt_focus = match app.prompt_focus {
-                PromptFocus::Text => PromptFocus::SessionName,
-                PromptFocus::SessionName => {
+            app.prompt_focus = match (&app.prompt_focus, app.selected_mode) {
+                (PromptFocus::Text, _) => PromptFocus::SessionName,
+                (PromptFocus::SessionName, ExecutionMode::Solo) => PromptFocus::Text,
+                (PromptFocus::SessionName, _) => {
                     app.iterations_buf = app.iterations.to_string();
                     PromptFocus::Iterations
                 }
-                PromptFocus::Iterations => {
+                (PromptFocus::Iterations, _) => {
                     sync_iterations_buf(app);
-                    PromptFocus::Text
+                    PromptFocus::Resume
                 }
+                (PromptFocus::Resume, ExecutionMode::Relay) => PromptFocus::ForwardPrompt,
+                (PromptFocus::Resume, _) => PromptFocus::Text,
+                (PromptFocus::ForwardPrompt, _) => PromptFocus::Text,
             };
         }
         KeyCode::BackTab => {
-            app.prompt_focus = match app.prompt_focus {
-                PromptFocus::Text => {
-                    app.iterations_buf = app.iterations.to_string();
-                    PromptFocus::Iterations
-                }
-                PromptFocus::SessionName => PromptFocus::Text,
-                PromptFocus::Iterations => {
+            app.prompt_focus = match (&app.prompt_focus, app.selected_mode) {
+                (PromptFocus::Text, ExecutionMode::Solo) => PromptFocus::SessionName,
+                (PromptFocus::Text, ExecutionMode::Relay) => PromptFocus::ForwardPrompt,
+                (PromptFocus::Text, _) => PromptFocus::Resume,
+                (PromptFocus::SessionName, _) => PromptFocus::Text,
+                (PromptFocus::Iterations, _) => {
                     sync_iterations_buf(app);
                     PromptFocus::SessionName
                 }
+                (PromptFocus::Resume, _) => {
+                    app.iterations_buf = app.iterations.to_string();
+                    PromptFocus::Iterations
+                }
+                (PromptFocus::ForwardPrompt, _) => PromptFocus::Resume,
             };
         }
-        KeyCode::Char('r')
-            if app.selected_mode != ExecutionMode::Solo
-                && app.prompt_focus == PromptFocus::Iterations =>
+        KeyCode::Char(' ')
+            if app.prompt_focus == PromptFocus::Resume =>
         {
             app.resume_previous = !app.resume_previous;
+        }
+        KeyCode::Char(' ')
+            if app.prompt_focus == PromptFocus::ForwardPrompt =>
+        {
+            app.forward_prompt = !app.forward_prompt;
         }
         KeyCode::F(5) | KeyCode::Enter
             if key.code == KeyCode::F(5) || app.prompt_focus != PromptFocus::Text =>
@@ -344,6 +375,7 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                     _ => {}
                 }
             }
+            PromptFocus::Resume | PromptFocus::ForwardPrompt => {}
         },
     }
 }
@@ -361,6 +393,7 @@ fn handle_prompt_text_key(app: &mut App, key: KeyEvent) {
                 app.prompt_cursor = prev_char_boundary(&app.prompt_text, app.prompt_cursor);
             }
         }
+        KeyCode::Up => move_prompt_cursor_line_up(app),
         KeyCode::Right => {
             if alt {
                 move_prompt_cursor_word_right(app);
@@ -368,6 +401,7 @@ fn handle_prompt_text_key(app: &mut App, key: KeyEvent) {
                 app.prompt_cursor = next_char_boundary(&app.prompt_text, app.prompt_cursor);
             }
         }
+        KeyCode::Down => move_prompt_cursor_line_down(app),
         KeyCode::Home => app.prompt_cursor = 0,
         KeyCode::End => app.prompt_cursor = app.prompt_text.len(),
         KeyCode::Backspace => {
@@ -378,15 +412,28 @@ fn handle_prompt_text_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Enter => {
-            app.prompt_text.insert(app.prompt_cursor, '\n');
-            app.prompt_cursor += '\n'.len_utf8();
+            insert_prompt_text(app, "\n");
         }
         KeyCode::Char(c) if !alt && !ctrl => {
-            app.prompt_text.insert(app.prompt_cursor, c);
-            app.prompt_cursor += c.len_utf8();
+            let mut s = [0u8; 4];
+            insert_prompt_text(app, c.encode_utf8(&mut s));
         }
         _ => {}
     }
+}
+
+fn insert_prompt_text(app: &mut App, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    clamp_prompt_cursor(app);
+    let normalized = if text.contains('\r') {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+    app.prompt_text.insert_str(app.prompt_cursor, &normalized);
+    app.prompt_cursor += normalized.len();
 }
 
 fn clamp_prompt_cursor(app: &mut App) {
@@ -481,6 +528,63 @@ fn move_prompt_cursor_word_right(app: &mut App) {
         }
     }
     app.prompt_cursor = idx;
+}
+
+fn line_start(text: &str, cursor: usize) -> usize {
+    text[..cursor].rfind('\n').map_or(0, |idx| idx + 1)
+}
+
+fn line_end(text: &str, cursor: usize) -> usize {
+    text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |offset| cursor + offset)
+}
+
+fn char_offset_in_line(text: &str, cursor: usize, start: usize) -> usize {
+    text[start..cursor].chars().count()
+}
+
+fn byte_index_for_char_offset(text: &str, start: usize, end: usize, char_offset: usize) -> usize {
+    if start >= end {
+        return start;
+    }
+    for (seen, (offset, _)) in text[start..end].char_indices().enumerate() {
+        if seen == char_offset {
+            return start + offset;
+        }
+    }
+    end
+}
+
+fn move_prompt_cursor_line_up(app: &mut App) {
+    clamp_prompt_cursor(app);
+    let curr_start = line_start(&app.prompt_text, app.prompt_cursor);
+    if curr_start == 0 {
+        return;
+    }
+    let target_col = char_offset_in_line(&app.prompt_text, app.prompt_cursor, curr_start);
+
+    let prev_end = curr_start - 1;
+    let prev_start = app.prompt_text[..prev_end].rfind('\n').map_or(0, |idx| idx + 1);
+    app.prompt_cursor =
+        byte_index_for_char_offset(&app.prompt_text, prev_start, prev_end, target_col);
+}
+
+fn move_prompt_cursor_line_down(app: &mut App) {
+    clamp_prompt_cursor(app);
+    let curr_start = line_start(&app.prompt_text, app.prompt_cursor);
+    let curr_end = line_end(&app.prompt_text, app.prompt_cursor);
+    if curr_end == app.prompt_text.len() {
+        return;
+    }
+    let target_col = char_offset_in_line(&app.prompt_text, app.prompt_cursor, curr_start);
+
+    let next_start = curr_end + 1;
+    let next_end = app.prompt_text[next_start..]
+        .find('\n')
+        .map_or(app.prompt_text.len(), |offset| next_start + offset);
+    app.prompt_cursor =
+        byte_index_for_char_offset(&app.prompt_text, next_start, next_end, target_col);
 }
 
 fn delete_prompt_char_left(app: &mut App) {
@@ -679,6 +783,7 @@ fn reset_to_home(app: &mut App) {
     app.iterations = 1;
     app.iterations_buf = "1".into();
     app.resume_previous = false;
+    app.forward_prompt = false;
     app.consolidation_active = false;
     app.consolidation_phase = ConsolidationPhase::Confirm;
     app.consolidation_provider_cursor = 0;
@@ -1321,6 +1426,7 @@ fn start_execution(app: &mut App) {
     }
     let agents = app.selected_agents.clone();
     let mode = app.selected_mode;
+    let forward_prompt_flag = app.forward_prompt;
     let iterations = if mode == ExecutionMode::Solo {
         1
     } else {
@@ -1560,6 +1666,7 @@ fn start_execution(app: &mut App) {
                     iterations,
                     start_iteration,
                     relay_initial_last_output,
+                    forward_prompt_flag,
                     use_cli_by_kind.clone(),
                     &output,
                     tx.clone(),
@@ -2242,6 +2349,7 @@ mod tests {
     use super::*;
     use crate::config::AppConfig;
     use crate::execution::ProgressEvent;
+    use crossterm::event::KeyEvent;
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -2263,6 +2371,10 @@ mod tests {
 
     fn test_app() -> App {
         App::new(test_config())
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     fn write_session_toml(run_dir: &Path, mode: &str, agents: &[&str]) {
@@ -2722,6 +2834,47 @@ mod tests {
     }
 
     #[test]
+    fn move_prompt_cursor_line_up_and_down_preserves_column() {
+        let mut app = test_app();
+        app.prompt_text = "abc\ndefg\nhi".to_string();
+        let second_line_start = "abc\n".len();
+        app.prompt_cursor = second_line_start + 2; // after 'e'
+
+        move_prompt_cursor_line_up(&mut app);
+        assert_eq!(app.prompt_cursor, 2);
+
+        move_prompt_cursor_line_down(&mut app);
+        assert_eq!(app.prompt_cursor, second_line_start + 2);
+    }
+
+    #[test]
+    fn move_prompt_cursor_line_up_and_down_clamp_to_line_length() {
+        let mut app = test_app();
+        app.prompt_text = "a\nlonger".to_string();
+        app.prompt_cursor = app.prompt_text.len();
+
+        move_prompt_cursor_line_up(&mut app);
+        assert_eq!(app.prompt_cursor, 1);
+
+        move_prompt_cursor_line_down(&mut app);
+        assert_eq!(app.prompt_cursor, 3);
+    }
+
+    #[test]
+    fn move_prompt_cursor_line_up_down_noop_at_edges() {
+        let mut app = test_app();
+        app.prompt_text = "top\nbottom".to_string();
+
+        app.prompt_cursor = 1;
+        move_prompt_cursor_line_up(&mut app);
+        assert_eq!(app.prompt_cursor, 1);
+
+        app.prompt_cursor = app.prompt_text.len();
+        move_prompt_cursor_line_down(&mut app);
+        assert_eq!(app.prompt_cursor, app.prompt_text.len());
+    }
+
+    #[test]
     fn delete_prompt_char_left_multibyte() {
         let mut app = test_app();
         app.prompt_text = "aé".to_string();
@@ -2786,5 +2939,102 @@ mod tests {
         sync_iterations_buf(&mut app);
         assert_eq!(app.iterations, 1);
         assert_eq!(app.iterations_buf, "1");
+    }
+
+    #[test]
+    fn prompt_focus_cycle_solo_tab_and_backtab() {
+        let mut app = test_app();
+        app.selected_mode = ExecutionMode::Solo;
+        app.prompt_focus = PromptFocus::Text;
+
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::SessionName);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Text);
+
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::SessionName);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Text);
+    }
+
+    #[test]
+    fn prompt_focus_cycle_swarm_tab_and_backtab() {
+        let mut app = test_app();
+        app.selected_mode = ExecutionMode::Swarm;
+        app.prompt_focus = PromptFocus::Text;
+
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::SessionName);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Iterations);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Resume);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Text);
+
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Resume);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Iterations);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::SessionName);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Text);
+    }
+
+    #[test]
+    fn prompt_focus_cycle_relay_tab_and_backtab() {
+        let mut app = test_app();
+        app.selected_mode = ExecutionMode::Relay;
+        app.prompt_focus = PromptFocus::Text;
+
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::SessionName);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Iterations);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Resume);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::ForwardPrompt);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Text);
+
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::ForwardPrompt);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Resume);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Iterations);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::SessionName);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Text);
+    }
+
+    #[test]
+    fn handle_paste_inserts_prompt_text_and_normalizes_newlines() {
+        let mut app = test_app();
+        app.screen = Screen::Prompt;
+        app.prompt_focus = PromptFocus::Text;
+        app.prompt_text = "ab".to_string();
+        app.prompt_cursor = 1;
+
+        handle_paste(&mut app, "X\r\nY\rZ");
+        assert_eq!(app.prompt_text, "aX\nY\nZb");
+        assert_eq!(app.prompt_cursor, "aX\nY\nZ".len());
+    }
+
+    #[test]
+    fn handle_paste_ignored_outside_prompt_text() {
+        let mut app = test_app();
+        app.screen = Screen::Prompt;
+        app.prompt_focus = PromptFocus::SessionName;
+        app.prompt_text = "base".to_string();
+        app.prompt_cursor = 2;
+
+        handle_paste(&mut app, "ZZZ");
+        assert_eq!(app.prompt_text, "base");
+        assert_eq!(app.prompt_cursor, 2);
     }
 }

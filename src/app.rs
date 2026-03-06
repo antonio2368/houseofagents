@@ -40,6 +40,7 @@ pub struct App {
     pub iterations: u32,
     pub iterations_buf: String,
     pub resume_previous: bool,
+    pub forward_prompt: bool,
     pub prompt_focus: PromptFocus,
 
     // Order screen state (relay only)
@@ -114,6 +115,8 @@ pub enum PromptFocus {
     Text,
     SessionName,
     Iterations,
+    Resume,
+    ForwardPrompt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +204,7 @@ impl App {
             iterations: 1,
             iterations_buf: "1".into(),
             resume_previous: false,
+            forward_prompt: false,
             prompt_focus: PromptFocus::Text,
             order_cursor: 0,
             order_grabbed: None,
