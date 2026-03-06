@@ -28,7 +28,7 @@ Run Claude, Codex, and Gemini in collaborative execution modes and save all arti
 |----------|:---:|:---:|
 | **Anthropic** (Claude) | `api_key` | `claude` binary |
 | **OpenAI** (Codex) | `api_key` | `codex` binary |
-| **Google** (Gemini) | `api_key` | `gemini` binary |
+| **Gemini** | `api_key` | `gemini` binary |
 
 Each agent can run in API mode or CLI mode (`use_cli = true`). Mix and match freely.
 
@@ -183,10 +183,13 @@ extra_cli_args = ""
 
 | Key | Action |
 |-----|--------|
+| `j` / `k` / `Up` / `Down` | Navigate agents and modes |
 | `Space` | Toggle agent / mode selection |
 | `Tab` | Switch panels |
 | `e` | Open config editor |
+| `?` | Open help popup |
 | `Enter` | Continue to prompt |
+| `q` | Quit |
 
 ### Config Editor
 
@@ -215,7 +218,7 @@ extra_cli_args = ""
 
 | Key | Action |
 |-----|--------|
-| `Tab` | Cycle input fields |
+| `Tab` / `Shift+Tab` | Cycle input fields forward / backward |
 | `Space` | Toggle focused option (Resume / Forward Prompt) |
 | `Enter` / `F5` | Start run |
 | `Esc` | Back |
@@ -239,6 +242,7 @@ Fields vary by mode: Solo shows only Prompt and Session Name; Swarm adds Iterati
 | `Ctrl+S` | Save pipeline (always prompts for filename, prefills current name) |
 | `Ctrl+L` | Load pipeline from file |
 | `F5` | Validate and run the pipeline |
+| `?` | Open help popup |
 | `Esc` | Cancel current action / back to home |
 
 Inside the **edit popup**: `Tab` cycles between Name, Agent (use `Left`/`Right`), Prompt (text area), and Session ID fields. `Esc` closes the popup.
@@ -250,6 +254,7 @@ Inside the **edit popup**: `Tab` cycles between Name, Agent (use `Left`/`Right`)
 | `j` / `k` | Move cursor |
 | `Space` | Grab / reorder agent |
 | `Enter` | Confirm and start |
+| `Esc` | Back to prompt |
 
 ### Running Screen
 
@@ -257,13 +262,14 @@ Inside the **edit popup**: `Tab` cycles between Name, Agent (use `Left`/`Right`)
 |-----|--------|
 | `Esc` | Cancel in-flight run |
 | `Enter` | Open results after completion |
+| `q` | Quit after run completes |
 
 ### Results Screen
 
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Navigate files |
-| `Enter` | Return to home |
+| `Enter` / `Esc` | Return to home |
 | `q` | Quit |
 
 > `Ctrl+C` exits from any screen (cancels an active run first).
