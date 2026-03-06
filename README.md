@@ -232,8 +232,8 @@ Fields vary by mode: Solo shows only Prompt and Session Name; Swarm adds Iterati
 | `e` | Edit selected block (name, agent, prompt, session ID) |
 | `c` | Enter connect mode — select a second block to create a connection |
 | `x` | Enter remove-connection mode — pick a connection to delete |
-| `Arrow keys` / `h j k l` | Move selected block (swap with occupied target cell, otherwise move) |
-| `Shift+Arrow keys` / `Shift+H J K L` | Navigate/select blocks spatially without moving |
+| `Arrow keys` / `h j k l` | Navigate/select blocks spatially without moving |
+| `Shift+Arrow keys` / `Shift+H J K L` | Move selected block (swap with occupied target cell, otherwise move) |
 | `Ctrl+Arrow keys` | Scroll the builder canvas |
 | `↑`/`+` `↓`/`-` | Increment / decrement iterations (when Iterations focused) |
 | `Ctrl+S` | Save pipeline (always prompts for filename, prefills current name) |

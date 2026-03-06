@@ -597,10 +597,12 @@ fn route_wire(
     let side_lane = ((lane % gap as usize) as i16) * 2 + 1;
     let side_clamp = gap - 1;
     let tier = lane as i16;
+    // Keep the horizontal corridor in row gaps (between block rows) for all tiers.
+    // Advancing by CELL_H preserves the same in-gap offset and avoids cutting through blocks.
     let hy = fr.max(tr) as i16 * CELL_H as i16
         + BLOCK_H as i16
         + 1
-        + tier * 2;
+        + tier * CELL_H as i16;
     let v1 = ex + side_lane.min(side_clamp);
     let v2 = nx - side_lane.min(side_clamp);
 
@@ -778,9 +780,30 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
         .border_style(prompt_style);
     let prompt_inner = prompt_block.inner(chunks[4]);
     f.render_widget(prompt_block, chunks[4]);
+
+    let (prompt_scroll, prompt_cursor_col, prompt_cursor_row) = if prompt_focus {
+        prompt_cursor_layout(
+            &app.pipeline_edit_prompt_buf,
+            app.pipeline_edit_prompt_cursor,
+            prompt_inner.width as usize,
+            prompt_inner.height as usize,
+        )
+    } else {
+        (0, 0, 0)
+    };
+
     let edit_wrapped = char_wrap_text(&app.pipeline_edit_prompt_buf, prompt_inner.width as usize);
-    let prompt_p = Paragraph::new(edit_wrapped.as_str());
+    let prompt_p = Paragraph::new(edit_wrapped.as_str()).scroll((prompt_scroll, 0));
     f.render_widget(prompt_p, prompt_inner);
+
+    if prompt_focus && prompt_inner.width > 0 && prompt_inner.height > 0 {
+        let visible_row = prompt_cursor_row.saturating_sub(prompt_scroll as usize);
+        let cx = prompt_inner.x
+            + (prompt_cursor_col.min(prompt_inner.width.saturating_sub(1) as usize) as u16);
+        let cy = prompt_inner.y
+            + (visible_row.min(prompt_inner.height.saturating_sub(1) as usize) as u16);
+        f.set_cursor_position((cx, cy));
+    }
 
     // Session ID
     let sess_focus = app.pipeline_edit_field == PipelineEditField::SessionId;
@@ -1292,5 +1315,21 @@ mod routing_tests {
         assert_eq!(segs.len(), 5, "blocked corridor forces 5-segment detour");
         // Verify we don't get a 1-segment or 3-segment direct path
         assert!(segs.len() > 3);
+    }
+
+    #[test]
+    fn higher_lane_u_route_stays_out_of_blocks() {
+        // Regression: higher lanes must not place the horizontal U-route segment
+        // inside the next row of blocks.
+        let blocks = vec![
+            block_at(1, 0, 0),
+            block_at(4, 1, 0), // force same-row corridor to be blocked -> U-route
+            block_at(2, 3, 0),
+            block_at(3, 1, 1), // was intersected by lane=1 with too-tight tier spacing
+        ];
+        let occ = grid_occupancy(&blocks);
+        let segs = route_wire((0, 0), (3, 0), &occ, 1, 0, 0);
+        assert_eq!(segs.len(), 5);
+        no_seg_hits_block(&segs, &blocks);
     }
 }
