@@ -1,8 +1,10 @@
 use crate::app::{
-    App, ConsolidationPhase, EditField, EditPopupSection, HomeSection, PromptFocus, Screen,
+    App, ConsolidationPhase, EditField, EditPopupSection, HomeSection, PipelineDialogMode,
+    PipelineEditField, PipelineFocus, PromptFocus, Screen,
 };
 use crate::config::{AgentConfig, ProviderConfig};
 use crate::event::{Event, EventHandler};
+use crate::execution::pipeline::{self as pipeline_mod, BlockId};
 use crate::execution::relay::run_relay;
 use crate::execution::solo::run_solo;
 use crate::execution::swarm::run_swarm;
@@ -151,6 +153,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Screen::Order => handle_order_key(app, key),
         Screen::Running => handle_running_key(app, key),
         Screen::Results => handle_results_key(app, key),
+        Screen::Pipeline => handle_pipeline_key(app, key),
     }
 }
 
@@ -173,6 +176,8 @@ fn handle_paste(app: &mut App, text: &str) {
 
     if app.screen == Screen::Prompt && app.prompt_focus == PromptFocus::Text {
         insert_prompt_text(app, text);
+    } else if app.screen == Screen::Pipeline {
+        handle_pipeline_paste(app, text);
     }
 }
 
@@ -227,7 +232,12 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
             }
         },
         KeyCode::Enter => {
-            if app.selected_agents.is_empty() {
+            if app.selected_mode == ExecutionMode::Pipeline {
+                app.screen = Screen::Pipeline;
+                app.pipeline_focus = PipelineFocus::InitialPrompt;
+                app.pipeline_prompt_cursor = app.pipeline_def.initial_prompt.len();
+                app.pipeline_iterations_buf = app.pipeline_def.iterations.to_string();
+            } else if app.selected_agents.is_empty() {
                 app.error_modal = Some("Select at least one agent".into());
             } else {
                 app.screen = Screen::Prompt;
@@ -385,66 +395,70 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_prompt_text_key(app: &mut App, key: KeyEvent) {
-    clamp_prompt_cursor(app);
+// ---------------------------------------------------------------------------
+// Generic text editing helpers (buffer, cursor) — used by prompt and pipeline
+// ---------------------------------------------------------------------------
+
+fn handle_text_key(text: &mut String, cursor: &mut usize, key: KeyEvent) {
+    clamp_cursor(text, cursor);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     match key.code {
         KeyCode::Left => {
             if alt {
-                move_prompt_cursor_word_left(app);
+                move_cursor_word_left(text, cursor);
             } else {
-                app.prompt_cursor = prev_char_boundary(&app.prompt_text, app.prompt_cursor);
+                *cursor = prev_char_boundary(text, *cursor);
             }
         }
-        KeyCode::Up => move_prompt_cursor_line_up(app),
+        KeyCode::Up => move_cursor_line_up(text, cursor),
         KeyCode::Right => {
             if alt {
-                move_prompt_cursor_word_right(app);
+                move_cursor_word_right(text, cursor);
             } else {
-                app.prompt_cursor = next_char_boundary(&app.prompt_text, app.prompt_cursor);
+                *cursor = next_char_boundary(text, *cursor);
             }
         }
-        KeyCode::Down => move_prompt_cursor_line_down(app),
-        KeyCode::Home => app.prompt_cursor = 0,
-        KeyCode::End => app.prompt_cursor = app.prompt_text.len(),
+        KeyCode::Down => move_cursor_line_down(text, cursor),
+        KeyCode::Home => *cursor = 0,
+        KeyCode::End => *cursor = text.len(),
         KeyCode::Backspace => {
             if alt {
-                delete_prompt_word_left(app);
+                delete_word_left(text, cursor);
             } else {
-                delete_prompt_char_left(app);
+                delete_char_left(text, cursor);
             }
         }
         KeyCode::Enter => {
-            insert_prompt_text(app, "\n");
+            insert_text(text, cursor, "\n");
         }
         KeyCode::Char(c) if !alt && !ctrl => {
             let mut s = [0u8; 4];
-            insert_prompt_text(app, c.encode_utf8(&mut s));
+            insert_text(text, cursor, c.encode_utf8(&mut s));
         }
         _ => {}
     }
 }
 
-fn insert_prompt_text(app: &mut App, text: &str) {
-    if text.is_empty() {
+fn insert_text(text: &mut String, cursor: &mut usize, input: &str) {
+    if input.is_empty() {
         return;
     }
-    clamp_prompt_cursor(app);
-    let normalized = if text.contains('\r') {
-        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
+    clamp_cursor(text, cursor);
+    let normalized = if input.contains('\r') {
+        std::borrow::Cow::Owned(input.replace("\r\n", "\n").replace('\r', "\n"))
     } else {
-        std::borrow::Cow::Borrowed(text)
+        std::borrow::Cow::Borrowed(input)
     };
-    app.prompt_text.insert_str(app.prompt_cursor, &normalized);
-    app.prompt_cursor += normalized.len();
+    text.insert_str(*cursor, &normalized);
+    *cursor += normalized.len();
 }
 
-fn clamp_prompt_cursor(app: &mut App) {
-    app.prompt_cursor = app.prompt_cursor.min(app.prompt_text.len());
-    while app.prompt_cursor > 0 && !app.prompt_text.is_char_boundary(app.prompt_cursor) {
-        app.prompt_cursor -= 1;
+fn clamp_cursor(text: &str, cursor: &mut usize) {
+    *cursor = (*cursor).min(text.len());
+    while *cursor > 0 && !text.is_char_boundary(*cursor) {
+        *cursor -= 1;
     }
 }
 
@@ -484,55 +498,55 @@ fn char_at(s: &str, idx: usize) -> Option<char> {
     }
 }
 
-fn move_prompt_cursor_word_left(app: &mut App) {
-    let mut idx = app.prompt_cursor;
+fn move_cursor_word_left(text: &str, cursor: &mut usize) {
+    let mut idx = *cursor;
     while idx > 0 {
-        let Some(ch) = char_before(&app.prompt_text, idx) else {
+        let Some(ch) = char_before(text, idx) else {
             break;
         };
         if ch.is_whitespace() {
-            idx = prev_char_boundary(&app.prompt_text, idx);
+            idx = prev_char_boundary(text, idx);
         } else {
             break;
         }
     }
     while idx > 0 {
-        let Some(ch) = char_before(&app.prompt_text, idx) else {
+        let Some(ch) = char_before(text, idx) else {
             break;
         };
         if !ch.is_whitespace() {
-            idx = prev_char_boundary(&app.prompt_text, idx);
+            idx = prev_char_boundary(text, idx);
         } else {
             break;
         }
     }
-    app.prompt_cursor = idx;
+    *cursor = idx;
 }
 
-fn move_prompt_cursor_word_right(app: &mut App) {
-    let mut idx = app.prompt_cursor;
-    let len = app.prompt_text.len();
+fn move_cursor_word_right(text: &str, cursor: &mut usize) {
+    let mut idx = *cursor;
+    let len = text.len();
     while idx < len {
-        let Some(ch) = char_at(&app.prompt_text, idx) else {
+        let Some(ch) = char_at(text, idx) else {
             break;
         };
         if ch.is_whitespace() {
-            idx = next_char_boundary(&app.prompt_text, idx);
+            idx = next_char_boundary(text, idx);
         } else {
             break;
         }
     }
     while idx < len {
-        let Some(ch) = char_at(&app.prompt_text, idx) else {
+        let Some(ch) = char_at(text, idx) else {
             break;
         };
         if !ch.is_whitespace() {
-            idx = next_char_boundary(&app.prompt_text, idx);
+            idx = next_char_boundary(text, idx);
         } else {
             break;
         }
     }
-    app.prompt_cursor = idx;
+    *cursor = idx;
 }
 
 fn line_start(text: &str, cursor: usize) -> usize {
@@ -561,73 +575,743 @@ fn byte_index_for_char_offset(text: &str, start: usize, end: usize, char_offset:
     end
 }
 
-fn move_prompt_cursor_line_up(app: &mut App) {
-    clamp_prompt_cursor(app);
-    let curr_start = line_start(&app.prompt_text, app.prompt_cursor);
+fn move_cursor_line_up(text: &str, cursor: &mut usize) {
+    clamp_cursor(text, cursor);
+    let curr_start = line_start(text, *cursor);
     if curr_start == 0 {
         return;
     }
-    let target_col = char_offset_in_line(&app.prompt_text, app.prompt_cursor, curr_start);
-
+    let target_col = char_offset_in_line(text, *cursor, curr_start);
     let prev_end = curr_start - 1;
-    let prev_start = app.prompt_text[..prev_end].rfind('\n').map_or(0, |idx| idx + 1);
-    app.prompt_cursor =
-        byte_index_for_char_offset(&app.prompt_text, prev_start, prev_end, target_col);
+    let prev_start = text[..prev_end].rfind('\n').map_or(0, |idx| idx + 1);
+    *cursor = byte_index_for_char_offset(text, prev_start, prev_end, target_col);
 }
 
-fn move_prompt_cursor_line_down(app: &mut App) {
-    clamp_prompt_cursor(app);
-    let curr_start = line_start(&app.prompt_text, app.prompt_cursor);
-    let curr_end = line_end(&app.prompt_text, app.prompt_cursor);
-    if curr_end == app.prompt_text.len() {
+fn move_cursor_line_down(text: &str, cursor: &mut usize) {
+    clamp_cursor(text, cursor);
+    let curr_start = line_start(text, *cursor);
+    let curr_end = line_end(text, *cursor);
+    if curr_end == text.len() {
         return;
     }
-    let target_col = char_offset_in_line(&app.prompt_text, app.prompt_cursor, curr_start);
-
+    let target_col = char_offset_in_line(text, *cursor, curr_start);
     let next_start = curr_end + 1;
-    let next_end = app.prompt_text[next_start..]
+    let next_end = text[next_start..]
         .find('\n')
-        .map_or(app.prompt_text.len(), |offset| next_start + offset);
-    app.prompt_cursor =
-        byte_index_for_char_offset(&app.prompt_text, next_start, next_end, target_col);
+        .map_or(text.len(), |offset| next_start + offset);
+    *cursor = byte_index_for_char_offset(text, next_start, next_end, target_col);
 }
 
-fn delete_prompt_char_left(app: &mut App) {
-    if app.prompt_cursor == 0 {
+fn delete_char_left(text: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
         return;
     }
-    let start = prev_char_boundary(&app.prompt_text, app.prompt_cursor);
-    app.prompt_text.replace_range(start..app.prompt_cursor, "");
-    app.prompt_cursor = start;
+    let start = prev_char_boundary(text, *cursor);
+    text.replace_range(start..*cursor, "");
+    *cursor = start;
 }
 
-fn delete_prompt_word_left(app: &mut App) {
-    if app.prompt_cursor == 0 {
+fn delete_word_left(text: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
         return;
     }
-    let mut start = app.prompt_cursor;
+    let mut start = *cursor;
     while start > 0 {
-        let Some(ch) = char_before(&app.prompt_text, start) else {
+        let Some(ch) = char_before(text, start) else {
             break;
         };
         if ch.is_whitespace() {
-            start = prev_char_boundary(&app.prompt_text, start);
+            start = prev_char_boundary(text, start);
         } else {
             break;
         }
     }
     while start > 0 {
-        let Some(ch) = char_before(&app.prompt_text, start) else {
+        let Some(ch) = char_before(text, start) else {
             break;
         };
         if !ch.is_whitespace() {
-            start = prev_char_boundary(&app.prompt_text, start);
+            start = prev_char_boundary(text, start);
         } else {
             break;
         }
     }
-    app.prompt_text.replace_range(start..app.prompt_cursor, "");
-    app.prompt_cursor = start;
+    text.replace_range(start..*cursor, "");
+    *cursor = start;
+}
+
+// Thin wrappers for prompt screen (backward compat)
+
+fn handle_prompt_text_key(app: &mut App, key: KeyEvent) {
+    handle_text_key(&mut app.prompt_text, &mut app.prompt_cursor, key);
+}
+
+fn insert_prompt_text(app: &mut App, text: &str) {
+    insert_text(&mut app.prompt_text, &mut app.prompt_cursor, text);
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline key handling
+// ---------------------------------------------------------------------------
+
+fn handle_pipeline_paste(app: &mut App, text: &str) {
+    if app.pipeline_show_edit {
+        match app.pipeline_edit_field {
+            PipelineEditField::Prompt => {
+                insert_text(
+                    &mut app.pipeline_edit_prompt_buf,
+                    &mut app.pipeline_edit_prompt_cursor,
+                    text,
+                );
+            }
+            PipelineEditField::SessionId => {
+                app.pipeline_edit_session_buf.push_str(text);
+                app.pipeline_edit_session_cursor = app.pipeline_edit_session_buf.len();
+            }
+            PipelineEditField::Provider => {}
+        }
+    } else if let Some(PipelineDialogMode::Save) = app.pipeline_file_dialog {
+        app.pipeline_file_input.push_str(text);
+    } else {
+        match app.pipeline_focus {
+            PipelineFocus::InitialPrompt => {
+                insert_text(
+                    &mut app.pipeline_def.initial_prompt,
+                    &mut app.pipeline_prompt_cursor,
+                    text,
+                );
+            }
+            PipelineFocus::Iterations => {
+                for ch in text.chars() {
+                    if ch.is_ascii_digit() {
+                        app.pipeline_iterations_buf.push(ch);
+                    }
+                }
+            }
+            PipelineFocus::Builder => {}
+        }
+    }
+}
+
+fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
+    // Dispatch priority: edit popup > file dialog > remove-conn > connect mode > normal
+    if app.pipeline_show_edit {
+        handle_pipeline_edit_key(app, key);
+        return;
+    }
+    if app.pipeline_file_dialog.is_some() {
+        handle_pipeline_dialog_key(app, key);
+        return;
+    }
+    if app.pipeline_removing_conn {
+        handle_pipeline_remove_conn_key(app, key);
+        return;
+    }
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Connect mode
+    if app.pipeline_connecting_from.is_some() {
+        match key.code {
+            KeyCode::Esc => {
+                app.pipeline_connecting_from = None;
+            }
+            KeyCode::Enter => {
+                if let (Some(from), Some(to)) =
+                    (app.pipeline_connecting_from, app.pipeline_block_cursor)
+                {
+                    if from == to {
+                        app.error_modal = Some("Cannot connect block to itself".into());
+                    } else if app
+                        .pipeline_def
+                        .connections
+                        .iter()
+                        .any(|c| c.from == from && c.to == to)
+                    {
+                        app.error_modal = Some("Connection already exists".into());
+                    } else if pipeline_mod::would_create_cycle(&app.pipeline_def, from, to) {
+                        app.error_modal = Some("Would create a cycle".into());
+                    } else {
+                        app.pipeline_def.connections.push(
+                            pipeline_mod::PipelineConnection { from, to },
+                        );
+                        app.pipeline_connecting_from = None;
+                    }
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => pipeline_spatial_nav(app, NavAxis::Vertical, true),
+            KeyCode::Down | KeyCode::Char('j') => pipeline_spatial_nav(app, NavAxis::Vertical, false),
+            KeyCode::Left | KeyCode::Char('h') => pipeline_spatial_nav(app, NavAxis::Horizontal, true),
+            KeyCode::Right | KeyCode::Char('l') => pipeline_spatial_nav(app, NavAxis::Horizontal, false),
+            _ => {}
+        }
+        return;
+    }
+
+    // Normal pipeline keys
+    match key.code {
+        KeyCode::Esc => {
+            app.screen = Screen::Home;
+        }
+        KeyCode::Tab => {
+            app.pipeline_focus = match app.pipeline_focus {
+                PipelineFocus::InitialPrompt => PipelineFocus::Iterations,
+                PipelineFocus::Iterations => PipelineFocus::Builder,
+                PipelineFocus::Builder => PipelineFocus::InitialPrompt,
+            };
+        }
+        KeyCode::BackTab => {
+            app.pipeline_focus = match app.pipeline_focus {
+                PipelineFocus::InitialPrompt => PipelineFocus::Builder,
+                PipelineFocus::Iterations => PipelineFocus::InitialPrompt,
+                PipelineFocus::Builder => PipelineFocus::Iterations,
+            };
+        }
+        KeyCode::Char('?') if !ctrl => {
+            app.show_help_popup = true;
+            app.help_popup_scroll = 0;
+        }
+        // Ctrl+S: save
+        KeyCode::Char('s') if ctrl => {
+            if let Some(ref path) = app.pipeline_save_path {
+                if let Err(e) = pipeline_mod::save_pipeline(&app.pipeline_def, path) {
+                    app.error_modal = Some(format!("Save failed: {e}"));
+                }
+            } else {
+                // Open save dialog
+                app.pipeline_file_dialog = Some(PipelineDialogMode::Save);
+                app.pipeline_file_input = app
+                    .pipeline_save_path
+                    .as_ref()
+                    .and_then(|p| p.file_stem())
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        // Ctrl+L: load
+        KeyCode::Char('l') if ctrl => {
+            app.pipeline_file_dialog = Some(PipelineDialogMode::Load);
+            app.pipeline_file_list = pipeline_mod::list_pipeline_files()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|s| s.to_string()))
+                .collect();
+            app.pipeline_file_cursor = 0;
+        }
+        // F5: run
+        KeyCode::F(5) => {
+            start_pipeline_execution(app);
+        }
+        _ => match app.pipeline_focus {
+            PipelineFocus::InitialPrompt => {
+                handle_text_key(
+                    &mut app.pipeline_def.initial_prompt,
+                    &mut app.pipeline_prompt_cursor,
+                    key,
+                );
+            }
+            PipelineFocus::Iterations => match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.pipeline_iterations_buf.push(c);
+                }
+                KeyCode::Backspace => {
+                    app.pipeline_iterations_buf.pop();
+                }
+                _ => {}
+            },
+            PipelineFocus::Builder => handle_pipeline_builder_key(app, key),
+        },
+    }
+}
+
+fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('a') => {
+            let pos = pipeline_mod::next_free_position(&app.pipeline_def);
+            let id = app.pipeline_next_id;
+            app.pipeline_next_id += 1;
+            app.pipeline_def.blocks.push(pipeline_mod::PipelineBlock {
+                id,
+                provider: ProviderKind::Anthropic,
+                prompt: String::new(),
+                session_id: None,
+                position: pos,
+            });
+            app.pipeline_block_cursor = Some(id);
+        }
+        KeyCode::Char('d') => {
+            if let Some(sel) = app.pipeline_block_cursor {
+                app.pipeline_def.blocks.retain(|b| b.id != sel);
+                app.pipeline_def
+                    .connections
+                    .retain(|c| c.from != sel && c.to != sel);
+                app.pipeline_block_cursor = app.pipeline_def.blocks.last().map(|b| b.id);
+            }
+        }
+        KeyCode::Char('e') | KeyCode::Enter => {
+            if let Some(sel) = app.pipeline_block_cursor {
+                if let Some(block) = app.pipeline_def.blocks.iter().find(|b| b.id == sel) {
+                    app.pipeline_show_edit = true;
+                    app.pipeline_edit_field = PipelineEditField::Provider;
+                    app.pipeline_edit_provider_idx = ProviderKind::all()
+                        .iter()
+                        .position(|&k| k == block.provider)
+                        .unwrap_or(0);
+                    app.pipeline_edit_prompt_buf = block.prompt.clone();
+                    app.pipeline_edit_prompt_cursor = block.prompt.len();
+                    app.pipeline_edit_session_buf =
+                        block.session_id.clone().unwrap_or_default();
+                    app.pipeline_edit_session_cursor = app.pipeline_edit_session_buf.len();
+                }
+            }
+        }
+        KeyCode::Char('c') => {
+            if let Some(sel) = app.pipeline_block_cursor {
+                app.pipeline_connecting_from = Some(sel);
+            }
+        }
+        KeyCode::Char('x') => {
+            if let Some(sel) = app.pipeline_block_cursor {
+                let conn_count = app
+                    .pipeline_def
+                    .connections
+                    .iter()
+                    .filter(|c| c.from == sel || c.to == sel)
+                    .count();
+                if conn_count == 0 {
+                    app.error_modal = Some("No connections on this block".into());
+                } else {
+                    app.pipeline_removing_conn = true;
+                    app.pipeline_conn_cursor = 0;
+                }
+            }
+        }
+        // Arrow navigation with Ctrl for canvas scroll
+        KeyCode::Up | KeyCode::Char('k') => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.pipeline_canvas_offset.1 = app.pipeline_canvas_offset.1.saturating_sub(1);
+            } else {
+                pipeline_spatial_nav(app, NavAxis::Vertical, true);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.pipeline_canvas_offset.1 += 1;
+            } else {
+                pipeline_spatial_nav(app, NavAxis::Vertical, false);
+            }
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.pipeline_canvas_offset.0 = app.pipeline_canvas_offset.0.saturating_sub(1);
+            } else {
+                pipeline_spatial_nav(app, NavAxis::Horizontal, true);
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                app.pipeline_canvas_offset.0 += 1;
+            } else {
+                pipeline_spatial_nav(app, NavAxis::Horizontal, false);
+            }
+        }
+        _ => {}
+    }
+}
+
+enum NavAxis {
+    Horizontal,
+    Vertical,
+}
+
+fn pipeline_spatial_nav(app: &mut App, axis: NavAxis, negative: bool) {
+    let Some(sel_id) = app.pipeline_block_cursor else {
+        // Select first block if none selected
+        app.pipeline_block_cursor = app.pipeline_def.blocks.first().map(|b| b.id);
+        return;
+    };
+    let Some(sel_block) = app.pipeline_def.blocks.iter().find(|b| b.id == sel_id) else {
+        return;
+    };
+    let (sx, sy) = (sel_block.position.0 as i32, sel_block.position.1 as i32);
+
+    let mut best: Option<(BlockId, i32)> = None;
+    for block in &app.pipeline_def.blocks {
+        if block.id == sel_id {
+            continue;
+        }
+        let (bx, by) = (block.position.0 as i32, block.position.1 as i32);
+        let (dx, dy) = (bx - sx, by - sy);
+
+        let in_direction = match (&axis, negative) {
+            (NavAxis::Horizontal, true) => dx < 0 && dx.abs() >= dy.abs(),
+            (NavAxis::Horizontal, false) => dx > 0 && dx.abs() >= dy.abs(),
+            (NavAxis::Vertical, true) => dy < 0 && dy.abs() > dx.abs(),
+            (NavAxis::Vertical, false) => dy > 0 && dy.abs() > dx.abs(),
+        };
+        if !in_direction {
+            continue;
+        }
+        let dist = dx * dx + dy * dy;
+        if best.is_none_or(|(_, bd)| dist < bd) {
+            best = Some((block.id, dist));
+        }
+    }
+    if let Some((id, _)) = best {
+        app.pipeline_block_cursor = Some(id);
+    }
+}
+
+fn handle_pipeline_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.pipeline_show_edit = false;
+        }
+        KeyCode::Tab => {
+            app.pipeline_edit_field = match app.pipeline_edit_field {
+                PipelineEditField::Provider => PipelineEditField::Prompt,
+                PipelineEditField::Prompt => PipelineEditField::SessionId,
+                PipelineEditField::SessionId => PipelineEditField::Provider,
+            };
+        }
+        KeyCode::Enter => {
+            match app.pipeline_edit_field {
+                PipelineEditField::Provider | PipelineEditField::SessionId => {
+                    // Confirm and save
+                    if let Some(sel) = app.pipeline_block_cursor {
+                        if let Some(block) =
+                            app.pipeline_def.blocks.iter_mut().find(|b| b.id == sel)
+                        {
+                            block.provider = ProviderKind::all()
+                                .get(app.pipeline_edit_provider_idx)
+                                .copied()
+                                .unwrap_or(ProviderKind::Anthropic);
+                            block.prompt = app.pipeline_edit_prompt_buf.clone();
+                            block.session_id = if app.pipeline_edit_session_buf.is_empty() {
+                                None
+                            } else {
+                                Some(app.pipeline_edit_session_buf.clone())
+                            };
+                        }
+                    }
+                    app.pipeline_show_edit = false;
+                }
+                PipelineEditField::Prompt => {
+                    // Enter inserts newline in prompt field
+                    insert_text(
+                        &mut app.pipeline_edit_prompt_buf,
+                        &mut app.pipeline_edit_prompt_cursor,
+                        "\n",
+                    );
+                }
+            }
+        }
+        _ => match app.pipeline_edit_field {
+            PipelineEditField::Provider => match key.code {
+                KeyCode::Left => {
+                    let len = ProviderKind::all().len();
+                    app.pipeline_edit_provider_idx =
+                        (app.pipeline_edit_provider_idx + len - 1) % len;
+                }
+                KeyCode::Right => {
+                    app.pipeline_edit_provider_idx =
+                        (app.pipeline_edit_provider_idx + 1) % ProviderKind::all().len();
+                }
+                _ => {}
+            },
+            PipelineEditField::Prompt => {
+                handle_text_key(
+                    &mut app.pipeline_edit_prompt_buf,
+                    &mut app.pipeline_edit_prompt_cursor,
+                    key,
+                );
+            }
+            PipelineEditField::SessionId => match key.code {
+                KeyCode::Char(c) => {
+                    app.pipeline_edit_session_buf.push(c);
+                    app.pipeline_edit_session_cursor = app.pipeline_edit_session_buf.len();
+                }
+                KeyCode::Backspace => {
+                    app.pipeline_edit_session_buf.pop();
+                    app.pipeline_edit_session_cursor = app.pipeline_edit_session_buf.len();
+                }
+                _ => {}
+            },
+        },
+    }
+}
+
+fn handle_pipeline_dialog_key(app: &mut App, key: KeyEvent) {
+    match app.pipeline_file_dialog {
+        Some(PipelineDialogMode::Save) => match key.code {
+            KeyCode::Esc => {
+                app.pipeline_file_dialog = None;
+            }
+            KeyCode::Enter => {
+                if !app.pipeline_file_input.is_empty() {
+                    let dir = pipeline_mod::ensure_pipelines_dir();
+                    match dir {
+                        Ok(dir) => {
+                            let filename =
+                                format!("{}.toml", app.pipeline_file_input.trim());
+                            let path = dir.join(&filename);
+                            match pipeline_mod::save_pipeline(&app.pipeline_def, &path) {
+                                Ok(()) => {
+                                    app.pipeline_save_path = Some(path);
+                                    app.pipeline_file_dialog = None;
+                                }
+                                Err(e) => {
+                                    app.error_modal = Some(format!("Save failed: {e}"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            app.error_modal =
+                                Some(format!("Cannot create pipelines dir: {e}"));
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                app.pipeline_file_input.push(c);
+            }
+            KeyCode::Backspace => {
+                app.pipeline_file_input.pop();
+            }
+            _ => {}
+        },
+        Some(PipelineDialogMode::Load) => match key.code {
+            KeyCode::Esc => {
+                app.pipeline_file_dialog = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.pipeline_file_cursor = app.pipeline_file_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if app.pipeline_file_cursor + 1 < app.pipeline_file_list.len() {
+                    app.pipeline_file_cursor += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(filename) = app.pipeline_file_list.get(app.pipeline_file_cursor) {
+                    let path = pipeline_mod::pipelines_dir().join(filename);
+                    match pipeline_mod::load_pipeline(&path) {
+                        Ok(def) => {
+                            let max_id = def.blocks.iter().map(|b| b.id).max().unwrap_or(0);
+                            app.pipeline_next_id = max_id + 1;
+                            app.pipeline_def = def;
+                            app.pipeline_save_path = Some(path);
+                            app.pipeline_block_cursor =
+                                app.pipeline_def.blocks.first().map(|b| b.id);
+                            app.pipeline_file_dialog = None;
+                        }
+                        Err(e) => {
+                            app.error_modal = Some(format!("Load failed: {e}"));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        None => {}
+    }
+}
+
+fn handle_pipeline_remove_conn_key(app: &mut App, key: KeyEvent) {
+    let sel = app.pipeline_block_cursor.unwrap_or(0);
+    let conns: Vec<usize> = app
+        .pipeline_def
+        .connections
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.from == sel || c.to == sel)
+        .map(|(i, _)| i)
+        .collect();
+
+    match key.code {
+        KeyCode::Esc => {
+            app.pipeline_removing_conn = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.pipeline_conn_cursor = app.pipeline_conn_cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.pipeline_conn_cursor + 1 < conns.len() {
+                app.pipeline_conn_cursor += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(&conn_idx) = conns.get(app.pipeline_conn_cursor) {
+                app.pipeline_def.connections.remove(conn_idx);
+            }
+            app.pipeline_removing_conn = false;
+        }
+        _ => {}
+    }
+}
+
+fn start_pipeline_execution(app: &mut App) {
+    // Validate
+    if app.pipeline_def.blocks.is_empty() {
+        app.error_modal = Some("Add at least one block before running".into());
+        return;
+    }
+    if app.pipeline_def.initial_prompt.trim().is_empty() {
+        app.error_modal = Some("Enter an initial prompt".into());
+        return;
+    }
+    let iterations: u32 = app
+        .pipeline_iterations_buf
+        .parse()
+        .unwrap_or(0);
+    if iterations < 1 {
+        app.error_modal = Some("Iterations must be at least 1".into());
+        return;
+    }
+    app.pipeline_def.iterations = iterations;
+
+    if pipeline_mod::topological_layers(&app.pipeline_def).is_err() {
+        app.error_modal = Some("Pipeline contains a cycle".into());
+        return;
+    }
+
+    // Check provider availability per block
+    let avail_map: std::collections::HashMap<ProviderKind, bool> =
+        app.available_providers().into_iter().collect();
+    for block in &app.pipeline_def.blocks {
+        if !avail_map.get(&block.provider).copied().unwrap_or(false) {
+            let name = block.provider.display_name();
+            app.error_modal = Some(format!("{name} is not configured (block {})", block.id));
+            return;
+        }
+    }
+
+    // Set running state
+    app.screen = Screen::Running;
+    app.progress_events.clear();
+    app.is_running = true;
+    app.run_error = None;
+    app.consolidation_active = false;
+    app.diagnostic_running = false;
+
+    // Copy prompt for running screen display
+    app.prompt_text = app.pipeline_def.initial_prompt.clone();
+    app.iterations = iterations;
+
+    // Build provider configs and CLI flags
+    let mut provider_configs: std::collections::HashMap<ProviderKind, ProviderConfig> =
+        std::collections::HashMap::new();
+    let mut use_cli_by_block: std::collections::HashMap<BlockId, bool> =
+        std::collections::HashMap::new();
+
+    for block in &app.pipeline_def.blocks {
+        if let Some(cfg) = app.effective_provider_config(block.provider) {
+            provider_configs.insert(block.provider, cfg.clone());
+            use_cli_by_block.insert(block.id, cfg.use_cli);
+        }
+    }
+
+    // HTTP client
+    let timeout_secs = app.effective_http_timeout_seconds().max(1);
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            app.error_modal = Some(format!("Failed to create HTTP client: {e}"));
+            app.screen = Screen::Pipeline;
+            app.is_running = false;
+            return;
+        }
+    };
+
+    // Output
+    let session_name = if app.pipeline_save_path.is_some() {
+        app.pipeline_save_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    let base_path = app.config.resolved_output_dir();
+    let output = match OutputManager::new(
+        &base_path,
+        if session_name.is_empty() {
+            None
+        } else {
+            Some(session_name)
+        },
+    ) {
+        Ok(o) => o,
+        Err(e) => {
+            app.error_modal = Some(format!("Cannot create output dir: {e}"));
+            app.screen = Screen::Pipeline;
+            app.is_running = false;
+            return;
+        }
+    };
+
+    // Write pipeline definition snapshot
+    if let Err(e) = output.write_prompt(&app.pipeline_def.initial_prompt) {
+        let _ = output.append_error(&format!("Failed to write prompt: {e}"));
+    }
+    if let Err(e) = output.write_pipeline_session_info(
+        app.pipeline_def.blocks.len(),
+        app.pipeline_def.connections.len(),
+        iterations,
+        app.pipeline_save_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str()),
+    ) {
+        let _ = output.append_error(&format!("Failed to write session info: {e}"));
+    }
+    // Serialize pipeline definition
+    match toml::to_string_pretty(&app.pipeline_def) {
+        Ok(toml_str) => {
+            if let Err(e) = std::fs::write(output.run_dir().join("pipeline.toml"), toml_str) {
+                let _ = output.append_error(&format!("Failed to write pipeline.toml: {e}"));
+            }
+        }
+        Err(e) => {
+            let _ = output.append_error(&format!("Failed to serialize pipeline: {e}"));
+        }
+    }
+
+    app.run_dir = Some(output.run_dir().to_path_buf());
+
+    let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    app.progress_rx = Some(progress_rx);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    app.cancel_flag = cancel.clone();
+
+    let pipeline_def = app.pipeline_def.clone();
+    let config = app.config.clone();
+    let cli_timeout = app.effective_cli_timeout_seconds();
+
+    tokio::spawn(async move {
+        let result = pipeline_mod::run_pipeline(
+            &pipeline_def,
+            &config,
+            provider_configs,
+            use_cli_by_block,
+            client,
+            cli_timeout,
+            &output,
+            progress_tx.clone(),
+            cancel,
+        )
+        .await;
+
+        if let Err(e) = result {
+            let _ = progress_tx.send(ProgressEvent::AllDone);
+            let _ = output.append_error(&format!("Pipeline failed: {e}"));
+        }
+    });
 }
 
 fn handle_order_key(app: &mut App, key: KeyEvent) {
@@ -797,6 +1481,30 @@ fn reset_to_home(app: &mut App) {
     app.consolidation_rx = None;
     app.diagnostic_running = false;
     app.diagnostic_rx = None;
+
+    // Pipeline state
+    app.pipeline_def = pipeline_mod::PipelineDefinition::default();
+    app.pipeline_next_id = 1;
+    app.pipeline_block_cursor = None;
+    app.pipeline_focus = PipelineFocus::InitialPrompt;
+    app.pipeline_canvas_offset = (0, 0);
+    app.pipeline_prompt_cursor = 0;
+    app.pipeline_iterations_buf = "1".into();
+    app.pipeline_connecting_from = None;
+    app.pipeline_removing_conn = false;
+    app.pipeline_conn_cursor = 0;
+    app.pipeline_show_edit = false;
+    app.pipeline_edit_field = PipelineEditField::Provider;
+    app.pipeline_edit_provider_idx = 0;
+    app.pipeline_edit_prompt_buf.clear();
+    app.pipeline_edit_prompt_cursor = 0;
+    app.pipeline_edit_session_buf.clear();
+    app.pipeline_edit_session_cursor = 0;
+    app.pipeline_file_dialog = None;
+    app.pipeline_file_input.clear();
+    app.pipeline_file_list.clear();
+    app.pipeline_file_cursor = 0;
+    app.pipeline_save_path = None;
 }
 
 fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
@@ -1700,7 +2408,7 @@ fn start_execution(app: &mut App) {
                     return;
                 }
             }
-            ExecutionMode::Solo => {}
+            ExecutionMode::Solo | ExecutionMode::Pipeline => {}
         }
 
         resumed_run = true;
@@ -1792,6 +2500,10 @@ fn start_execution(app: &mut App) {
                 )
                 .await
             }
+            ExecutionMode::Pipeline => {
+                // Pipeline execution is handled by start_pipeline_execution
+                return;
+            }
         };
         if let Err(e) = result {
             let err_str = e.to_string();
@@ -1835,7 +2547,7 @@ fn should_offer_consolidation(app: &App) -> bool {
     }
     if !matches!(
         app.selected_mode,
-        ExecutionMode::Swarm | ExecutionMode::Solo
+        ExecutionMode::Swarm | ExecutionMode::Solo | ExecutionMode::Pipeline
     ) {
         return false;
     }
@@ -1981,11 +2693,33 @@ fn parse_agent_iteration_filename(name: &str, agent_key: &str) -> Option<u32> {
     iter_str.parse::<u32>().ok()
 }
 
+fn parse_block_iteration_filename(name: &str) -> Option<u32> {
+    if !name.ends_with(".md") {
+        return None;
+    }
+    // Match pattern: block{id}_{provider}_iter{n}.md
+    let rest = name.strip_prefix("block")?;
+    // Find the first underscore after the block id
+    let underscore_pos = rest.find('_')?;
+    let block_id_str = &rest[..underscore_pos];
+    // Verify block id is a number
+    block_id_str.parse::<u32>().ok()?;
+    // The remainder is {provider}_iter{n}.md — delegate to parse_agent_iteration_filename
+    let agent_part = &rest[underscore_pos + 1..];
+    for kind in ProviderKind::all() {
+        if let Some(iter) = parse_agent_iteration_filename(agent_part, kind.config_key()) {
+            return Some(iter);
+        }
+    }
+    None
+}
+
 fn parse_iteration_from_filename(name: &str) -> Option<u32> {
     // Match any pattern of {agent_key}_iter{N}.md
     if !name.ends_with(".md") {
         return None;
     }
+    // Generic: find _iter{N} before .md suffix — works for both agent and block filenames
     let stem = name.trim_end_matches(".md");
     let iter_pos = stem.rfind("_iter")?;
     let iter_str = &stem[iter_pos + 5..];
@@ -2054,11 +2788,33 @@ fn start_consolidation(app: &mut App) {
     }
 
     let mut file_lines = Vec::new();
-    for name in &app.selected_agents {
-        let file_key = App::agent_file_key(name);
-        let path = run_dir.join(format!("{file_key}_iter{last_iteration}.md"));
-        if path.exists() {
-            file_lines.push(format!("- {name}: {}", path.display()));
+    if app.selected_mode == ExecutionMode::Pipeline {
+        // Scan run dir for block*_*_iter{last_iteration}.md files
+        if let Ok(entries) = std::fs::read_dir(&run_dir) {
+            let suffix = format!("_iter{last_iteration}.md");
+            let mut paths: Vec<(String, std::path::PathBuf)> = entries
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.starts_with("block") && name.ends_with(&suffix) {
+                        Some((name, entry.path()))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            paths.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, path) in paths {
+                file_lines.push(format!("- {name}: {}", path.display()));
+            }
+        }
+    } else {
+        for name in &app.selected_agents {
+            let file_key = App::agent_file_key(name);
+            let path = run_dir.join(format!("{file_key}_iter{last_iteration}.md"));
+            if path.exists() {
+                file_lines.push(format!("- {name}: {}", path.display()));
+            }
         }
     }
     if file_lines.is_empty() {
@@ -2594,6 +3350,63 @@ mod tests {
     }
 
     #[test]
+    fn parse_block_iteration_valid() {
+        assert_eq!(
+            parse_block_iteration_filename("block1_anthropic_iter2.md"),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn parse_block_iteration_different_provider() {
+        assert_eq!(
+            parse_block_iteration_filename("block3_openai_iter5.md"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn parse_block_iteration_not_md() {
+        assert_eq!(
+            parse_block_iteration_filename("block1_anthropic_iter2.txt"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_block_iteration_no_block_prefix() {
+        assert_eq!(
+            parse_block_iteration_filename("anthropic_iter2.md"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_block_iteration_non_numeric_block_id() {
+        assert_eq!(
+            parse_block_iteration_filename("blockx_anthropic_iter2.md"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_iteration_from_filename_matches_block_files() {
+        assert_eq!(
+            parse_iteration_from_filename("block2_gemini_iter4.md"),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn find_last_iteration_includes_block_files() {
+        let dir = tempdir().unwrap();
+        write_agent_iter(dir.path(), "anthropic", 1);
+        fs::write(dir.path().join("block1_openai_iter3.md"), "test").unwrap();
+        fs::write(dir.path().join("block2_gemini_iter3.md"), "test").unwrap();
+        assert_eq!(find_last_iteration(dir.path()), Some(3));
+    }
+
+    #[test]
     fn find_last_iteration_multiple_files() {
         let dir = tempdir().unwrap();
         write_agent_iter(dir.path(), "Claude", 1);
@@ -2976,79 +3789,79 @@ mod tests {
         app.prompt_text = "hello world".to_string();
         app.prompt_cursor = app.prompt_text.len();
 
-        move_prompt_cursor_word_left(&mut app);
+        move_cursor_word_left(&app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_cursor, 6);
     }
 
     #[test]
-    fn move_prompt_cursor_word_right_skips_whitespace_and_word() {
+    fn move_cursor_word_right_skips_whitespace_and_word() {
         let mut app = test_app();
         app.prompt_text = "hello   world  next".to_string();
         app.prompt_cursor = 5;
 
-        move_prompt_cursor_word_right(&mut app);
+        move_cursor_word_right(&app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_cursor, 13);
     }
 
     #[test]
-    fn move_prompt_cursor_line_up_and_down_preserves_column() {
+    fn move_cursor_line_up_and_down_preserves_column() {
         let mut app = test_app();
         app.prompt_text = "abc\ndefg\nhi".to_string();
         let second_line_start = "abc\n".len();
         app.prompt_cursor = second_line_start + 2; // after 'e'
 
-        move_prompt_cursor_line_up(&mut app);
+        move_cursor_line_up(&app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_cursor, 2);
 
-        move_prompt_cursor_line_down(&mut app);
+        move_cursor_line_down(&app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_cursor, second_line_start + 2);
     }
 
     #[test]
-    fn move_prompt_cursor_line_up_and_down_clamp_to_line_length() {
+    fn move_cursor_line_up_and_down_clamp_to_line_length() {
         let mut app = test_app();
         app.prompt_text = "a\nlonger".to_string();
         app.prompt_cursor = app.prompt_text.len();
 
-        move_prompt_cursor_line_up(&mut app);
+        move_cursor_line_up(&app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_cursor, 1);
 
-        move_prompt_cursor_line_down(&mut app);
+        move_cursor_line_down(&app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_cursor, 3);
     }
 
     #[test]
-    fn move_prompt_cursor_line_up_down_noop_at_edges() {
+    fn move_cursor_line_up_down_noop_at_edges() {
         let mut app = test_app();
         app.prompt_text = "top\nbottom".to_string();
 
         app.prompt_cursor = 1;
-        move_prompt_cursor_line_up(&mut app);
+        move_cursor_line_up(&app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_cursor, 1);
 
         app.prompt_cursor = app.prompt_text.len();
-        move_prompt_cursor_line_down(&mut app);
+        move_cursor_line_down(&app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_cursor, app.prompt_text.len());
     }
 
     #[test]
-    fn delete_prompt_char_left_multibyte() {
+    fn delete_char_left_multibyte() {
         let mut app = test_app();
         app.prompt_text = "aé".to_string();
         app.prompt_cursor = app.prompt_text.len();
 
-        delete_prompt_char_left(&mut app);
+        delete_char_left(&mut app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_text, "a");
         assert_eq!(app.prompt_cursor, 1);
     }
 
     #[test]
-    fn delete_prompt_word_left_multibyte_boundary_safe() {
+    fn delete_word_left_multibyte_boundary_safe() {
         let mut app = test_app();
         app.prompt_text = "hello café".to_string();
         app.prompt_cursor = app.prompt_text.len();
 
-        delete_prompt_word_left(&mut app);
+        delete_word_left(&mut app.prompt_text, &mut app.prompt_cursor);
         assert_eq!(app.prompt_text, "hello ");
         assert_eq!(app.prompt_cursor, 6);
     }
