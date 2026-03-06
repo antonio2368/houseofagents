@@ -687,11 +687,19 @@ fn handle_pipeline_paste(app: &mut App, text: &str) {
                     text,
                 );
             }
+            PipelineFocus::SessionName => {
+                let clean = text.replace(['\n', '\r'], "");
+                app.pipeline_session_name.push_str(&clean);
+            }
             PipelineFocus::Iterations => {
                 for ch in text.chars() {
                     if ch.is_ascii_digit() {
                         app.pipeline_iterations_buf.push(ch);
                     }
+                }
+                if !app.pipeline_iterations_buf.is_empty() {
+                    let v: u32 = app.pipeline_iterations_buf.parse().unwrap_or(1).clamp(1, 99);
+                    app.pipeline_iterations_buf = v.to_string();
                 }
             }
             PipelineFocus::Builder => {}
@@ -761,7 +769,8 @@ fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab => {
             app.pipeline_focus = match app.pipeline_focus {
-                PipelineFocus::InitialPrompt => PipelineFocus::Iterations,
+                PipelineFocus::InitialPrompt => PipelineFocus::SessionName,
+                PipelineFocus::SessionName => PipelineFocus::Iterations,
                 PipelineFocus::Iterations => PipelineFocus::Builder,
                 PipelineFocus::Builder => PipelineFocus::InitialPrompt,
             };
@@ -769,7 +778,8 @@ fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
         KeyCode::BackTab => {
             app.pipeline_focus = match app.pipeline_focus {
                 PipelineFocus::InitialPrompt => PipelineFocus::Builder,
-                PipelineFocus::Iterations => PipelineFocus::InitialPrompt,
+                PipelineFocus::SessionName => PipelineFocus::InitialPrompt,
+                PipelineFocus::Iterations => PipelineFocus::SessionName,
                 PipelineFocus::Builder => PipelineFocus::Iterations,
             };
         }
@@ -777,23 +787,16 @@ fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
             app.show_help_popup = true;
             app.help_popup_scroll = 0;
         }
-        // Ctrl+S: save
+        // Ctrl+S: save — always open dialog, prefill with current name
         KeyCode::Char('s') if ctrl => {
-            if let Some(ref path) = app.pipeline_save_path {
-                if let Err(e) = pipeline_mod::save_pipeline(&app.pipeline_def, path) {
-                    app.error_modal = Some(format!("Save failed: {e}"));
-                }
-            } else {
-                // Open save dialog
-                app.pipeline_file_dialog = Some(PipelineDialogMode::Save);
-                app.pipeline_file_input = app
-                    .pipeline_save_path
-                    .as_ref()
-                    .and_then(|p| p.file_stem())
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-            }
+            app.pipeline_file_dialog = Some(PipelineDialogMode::Save);
+            app.pipeline_file_input = app
+                .pipeline_save_path
+                .as_ref()
+                .and_then(|p| p.file_stem())
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
         }
         // Ctrl+L: load
         KeyCode::Char('l') if ctrl => {
@@ -817,12 +820,29 @@ fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
                     key,
                 );
             }
+            PipelineFocus::SessionName => match key.code {
+                KeyCode::Char(c) => app.pipeline_session_name.push(c),
+                KeyCode::Backspace => { app.pipeline_session_name.pop(); }
+                _ => {}
+            },
             PipelineFocus::Iterations => match key.code {
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     app.pipeline_iterations_buf.push(c);
+                    let v: u32 = app.pipeline_iterations_buf.parse().unwrap_or(1).clamp(1, 99);
+                    app.pipeline_iterations_buf = v.to_string();
                 }
                 KeyCode::Backspace => {
                     app.pipeline_iterations_buf.pop();
+                }
+                KeyCode::Up | KeyCode::Char('+') => {
+                    let v: u32 = app.pipeline_iterations_buf.parse().unwrap_or(1);
+                    let v = (v + 1).min(99);
+                    app.pipeline_iterations_buf = v.to_string();
+                }
+                KeyCode::Down | KeyCode::Char('-') => {
+                    let v: u32 = app.pipeline_iterations_buf.parse().unwrap_or(1);
+                    let v = v.saturating_sub(1).max(1);
+                    app.pipeline_iterations_buf = v.to_string();
                 }
                 _ => {}
             },
@@ -912,38 +932,67 @@ fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
-        // Arrow navigation with Ctrl for canvas scroll
+        // Arrow/hjkl move selected block, Shift+Arrow/Shift+hjkl navigate selection.
+        // Ctrl+Arrow scrolls the canvas.
         KeyCode::Up | KeyCode::Char('k') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.pipeline_canvas_offset.1 = app.pipeline_canvas_offset.1.saturating_sub(1);
-            } else {
+            } else if pipeline_builder_nav_mode(&key) {
                 pipeline_spatial_nav(app, NavAxis::Vertical, true);
                 pipeline_ensure_visible(app);
+            } else {
+                pipeline_move_selected_block(app, 0, -1);
+                pipeline_ensure_visible(app);
             }
+        }
+        KeyCode::Char('K') => {
+            pipeline_spatial_nav(app, NavAxis::Vertical, true);
+            pipeline_ensure_visible(app);
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.pipeline_canvas_offset.1 += 1;
-            } else {
+            } else if pipeline_builder_nav_mode(&key) {
                 pipeline_spatial_nav(app, NavAxis::Vertical, false);
                 pipeline_ensure_visible(app);
+            } else {
+                pipeline_move_selected_block(app, 0, 1);
+                pipeline_ensure_visible(app);
             }
+        }
+        KeyCode::Char('J') => {
+            pipeline_spatial_nav(app, NavAxis::Vertical, false);
+            pipeline_ensure_visible(app);
         }
         KeyCode::Left | KeyCode::Char('h') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.pipeline_canvas_offset.0 = app.pipeline_canvas_offset.0.saturating_sub(1);
-            } else {
+            } else if pipeline_builder_nav_mode(&key) {
                 pipeline_spatial_nav(app, NavAxis::Horizontal, true);
                 pipeline_ensure_visible(app);
+            } else {
+                pipeline_move_selected_block(app, -1, 0);
+                pipeline_ensure_visible(app);
             }
+        }
+        KeyCode::Char('H') => {
+            pipeline_spatial_nav(app, NavAxis::Horizontal, true);
+            pipeline_ensure_visible(app);
         }
         KeyCode::Right | KeyCode::Char('l') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.pipeline_canvas_offset.0 += 1;
-            } else {
+            } else if pipeline_builder_nav_mode(&key) {
                 pipeline_spatial_nav(app, NavAxis::Horizontal, false);
                 pipeline_ensure_visible(app);
+            } else {
+                pipeline_move_selected_block(app, 1, 0);
+                pipeline_ensure_visible(app);
             }
+        }
+        KeyCode::Char('L') => {
+            pipeline_spatial_nav(app, NavAxis::Horizontal, false);
+            pipeline_ensure_visible(app);
         }
         _ => {}
     }
@@ -952,6 +1001,49 @@ fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
 enum NavAxis {
     Horizontal,
     Vertical,
+}
+
+fn pipeline_builder_nav_mode(key: &KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::SHIFT)
+}
+
+fn pipeline_move_selected_block(app: &mut App, dx: i16, dy: i16) {
+    if app.pipeline_def.blocks.is_empty() {
+        app.pipeline_block_cursor = None;
+        return;
+    }
+
+    let Some(sel_id) = app.pipeline_block_cursor else {
+        app.pipeline_block_cursor = app.pipeline_def.blocks.first().map(|b| b.id);
+        return;
+    };
+    let Some(sel_idx) = app.pipeline_def.blocks.iter().position(|b| b.id == sel_id) else {
+        app.pipeline_block_cursor = app.pipeline_def.blocks.first().map(|b| b.id);
+        return;
+    };
+
+    let (sx, sy) = app.pipeline_def.blocks[sel_idx].position;
+    let nx_i = sx as i32 + dx as i32;
+    let ny_i = sy as i32 + dy as i32;
+    if nx_i < 0 || ny_i < 0 || nx_i > u16::MAX as i32 || ny_i > u16::MAX as i32 {
+        return;
+    }
+
+    let next_pos = (nx_i as u16, ny_i as u16);
+    if next_pos == (sx, sy) {
+        return;
+    }
+
+    if let Some(other_idx) = app
+        .pipeline_def
+        .blocks
+        .iter()
+        .position(|b| b.id != sel_id && b.position == next_pos)
+    {
+        app.pipeline_def.blocks[other_idx].position = (sx, sy);
+    }
+
+    app.pipeline_def.blocks[sel_idx].position = next_pos;
 }
 
 fn pipeline_spatial_nav(app: &mut App, axis: NavAxis, negative: bool) {
@@ -1281,8 +1373,9 @@ fn start_pipeline_execution(app: &mut App) {
     app.consolidation_active = false;
     app.diagnostic_running = false;
 
-    // Copy prompt for running screen display
+    // Copy prompt/session for running screen display
     app.prompt_text = app.pipeline_def.initial_prompt.clone();
+    app.session_name = app.pipeline_session_name.clone();
     app.iterations = iterations;
 
     // Build agent configs keyed by agent name
@@ -1317,24 +1410,16 @@ fn start_pipeline_execution(app: &mut App) {
         }
     };
 
-    // Output
-    let session_name = if app.pipeline_save_path.is_some() {
-        app.pipeline_save_path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
+    // Output — use session name (not pipeline filename) for output dir
+    let session_name = if app.pipeline_session_name.trim().is_empty() {
+        None
     } else {
-        ""
+        Some(app.pipeline_session_name.trim())
     };
     let base_path = app.config.resolved_output_dir();
     let output = match OutputManager::new(
         &base_path,
-        if session_name.is_empty() {
-            None
-        } else {
-            Some(session_name)
-        },
+        session_name,
     ) {
         Ok(o) => o,
         Err(e) => {
@@ -1578,6 +1663,7 @@ fn reset_to_home(app: &mut App) {
     app.pipeline_focus = PipelineFocus::InitialPrompt;
     app.pipeline_canvas_offset = (0, 0);
     app.pipeline_prompt_cursor = 0;
+    app.pipeline_session_name.clear();
     app.pipeline_iterations_buf = "1".into();
     app.pipeline_connecting_from = None;
     app.pipeline_removing_conn = false;
@@ -2657,7 +2743,8 @@ fn find_last_iteration(run_dir: &std::path::Path, agent_keys: &[String]) -> Opti
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if agent_keys.is_empty() {
-            if let Some(iter) = parse_iteration_from_filename(&name) {
+            // Pipeline mode: only match known block output filename patterns
+            if let Some(iter) = parse_pipeline_iteration_filename(&name) {
                 max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
             }
         } else {
@@ -2784,25 +2871,37 @@ fn parse_agent_iteration_filename(name: &str, agent_key: &str) -> Option<u32> {
     iter_str.parse::<u32>().ok()
 }
 
-#[cfg(test)]
-fn parse_block_iteration_filename(name: &str) -> Option<u32> {
+/// Parse iteration from a pipeline block output filename.
+/// Matches both named blocks (`{name}_b{id}_{agent}_iter{n}.md`)
+/// and unnamed blocks (`block{id}_{agent}_iter{n}.md`).
+fn parse_pipeline_iteration_filename(name: &str) -> Option<u32> {
     if !name.ends_with(".md") {
         return None;
     }
-    // Match pattern: block{id}_{provider}_iter{n}.md
-    let rest = name.strip_prefix("block")?;
-    // Find the first underscore after the block id
-    let underscore_pos = rest.find('_')?;
-    let block_id_str = &rest[..underscore_pos];
-    // Verify block id is a number
-    block_id_str.parse::<u32>().ok()?;
-    // The remainder is {provider}_iter{n}.md — delegate to parse_agent_iteration_filename
-    let agent_part = &rest[underscore_pos + 1..];
-    for kind in ProviderKind::all() {
-        if let Some(iter) = parse_agent_iteration_filename(agent_part, kind.config_key()) {
-            return Some(iter);
+    let stem = name.trim_end_matches(".md");
+
+    // Named blocks: must contain _b{digits}_ somewhere.
+    // Search right-to-left so block names containing "_b" (e.g. "web_builder") are handled.
+    let mut search_end = stem.len();
+    while let Some(rel) = stem[..search_end].rfind("_b") {
+        let after_b = &stem[rel + 2..];
+        if let Some(end_of_id) = after_b.find('_') {
+            if after_b[..end_of_id].parse::<u32>().is_ok() {
+                return parse_iteration_from_filename(name);
+            }
+        }
+        search_end = rel;
+    }
+
+    // Unnamed blocks: must start with "block{digits}_".
+    if let Some(rest) = stem.strip_prefix("block") {
+        if let Some(underscore) = rest.find('_') {
+            if rest[..underscore].parse::<u32>().is_ok() {
+                return parse_iteration_from_filename(name);
+            }
         }
     }
+
     None
 }
 
@@ -2881,14 +2980,13 @@ fn start_consolidation(app: &mut App) {
 
     let mut file_lines = Vec::new();
     if app.selected_mode == ExecutionMode::Pipeline {
-        // Scan run dir for block*_*_iter{last_iteration}.md files
+        // Scan run dir for block output files from the target iteration
         if let Ok(entries) = std::fs::read_dir(&run_dir) {
-            let suffix = format!("_iter{last_iteration}.md");
             let mut paths: Vec<(String, std::path::PathBuf)> = entries
                 .flatten()
                 .filter_map(|entry| {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with("block") && name.ends_with(&suffix) {
+                    if parse_pipeline_iteration_filename(&name) == Some(last_iteration) {
                         Some((name, entry.path()))
                     } else {
                         None
@@ -3243,14 +3341,26 @@ fn build_diagnostic_prompt(
     use_cli: bool,
 ) -> String {
     let mut prompt = String::from(
-        "Analyze all reports for operational/tooling errors and produce a markdown report.\n",
+        "Analyze all reports for OPERATIONAL errors only and produce a markdown report.\n",
     );
+    prompt.push_str("Focus exclusively on errors that prevented an agent from completing its task:\n");
+    prompt.push_str("- API failures, timeouts, authentication errors\n");
+    prompt.push_str("- CLI tool crashes, missing binaries, permission errors\n");
+    prompt.push_str("- Agent permission denials (e.g. tool use blocked, sandbox restrictions, file access denied)\n");
+    prompt.push_str("- Rate limits, network errors, malformed responses\n");
+    prompt.push_str("- Provider returning empty or truncated output due to a fault\n\n");
+    prompt.push_str("Do NOT report on:\n");
+    prompt.push_str("- Quality or correctness of the agent's response content\n");
+    prompt.push_str("- Whether the agent answered the user's prompt well\n");
+    prompt.push_str("- Logical errors, hallucinations, or wrong answers in the output\n");
+    prompt.push_str("- Style, formatting, or completeness of the response text\n\n");
     prompt.push_str("Write only the diagnostic report content.\n");
     prompt.push_str("Do not write files and do not ask for filesystem permissions.\n");
     prompt.push_str("The application will save your response to errors.md.\n\n");
     prompt.push_str(
         "Report structure:\n1) Summary\n2) Detected Issues\n3) Evidence\n4) Suggested Fixes\n\n",
     );
+    prompt.push_str("If there are no operational errors, write a short summary stating all agents completed successfully.\n\n");
 
     prompt.push_str("Application-generated errors:\n");
     if app_errors.is_empty() {
@@ -3442,17 +3552,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_block_iteration_valid() {
+    fn parse_block_iteration_named_block() {
+        // {name}_b{id}_{agent}_iter{n}.md
         assert_eq!(
-            parse_block_iteration_filename("block1_anthropic_iter2.md"),
+            parse_pipeline_iteration_filename("Analyzer_b1_Claude_iter2.md"),
             Some(2)
         );
     }
 
     #[test]
-    fn parse_block_iteration_different_provider() {
+    fn parse_pipeline_iteration_unnamed_block() {
+        // unnamed blocks use block{id}_{agent}_iter{n}.md pattern
         assert_eq!(
-            parse_block_iteration_filename("block3_openai_iter5.md"),
+            parse_pipeline_iteration_filename("block1_openai_iter5.md"),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn parse_block_iteration_different_agent() {
+        assert_eq!(
+            parse_pipeline_iteration_filename("Reviewer_b3_Gemini_iter5.md"),
             Some(5)
         );
     }
@@ -3460,15 +3580,15 @@ mod tests {
     #[test]
     fn parse_block_iteration_not_md() {
         assert_eq!(
-            parse_block_iteration_filename("block1_anthropic_iter2.txt"),
+            parse_pipeline_iteration_filename("Analyzer_b1_Claude_iter2.txt"),
             None
         );
     }
 
     #[test]
-    fn parse_block_iteration_no_block_prefix() {
+    fn parse_block_iteration_no_block_id_marker() {
         assert_eq!(
-            parse_block_iteration_filename("anthropic_iter2.md"),
+            parse_pipeline_iteration_filename("Claude_iter2.md"),
             None
         );
     }
@@ -3476,13 +3596,28 @@ mod tests {
     #[test]
     fn parse_block_iteration_non_numeric_block_id() {
         assert_eq!(
-            parse_block_iteration_filename("blockx_anthropic_iter2.md"),
+            parse_pipeline_iteration_filename("Analyzer_bx_Claude_iter2.md"),
             None
         );
     }
 
     #[test]
+    fn parse_block_iteration_name_contains_b() {
+        // Block name "web_builder" contains "_b" — parser must skip it and find _b7_
+        assert_eq!(
+            parse_pipeline_iteration_filename("web_builder_b7_Claude_iter1.md"),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn parse_iteration_from_filename_matches_block_files() {
+        // Named block format
+        assert_eq!(
+            parse_iteration_from_filename("Reviewer_b2_Gemini_iter4.md"),
+            Some(4)
+        );
+        // Unnamed block fallback format
         assert_eq!(
             parse_iteration_from_filename("block2_gemini_iter4.md"),
             Some(4)
@@ -3493,8 +3628,8 @@ mod tests {
     fn find_last_iteration_includes_block_files() {
         let dir = tempdir().unwrap();
         write_agent_iter(dir.path(), "anthropic", 1);
-        fs::write(dir.path().join("block1_openai_iter3.md"), "test").unwrap();
-        fs::write(dir.path().join("block2_gemini_iter3.md"), "test").unwrap();
+        fs::write(dir.path().join("Analyzer_b1_Claude_iter3.md"), "test").unwrap();
+        fs::write(dir.path().join("Reviewer_b2_Gemini_iter3.md"), "test").unwrap();
         assert_eq!(find_last_iteration(dir.path(), &[]), Some(3));
     }
 
@@ -4098,5 +4233,89 @@ mod tests {
         handle_paste(&mut app, "ZZZ");
         assert_eq!(app.prompt_text, "base");
         assert_eq!(app.prompt_cursor, 2);
+    }
+
+    #[test]
+    fn pipeline_move_selected_block_moves_into_empty_cell() {
+        let mut app = test_app();
+        app.pipeline_def.blocks = vec![pipeline_mod::PipelineBlock {
+            id: 1,
+            name: "one".into(),
+            agent: "agent".into(),
+            prompt: String::new(),
+            session_id: None,
+            position: (2, 2),
+        }];
+        app.pipeline_block_cursor = Some(1);
+
+        pipeline_move_selected_block(&mut app, 1, 0);
+
+        assert_eq!(app.pipeline_def.blocks[0].position, (3, 2));
+        assert_eq!(app.pipeline_block_cursor, Some(1));
+    }
+
+    #[test]
+    fn pipeline_move_selected_block_swaps_when_target_occupied() {
+        let mut app = test_app();
+        app.pipeline_def.blocks = vec![
+            pipeline_mod::PipelineBlock {
+                id: 1,
+                name: "one".into(),
+                agent: "agent".into(),
+                prompt: String::new(),
+                session_id: None,
+                position: (2, 2),
+            },
+            pipeline_mod::PipelineBlock {
+                id: 2,
+                name: "two".into(),
+                agent: "agent".into(),
+                prompt: String::new(),
+                session_id: None,
+                position: (3, 2),
+            },
+        ];
+        app.pipeline_block_cursor = Some(1);
+
+        pipeline_move_selected_block(&mut app, 1, 0);
+
+        let b1 = app.pipeline_def.blocks.iter().find(|b| b.id == 1).unwrap();
+        let b2 = app.pipeline_def.blocks.iter().find(|b| b.id == 2).unwrap();
+        assert_eq!(b1.position, (3, 2));
+        assert_eq!(b2.position, (2, 2));
+    }
+
+    #[test]
+    fn pipeline_builder_arrow_moves_block_shift_arrow_navigates() {
+        let mut app = test_app();
+        app.pipeline_def.blocks = vec![
+            pipeline_mod::PipelineBlock {
+                id: 1,
+                name: "one".into(),
+                agent: "agent".into(),
+                prompt: String::new(),
+                session_id: None,
+                position: (2, 2),
+            },
+            pipeline_mod::PipelineBlock {
+                id: 2,
+                name: "two".into(),
+                agent: "agent".into(),
+                prompt: String::new(),
+                session_id: None,
+                position: (3, 2),
+            },
+        ];
+        app.pipeline_block_cursor = Some(1);
+
+        handle_pipeline_builder_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let moved = app.pipeline_def.blocks.iter().find(|b| b.id == 1).unwrap();
+        assert_eq!(moved.position, (3, 2));
+        assert_eq!(app.pipeline_block_cursor, Some(1));
+
+        handle_pipeline_builder_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(app.pipeline_block_cursor, Some(2));
+        let after_nav = app.pipeline_def.blocks.iter().find(|b| b.id == 1).unwrap();
+        assert_eq!(after_nav.position, (3, 2));
     }
 }

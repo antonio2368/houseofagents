@@ -471,8 +471,13 @@ pub async fn run_pipeline(
                             let mut file_refs = String::new();
                             for uid in &upstream_ids {
                                 if let Some(ub) = def.blocks.iter().find(|b| b.id == *uid) {
+                                    let ub_name_key = if ub.name.trim().is_empty() {
+                                        format!("block{}", uid)
+                                    } else {
+                                        format!("{}_b{}", OutputManager::sanitize_session_name(&ub.name), uid)
+                                    };
                                     let sanitized = OutputManager::sanitize_session_name(&ub.agent);
-                                    let fname = format!("block{}_{}_iter{}.md", uid, sanitized, iteration);
+                                    let fname = format!("{}_{}_iter{}.md", ub_name_key, sanitized, iteration);
                                     let fpath = output.run_dir().join(&fname);
                                     if fpath.exists() {
                                         file_refs.push_str(&format!("- {}\n", fpath.display()));
@@ -528,6 +533,11 @@ pub async fn run_pipeline(
                     let cancel_clone = cancel.clone();
                     let output_run_dir = output.run_dir().to_path_buf();
                     let file_key = OutputManager::sanitize_session_name(&agent_name);
+                    let block_name_key = if block.name.trim().is_empty() {
+                        format!("block{}", block_id)
+                    } else {
+                        format!("{}_b{}", OutputManager::sanitize_session_name(&block.name), block_id)
+                    };
 
                     tasks.spawn(async move {
                         let mut guard = provider_arc.lock().await;
@@ -576,7 +586,7 @@ pub async fn run_pipeline(
                                     });
                                 }
                                 // Write output
-                                let filename = format!("block{}_{}_iter{}.md", block_id, file_key, iteration);
+                                let filename = format!("{}_{}_iter{}.md", block_name_key, file_key, iteration);
                                 let path = output_run_dir.join(&filename);
                                 if let Err(e) = std::fs::write(&path, &resp.content) {
                                     let error = format!("Failed to write output: {e}");

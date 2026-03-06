@@ -249,6 +249,7 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
         Thinking,
         Finished,
         Error(String),
+        Cancelled,
     }
 
     enum Row {
@@ -440,6 +441,20 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
         }
     }
 
+    // If run finished due to cancellation, mark still-thinking items as cancelled
+    if !app.is_running && app.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        for row in &mut rows {
+            match row {
+                Row::Agent { status, .. } | Row::Block { status, .. } => {
+                    if matches!(status, AgentStatus::Thinking) {
+                        *status = AgentStatus::Cancelled;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     for row in rows {
         match row {
             Row::Agent {
@@ -458,6 +473,13 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                 AgentStatus::Error(err) => items.push(ListItem::new(Line::from(vec![
                     Span::styled("✗ ", Style::default().fg(Color::Red)),
                     Span::raw(format!("{name} FAILED (iter {iteration}): {err}")),
+                ]))),
+                AgentStatus::Cancelled => items.push(ListItem::new(Line::from(vec![
+                    Span::styled("✗ ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{name} cancelled (iter {iteration})"),
+                        Style::default().fg(Color::Yellow),
+                    ),
                 ]))),
             },
             Row::IterationComplete(iteration) => {
@@ -491,6 +513,13 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                 AgentStatus::Error(err) => items.push(ListItem::new(Line::from(vec![
                     Span::styled("\u{2717} ", Style::default().fg(Color::Red)),
                     Span::raw(format!("{label} (iter {iteration}): {err}")),
+                ]))),
+                AgentStatus::Cancelled => items.push(ListItem::new(Line::from(vec![
+                    Span::styled("\u{2717} ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        format!("{label} cancelled (iter {iteration})"),
+                        Style::default().fg(Color::Yellow),
+                    ),
                 ]))),
             },
             Row::AllDone => items.push(ListItem::new(Line::from(vec![Span::styled(
@@ -621,6 +650,9 @@ fn current_status(app: &App) -> String {
         return "Consolidating reports...".into();
     }
     if !app.is_running {
+        if app.cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            return "Cancelled".into();
+        }
         return "Done".into();
     }
 
@@ -939,5 +971,82 @@ mod tests {
             iteration: 1,
         }];
         assert_eq!(current_status(&a), "Waiting...");
+    }
+
+    #[test]
+    fn current_status_shows_cancelled_when_flag_set() {
+        let mut a = app();
+        a.is_running = false;
+        a.cancel_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(current_status(&a), "Cancelled");
+    }
+
+    #[test]
+    fn build_event_items_marks_thinking_as_cancelled() {
+        let mut a = app();
+        a.is_running = false;
+        a.cancel_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        a.progress_events = vec![
+            ProgressEvent::AgentStarted {
+                agent: "Claude".into(),
+                kind: ProviderKind::Anthropic,
+                iteration: 1,
+            },
+            ProgressEvent::AgentFinished {
+                agent: "Codex".into(),
+                kind: ProviderKind::OpenAI,
+                iteration: 1,
+            },
+        ];
+        let items = build_event_items(&a);
+        let texts: Vec<String> = items.iter().map(|i| format!("{:?}", i)).collect();
+        let joined = texts.join("\n");
+        // Thinking agent should be cancelled, finished agent stays finished
+        assert!(joined.contains("cancelled"), "expected cancelled in: {joined}");
+        assert!(joined.contains("finished"), "expected finished in: {joined}");
+        assert!(
+            !joined.contains("thinking"),
+            "expected no thinking in: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_event_items_keeps_thinking_when_not_cancelled() {
+        let mut a = app();
+        a.is_running = true;
+        a.progress_events = vec![ProgressEvent::AgentStarted {
+            agent: "Claude".into(),
+            kind: ProviderKind::Anthropic,
+            iteration: 1,
+        }];
+        let items = build_event_items(&a);
+        let joined: String = items.iter().map(|i| format!("{:?}", i)).collect();
+        assert!(
+            joined.contains("thinking"),
+            "expected thinking in: {joined}"
+        );
+    }
+
+    #[test]
+    fn build_event_items_marks_thinking_blocks_as_cancelled() {
+        let mut a = app();
+        a.is_running = false;
+        a.cancel_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        a.progress_events = vec![ProgressEvent::BlockStarted {
+            block_id: 1,
+            agent_name: "Claude".into(),
+            label: "Block 1 (Claude)".into(),
+            iteration: 1,
+        }];
+        let items = build_event_items(&a);
+        let joined: String = items.iter().map(|i| format!("{:?}", i)).collect();
+        assert!(joined.contains("cancelled"), "expected cancelled in: {joined}");
+        assert!(
+            !joined.contains("thinking"),
+            "expected no thinking in: {joined}"
+        );
     }
 }

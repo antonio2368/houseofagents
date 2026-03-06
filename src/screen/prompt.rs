@@ -3,7 +3,7 @@ use crate::execution::ExecutionMode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
@@ -79,9 +79,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         (0, 0, 0)
     };
 
-    let prompt_area = Paragraph::new(display_text)
+    let wrapped = char_wrap_text(display_text, prompt_inner.width as usize);
+    let prompt_area = Paragraph::new(wrapped.as_str())
         .style(text_style)
-        .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0))
         .block(prompt_block);
     f.render_widget(prompt_area, chunks[1]);
@@ -278,6 +278,35 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(help, chunks[5]);
 }
 
+/// Character-wrap text into visual lines matching `prompt_cursor_layout` wrapping.
+/// Returns a new string with newlines inserted at wrap points.
+pub(crate) fn char_wrap_text(text: &str, width: usize) -> String {
+    if width == 0 {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len() + text.len() / width.max(1));
+    let mut col = 0usize;
+    for ch in text.chars() {
+        if ch == '\n' {
+            result.push('\n');
+            col = 0;
+            continue;
+        }
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).min(width);
+        if ch_width == 0 {
+            result.push(ch);
+            continue;
+        }
+        if col + ch_width > width {
+            result.push('\n');
+            col = 0;
+        }
+        result.push(ch);
+        col += ch_width;
+    }
+    result
+}
+
 pub(crate) fn prompt_cursor_layout(
     text: &str,
     cursor: usize,
@@ -329,7 +358,7 @@ pub(crate) fn prompt_cursor_layout(
 
 #[cfg(test)]
 mod tests {
-    use super::prompt_cursor_layout;
+    use super::{char_wrap_text, prompt_cursor_layout};
 
     #[test]
     fn prompt_cursor_layout_zero_size_returns_origin() {
@@ -385,5 +414,31 @@ mod tests {
         assert_eq!(col, 1);
         assert_eq!(row, 4);
         assert_eq!(scroll, 3);
+    }
+
+    #[test]
+    fn char_wrap_text_no_wrap_needed() {
+        assert_eq!(char_wrap_text("hello", 10), "hello");
+    }
+
+    #[test]
+    fn char_wrap_text_wraps_at_width() {
+        assert_eq!(char_wrap_text("abcdef", 3), "abc\ndef");
+    }
+
+    #[test]
+    fn char_wrap_text_preserves_newlines() {
+        assert_eq!(char_wrap_text("ab\ncd", 5), "ab\ncd");
+    }
+
+    #[test]
+    fn char_wrap_text_zero_width_returns_original() {
+        assert_eq!(char_wrap_text("abc", 0), "abc");
+    }
+
+    #[test]
+    fn char_wrap_text_wide_chars() {
+        // CJK char "中" has width 2; width=3 fits one CJK + one ASCII
+        assert_eq!(char_wrap_text("中a中", 3), "中a\n中");
     }
 }

@@ -112,8 +112,9 @@ pub struct App {
     pub pipeline_focus: PipelineFocus,
     pub pipeline_canvas_offset: (i16, i16),
 
-    // Pipeline prompt/iterations
+    // Pipeline prompt/session/iterations
     pub pipeline_prompt_cursor: usize,
+    pub pipeline_session_name: String,
     pub pipeline_iterations_buf: String,
 
     // Pipeline connect mode
@@ -186,6 +187,7 @@ pub enum ConsolidationPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineFocus {
     InitialPrompt,
+    SessionName,
     Iterations,
     Builder,
 }
@@ -299,6 +301,7 @@ impl App {
             pipeline_focus: PipelineFocus::InitialPrompt,
             pipeline_canvas_offset: (0, 0),
             pipeline_prompt_cursor: 0,
+            pipeline_session_name: String::new(),
             pipeline_iterations_buf: "1".into(),
             pipeline_connecting_from: None,
             pipeline_removing_conn: false,
