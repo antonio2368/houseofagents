@@ -8,21 +8,21 @@ use tokio::sync::mpsc;
 
 pub async fn run_solo(
     prompt: &str,
-    mut providers: Vec<Box<dyn Provider>>,
+    agents: Vec<(String, Box<dyn Provider>)>,
     output: &OutputManager,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
     let mut handles = Vec::new();
 
-    for provider in providers.drain(..) {
+    for (name, provider) in agents {
         let prompt = prompt.to_string();
         let tx = progress_tx.clone();
         let cancel = cancel.clone();
         let run_dir = output.run_dir().clone();
 
         handles.push(tokio::spawn(async move {
-            solo_agent(provider, &prompt, &run_dir, tx, cancel).await
+            solo_agent(name, provider, &prompt, &run_dir, tx, cancel).await
         }));
     }
 
@@ -35,6 +35,7 @@ pub async fn run_solo(
 }
 
 async fn solo_agent(
+    name: String,
     mut provider: Box<dyn Provider>,
     prompt: &str,
     run_dir: &std::path::Path,
@@ -47,8 +48,13 @@ async fn solo_agent(
         return;
     }
 
-    let _ = tx.send(ProgressEvent::AgentStarted { kind, iteration: 1 });
+    let _ = tx.send(ProgressEvent::AgentStarted {
+        agent: name.clone(),
+        kind,
+        iteration: 1,
+    });
     let _ = tx.send(ProgressEvent::AgentLog {
+        agent: name.clone(),
         kind,
         iteration: 1,
         message: "Sending request...".into(),
@@ -56,10 +62,12 @@ async fn solo_agent(
 
     let (live_tx, mut live_rx) = mpsc::unbounded_channel::<String>();
     provider.set_live_log_sender(Some(live_tx));
+    let live_name = name.clone();
     let live_progress_tx = tx.clone();
     let live_forward = tokio::spawn(async move {
         while let Some(line) = live_rx.recv().await {
             let _ = live_progress_tx.send(ProgressEvent::AgentLog {
+                agent: live_name.clone(),
                 kind,
                 iteration: 1,
                 message: format!("CLI {line}"),
@@ -71,7 +79,7 @@ async fn solo_agent(
         res = provider.send(prompt) => Some(res),
         _ = wait_for_cancel(&cancel) => {
             let _ = tx.send(ProgressEvent::AgentLog {
-                kind, iteration: 1, message: "Cancelled".into(),
+                agent: name.clone(), kind, iteration: 1, message: "Cancelled".into(),
             });
             None
         }
@@ -87,6 +95,7 @@ async fn solo_agent(
         Ok(resp) => {
             for log in &resp.debug_logs {
                 let _ = tx.send(ProgressEvent::AgentLog {
+                    agent: name.clone(),
                     kind,
                     iteration: 1,
                     message: format!("CLI {log}"),
@@ -94,6 +103,7 @@ async fn solo_agent(
             }
             let preview = resp.content.lines().take(3).collect::<Vec<_>>().join(" | ");
             let _ = tx.send(ProgressEvent::AgentLog {
+                agent: name.clone(),
                 kind,
                 iteration: 1,
                 message: format!(
@@ -102,11 +112,13 @@ async fn solo_agent(
                     truncate_chars(&preview, 80)
                 ),
             });
-            let filename = format!("{}_iter1.md", kind.config_key());
+            let sanitized = OutputManager::sanitize_session_name(&name);
+            let filename = format!("{sanitized}_iter1.md");
             let path = run_dir.join(&filename);
             if let Err(e) = tokio::fs::write(&path, &resp.content).await {
                 let err = format!("Failed to write output file {}: {e}", path.display());
                 let _ = tx.send(ProgressEvent::AgentError {
+                    agent: name.clone(),
                     kind,
                     iteration: 1,
                     error: err.clone(),
@@ -114,11 +126,16 @@ async fn solo_agent(
                 });
                 return;
             }
-            let _ = tx.send(ProgressEvent::AgentFinished { kind, iteration: 1 });
+            let _ = tx.send(ProgressEvent::AgentFinished {
+                agent: name,
+                kind,
+                iteration: 1,
+            });
         }
         Err(e) => {
             let err_str = e.to_string();
             let _ = tx.send(ProgressEvent::AgentError {
+                agent: name,
                 kind,
                 iteration: 1,
                 error: err_str.clone(),
@@ -136,33 +153,49 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
+    fn named(
+        name: &str,
+        _kind: ProviderKind,
+        provider: Box<dyn Provider>,
+    ) -> (String, Box<dyn Provider>) {
+        (name.to_string(), provider)
+    }
+
     #[tokio::test]
     async fn run_solo_success_writes_outputs_and_all_done() {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), Some("solo")).expect("out");
         let received = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![
-            Box::new(MockProvider::ok(
+        let agents = vec![
+            named(
+                "Claude",
                 ProviderKind::Anthropic,
-                "a1",
-                received.clone(),
-            )),
-            Box::new(MockProvider::ok(
+                Box::new(MockProvider::ok(
+                    ProviderKind::Anthropic,
+                    "a1",
+                    received.clone(),
+                )),
+            ),
+            named(
+                "Codex",
                 ProviderKind::OpenAI,
-                "o1",
-                received.clone(),
-            )),
+                Box::new(MockProvider::ok(
+                    ProviderKind::OpenAI,
+                    "o1",
+                    received.clone(),
+                )),
+            ),
         ];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        run_solo("prompt", providers, &out, tx, cancel)
+        run_solo("prompt", agents, &out, tx, cancel)
             .await
             .expect("run");
 
         assert_eq!(received.lock().expect("lock").len(), 2);
-        assert!(out.run_dir().join("anthropic_iter1.md").exists());
-        assert!(out.run_dir().join("openai_iter1.md").exists());
+        assert!(out.run_dir().join("Claude_iter1.md").exists());
+        assert!(out.run_dir().join("Codex_iter1.md").exists());
 
         let events = collect_progress_events(rx);
         assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
@@ -187,15 +220,15 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
         let received = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::err(
+        let agents = vec![named(
+            "Gemini",
             ProviderKind::Gemini,
-            "boom",
-            received,
-        ))];
+            Box::new(MockProvider::err(ProviderKind::Gemini, "boom", received)),
+        )];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        run_solo("prompt", providers, &out, tx, cancel)
+        run_solo("prompt", agents, &out, tx, cancel)
             .await
             .expect("run");
 
@@ -216,17 +249,21 @@ mod tests {
     async fn run_solo_write_failure_emits_agent_error() {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
-        std::fs::create_dir_all(out.run_dir().join("anthropic_iter1.md")).expect("mkdir");
+        std::fs::create_dir_all(out.run_dir().join("Claude_iter1.md")).expect("mkdir");
         let received = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::ok(
+        let agents = vec![named(
+            "Claude",
             ProviderKind::Anthropic,
-            "content",
-            received,
-        ))];
+            Box::new(MockProvider::ok(
+                ProviderKind::Anthropic,
+                "content",
+                received,
+            )),
+        )];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        run_solo("prompt", providers, &out, tx, cancel)
+        run_solo("prompt", agents, &out, tx, cancel)
             .await
             .expect("run");
 
@@ -254,20 +291,24 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
         let received = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::ok(
+        let agents = vec![named(
+            "Claude",
             ProviderKind::Anthropic,
-            "unused",
-            received.clone(),
-        ))];
+            Box::new(MockProvider::ok(
+                ProviderKind::Anthropic,
+                "unused",
+                received.clone(),
+            )),
+        )];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(true));
 
-        run_solo("prompt", providers, &out, tx, cancel)
+        run_solo("prompt", agents, &out, tx, cancel)
             .await
             .expect("run");
 
         assert!(received.lock().expect("lock").is_empty());
-        assert!(!out.run_dir().join("anthropic_iter1.md").exists());
+        assert!(!out.run_dir().join("Claude_iter1.md").exists());
         let events = collect_progress_events(rx);
         assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
     }
@@ -277,15 +318,19 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
         let received = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::ok(
+        let agents = vec![named(
+            "Claude",
             ProviderKind::Anthropic,
-            "ok",
-            received,
-        ))];
+            Box::new(MockProvider::ok(
+                ProviderKind::Anthropic,
+                "ok",
+                received,
+            )),
+        )];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        run_solo("prompt", providers, &out, tx, cancel)
+        run_solo("prompt", agents, &out, tx, cancel)
             .await
             .expect("run");
 

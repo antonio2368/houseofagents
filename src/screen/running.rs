@@ -65,7 +65,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Check if there's an error to show details for
     let failed_error = find_last_error(app);
 
-    if let Some((kind, error_text)) = &failed_error {
+    if let Some((agent_name, error_text)) = &failed_error {
         // Split: event list on top, error detail on bottom
         let log_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -75,7 +75,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         render_activity_list(f, app, log_chunks[0]);
 
         // Error detail panel
-        let error_title = format!(" {} — Error Details ", kind.display_name());
+        let error_title = format!(" {agent_name} — Error Details ");
         let error_para = Paragraph::new(error_text.as_str())
             .wrap(Wrap { trim: false })
             .block(
@@ -103,10 +103,10 @@ pub fn draw(f: &mut Frame, app: &App) {
             // Active agent detail panel — last 10 logs
             let detail_items: Vec<ListItem> = active_logs
                 .iter()
-                .map(|(kind, msg)| {
+                .map(|(agent, msg)| {
                     ListItem::new(Line::from(vec![
                         Span::styled(
-                            format!("{}: ", kind.display_name()),
+                            format!("{agent}: "),
                             Style::default().fg(Color::Cyan),
                         ),
                         Span::raw(msg.as_str()),
@@ -183,8 +183,8 @@ fn draw_consolidation_modal(f: &mut Frame, app: &App) {
                 ]),
             ],
             ConsolidationPhase::Provider => {
-                let mut lines = vec![Line::from("Select consolidation provider:"), Line::from("")];
-                for (i, kind) in app.selected_agents.iter().enumerate() {
+                let mut lines = vec![Line::from("Select consolidation agent:"), Line::from("")];
+                for (i, agent) in app.config.agents.iter().enumerate() {
                     let style = if i == app.consolidation_provider_cursor {
                         Style::default()
                             .fg(Color::Cyan)
@@ -193,7 +193,7 @@ fn draw_consolidation_modal(f: &mut Frame, app: &App) {
                         Style::default()
                     };
                     lines.push(Line::from(Span::styled(
-                        kind.display_name().to_string(),
+                        format!("{} ({})", agent.name, agent.provider.display_name()),
                         style,
                     )));
                 }
@@ -252,12 +252,12 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
 
     enum Row {
         Agent {
-            kind: crate::provider::ProviderKind,
+            name: String,
             iteration: u32,
             status: AgentStatus,
         },
         Log {
-            kind: crate::provider::ProviderKind,
+            name: String,
             message: String,
         },
         IterationComplete(u32),
@@ -265,12 +265,12 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
     }
 
     let mut rows: Vec<Row> = Vec::new();
-    let mut agent_row_idx: HashMap<(crate::provider::ProviderKind, u32), usize> = HashMap::new();
+    let mut agent_row_idx: HashMap<(String, u32), usize> = HashMap::new();
 
     for evt in &app.progress_events {
         match evt {
-            ProgressEvent::AgentStarted { kind, iteration } => {
-                let key = (*kind, *iteration);
+            ProgressEvent::AgentStarted { agent, iteration, .. } => {
+                let key = (agent.clone(), *iteration);
                 if let Some(idx) = agent_row_idx.get(&key).copied() {
                     if let Row::Agent { status, .. } = &mut rows[idx] {
                         *status = AgentStatus::Thinking;
@@ -278,14 +278,14 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                 } else {
                     agent_row_idx.insert(key, rows.len());
                     rows.push(Row::Agent {
-                        kind: *kind,
+                        name: agent.clone(),
                         iteration: *iteration,
                         status: AgentStatus::Thinking,
                     });
                 }
             }
-            ProgressEvent::AgentFinished { kind, iteration } => {
-                let key = (*kind, *iteration);
+            ProgressEvent::AgentFinished { agent, iteration, .. } => {
+                let key = (agent.clone(), *iteration);
                 if let Some(idx) = agent_row_idx.get(&key).copied() {
                     if let Row::Agent { status, .. } = &mut rows[idx] {
                         *status = AgentStatus::Finished;
@@ -293,19 +293,19 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                 } else {
                     agent_row_idx.insert(key, rows.len());
                     rows.push(Row::Agent {
-                        kind: *kind,
+                        name: agent.clone(),
                         iteration: *iteration,
                         status: AgentStatus::Finished,
                     });
                 }
             }
             ProgressEvent::AgentError {
-                kind,
+                agent,
                 iteration,
                 error,
                 ..
             } => {
-                let key = (*kind, *iteration);
+                let key = (agent.clone(), *iteration);
                 let err = truncate_line(error, 100);
                 if let Some(idx) = agent_row_idx.get(&key).copied() {
                     if let Row::Agent { status, .. } = &mut rows[idx] {
@@ -314,7 +314,7 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                 } else {
                     agent_row_idx.insert(key, rows.len());
                     rows.push(Row::Agent {
-                        kind: *kind,
+                        name: agent.clone(),
                         iteration: *iteration,
                         status: AgentStatus::Error(err),
                     });
@@ -324,13 +324,13 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                 rows.push(Row::IterationComplete(*iteration));
             }
             ProgressEvent::AllDone => rows.push(Row::AllDone),
-            ProgressEvent::AgentLog { kind, message, .. } => {
+            ProgressEvent::AgentLog { agent, message, .. } => {
                 if message.contains("consolidating reports")
                     || message.contains("analyzing reports for errors")
                     || message.contains("Diagnostic report saved to")
                 {
                     rows.push(Row::Log {
-                        kind: *kind,
+                        name: agent.clone(),
                         message: message.clone(),
                     });
                 }
@@ -341,34 +341,21 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
     for row in rows {
         match row {
             Row::Agent {
-                kind,
+                name,
                 iteration,
                 status,
             } => match status {
                 AgentStatus::Thinking => items.push(ListItem::new(Line::from(vec![
                     Span::styled(format!("{spinner} "), Style::default().fg(Color::Yellow)),
-                    Span::raw(format!(
-                        "{} thinking (iter {})",
-                        kind.display_name(),
-                        iteration
-                    )),
+                    Span::raw(format!("{name} thinking (iter {iteration})")),
                 ]))),
                 AgentStatus::Finished => items.push(ListItem::new(Line::from(vec![
                     Span::styled("✓ ", Style::default().fg(Color::Green)),
-                    Span::raw(format!(
-                        "{} finished (iter {})",
-                        kind.display_name(),
-                        iteration
-                    )),
+                    Span::raw(format!("{name} finished (iter {iteration})")),
                 ]))),
                 AgentStatus::Error(err) => items.push(ListItem::new(Line::from(vec![
                     Span::styled("✗ ", Style::default().fg(Color::Red)),
-                    Span::raw(format!(
-                        "{} FAILED (iter {}): {}",
-                        kind.display_name(),
-                        iteration,
-                        err
-                    )),
+                    Span::raw(format!("{name} FAILED (iter {iteration}): {err}")),
                 ]))),
             },
             Row::IterationComplete(iteration) => {
@@ -379,9 +366,9 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                         .add_modifier(Modifier::ITALIC),
                 )])))
             }
-            Row::Log { kind, message } => items.push(ListItem::new(Line::from(vec![
+            Row::Log { name, message } => items.push(ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("{} ", kind.display_name()),
+                    format!("{name} "),
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(message, Style::default().fg(Color::Yellow)),
@@ -416,16 +403,17 @@ fn render_activity_list(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Collect the last 10 AgentLog events for currently active agents
-fn collect_active_agent_logs(app: &App) -> Vec<(crate::provider::ProviderKind, String)> {
+fn collect_active_agent_logs(app: &App) -> Vec<(String, String)> {
     app.progress_events
         .iter()
         .rev()
         .filter_map(|evt| match evt {
             ProgressEvent::AgentLog {
-                kind,
+                agent,
                 iteration,
                 message,
-            } => Some((*kind, format!("[iter {iteration}] {message}"))),
+                ..
+            } => Some((agent.clone(), format!("[iter {iteration}] {message}"))),
             _ => None,
         })
         .take(10)
@@ -436,13 +424,13 @@ fn collect_active_agent_logs(app: &App) -> Vec<(crate::provider::ProviderKind, S
 }
 
 /// Find the last error event (if any) to show full details
-fn find_last_error(app: &App) -> Option<(crate::provider::ProviderKind, String)> {
+fn find_last_error(app: &App) -> Option<(String, String)> {
     app.progress_events.iter().rev().find_map(|evt| match evt {
         ProgressEvent::AgentError {
-            kind,
+            agent,
             details: Some(details),
             ..
-        } => Some((*kind, details.clone())),
+        } => Some((agent.clone(), details.clone())),
         _ => None,
     })
 }
@@ -498,16 +486,15 @@ fn current_status(app: &App) -> String {
         return "Done".into();
     }
     let mut active_agents: Vec<&str> = Vec::new();
-    for kind in &app.selected_agents {
-        let name = kind.display_name();
+    for name in &app.selected_agents {
         let last = app.progress_events.iter().rev().find(|e| match e {
-            ProgressEvent::AgentStarted { kind: k, .. }
-            | ProgressEvent::AgentFinished { kind: k, .. }
-            | ProgressEvent::AgentError { kind: k, .. } => k == kind,
+            ProgressEvent::AgentStarted { agent, .. }
+            | ProgressEvent::AgentFinished { agent, .. }
+            | ProgressEvent::AgentError { agent, .. } => agent == name,
             _ => false,
         });
         if matches!(last, Some(ProgressEvent::AgentStarted { .. })) {
-            active_agents.push(name);
+            active_agents.push(name.as_str());
         }
     }
 
@@ -535,8 +522,8 @@ mod tests {
             model_fetch_timeout_seconds: 30,
             cli_timeout_seconds: 600,
             diagnostic_provider: None,
+            agents: Vec::new(),
             providers: std::collections::HashMap::new(),
-            diagnostics: std::collections::HashMap::new(),
         })
     }
 
@@ -560,7 +547,7 @@ mod tests {
     fn compute_total_steps_solo_is_agent_count() {
         let mut a = app();
         a.selected_mode = ExecutionMode::Solo;
-        a.selected_agents = vec![ProviderKind::Anthropic, ProviderKind::OpenAI];
+        a.selected_agents = vec!["Claude".into(), "Codex".into()];
         a.iterations = 9;
         assert_eq!(compute_total_steps(&a), 2);
     }
@@ -569,7 +556,7 @@ mod tests {
     fn compute_total_steps_relay_uses_iterations() {
         let mut a = app();
         a.selected_mode = ExecutionMode::Relay;
-        a.selected_agents = vec![ProviderKind::Anthropic, ProviderKind::OpenAI];
+        a.selected_agents = vec!["Claude".into(), "Codex".into()];
         a.iterations = 3;
         assert_eq!(compute_total_steps(&a), 6);
     }
@@ -578,7 +565,7 @@ mod tests {
     fn compute_total_steps_swarm_uses_iterations() {
         let mut a = app();
         a.selected_mode = ExecutionMode::Swarm;
-        a.selected_agents = vec![ProviderKind::Anthropic];
+        a.selected_agents = vec!["Claude".into()];
         a.iterations = 4;
         assert_eq!(compute_total_steps(&a), 4);
     }
@@ -588,14 +575,17 @@ mod tests {
         let mut a = app();
         a.progress_events = vec![
             ProgressEvent::AgentStarted {
+                agent: "Claude".into(),
                 kind: ProviderKind::Anthropic,
                 iteration: 1,
             },
             ProgressEvent::AgentFinished {
+                agent: "Claude".into(),
                 kind: ProviderKind::Anthropic,
                 iteration: 1,
             },
             ProgressEvent::AgentError {
+                agent: "Codex".into(),
                 kind: ProviderKind::OpenAI,
                 iteration: 1,
                 error: "x".to_string(),
@@ -610,6 +600,7 @@ mod tests {
         let mut a = app();
         for i in 0..12 {
             a.progress_events.push(ProgressEvent::AgentLog {
+                agent: "Claude".into(),
                 kind: ProviderKind::Anthropic,
                 iteration: i,
                 message: format!("m{i}"),
@@ -626,12 +617,14 @@ mod tests {
         let mut a = app();
         a.progress_events = vec![
             ProgressEvent::AgentError {
+                agent: "Claude".into(),
                 kind: ProviderKind::Anthropic,
                 iteration: 1,
                 error: "old".to_string(),
                 details: Some("old details".to_string()),
             },
             ProgressEvent::AgentError {
+                agent: "Codex".into(),
                 kind: ProviderKind::OpenAI,
                 iteration: 2,
                 error: "new".to_string(),
@@ -640,7 +633,7 @@ mod tests {
         ];
         assert_eq!(
             find_last_error(&a),
-            Some((ProviderKind::OpenAI, "new details".to_string()))
+            Some(("Codex".to_string(), "new details".to_string()))
         );
     }
 
@@ -648,6 +641,7 @@ mod tests {
     fn find_last_error_ignores_missing_details() {
         let mut a = app();
         a.progress_events.push(ProgressEvent::AgentError {
+            agent: "Codex".into(),
             kind: ProviderKind::OpenAI,
             iteration: 1,
             error: "x".to_string(),
@@ -678,8 +672,9 @@ mod tests {
     fn current_status_reports_waiting_when_no_active_agents() {
         let mut a = app();
         a.is_running = true;
-        a.selected_agents = vec![ProviderKind::Anthropic];
+        a.selected_agents = vec!["Claude".into()];
         a.progress_events = vec![ProgressEvent::AgentFinished {
+            agent: "Claude".into(),
             kind: ProviderKind::Anthropic,
             iteration: 1,
         }];
@@ -690,13 +685,15 @@ mod tests {
     fn current_status_reports_active_agent_names() {
         let mut a = app();
         a.is_running = true;
-        a.selected_agents = vec![ProviderKind::Anthropic, ProviderKind::OpenAI];
+        a.selected_agents = vec!["Claude".into(), "Codex".into()];
         a.progress_events = vec![
             ProgressEvent::AgentStarted {
+                agent: "Claude".into(),
                 kind: ProviderKind::Anthropic,
                 iteration: 1,
             },
             ProgressEvent::AgentStarted {
+                agent: "Codex".into(),
                 kind: ProviderKind::OpenAI,
                 iteration: 1,
             },

@@ -1,7 +1,7 @@
 use crate::error::AppError;
 use crate::execution::{truncate_chars, wait_for_cancel, ProgressEvent};
 use crate::output::OutputManager;
-use crate::provider::{Provider, ProviderKind};
+use crate::provider::Provider;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,12 +10,12 @@ use tokio::sync::mpsc;
 #[allow(clippy::too_many_arguments)]
 pub async fn run_relay(
     prompt: &str,
-    mut providers: Vec<Box<dyn Provider>>,
+    mut agents: Vec<(String, Box<dyn Provider>)>,
     iterations: u32,
     start_iteration: u32,
     initial_last_output: Option<String>,
     forward_prompt: bool,
-    use_cli_by_kind: HashMap<ProviderKind, bool>,
+    use_cli_by_agent: HashMap<String, bool>,
     output: &OutputManager,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
     cancel: Arc<AtomicBool>,
@@ -23,9 +23,12 @@ pub async fn run_relay(
     let has_initial_last_output = initial_last_output.is_some();
     let mut last_output = initial_last_output.unwrap_or_default();
 
-    // Pre-compute agent kinds for building messages without borrowing providers
-    let agent_kinds: Vec<ProviderKind> = providers.iter().map(|p| p.kind()).collect();
-    let num_agents = providers.len();
+    // Pre-compute agent names/kinds for building messages without borrowing agents
+    let agent_info: Vec<(String, crate::provider::ProviderKind)> = agents
+        .iter()
+        .map(|(name, p)| (name.clone(), p.kind()))
+        .collect();
+    let num_agents = agents.len();
 
     for offset in 0..iterations {
         let iteration = start_iteration + offset;
@@ -35,10 +38,15 @@ pub async fn run_relay(
                 return Ok(());
             }
 
-            let kind = agent_kinds[i];
-            let _ = progress_tx.send(ProgressEvent::AgentStarted { kind, iteration });
+            let (ref name, ref kind) = agent_info[i];
+            let _ = progress_tx.send(ProgressEvent::AgentStarted {
+                agent: name.clone(),
+                kind: *kind,
+                iteration,
+            });
             let _ = progress_tx.send(ProgressEvent::AgentLog {
-                kind,
+                agent: name.clone(),
+                kind: *kind,
                 iteration,
                 message: "Sending request...".into(),
             });
@@ -46,12 +54,12 @@ pub async fn run_relay(
             let message = if !has_initial_last_output && offset == 0 && i == 0 {
                 prompt.to_string()
             } else {
-                let prev_kind = if i == 0 {
-                    agent_kinds[num_agents - 1]
+                let (ref prev_name, ref _prev_kind) = if i == 0 {
+                    &agent_info[num_agents - 1]
                 } else {
-                    agent_kinds[i - 1]
+                    &agent_info[i - 1]
                 };
-                let receiver_is_cli = use_cli_by_kind.get(&kind).copied().unwrap_or(false);
+                let receiver_is_cli = use_cli_by_agent.get(name).copied().unwrap_or(false);
                 let task_prefix = if forward_prompt {
                     format!("Original task: {}\n\n", prompt)
                 } else {
@@ -59,48 +67,50 @@ pub async fn run_relay(
                 };
                 if receiver_is_cli {
                     let prev_iteration = if i == 0 { iteration - 1 } else { iteration };
-                    let prev_path = output.run_dir().join(format!(
-                        "{}_iter{}.md",
-                        prev_kind.config_key(),
-                        prev_iteration
-                    ));
+                    let prev_file_key = OutputManager::sanitize_session_name(prev_name);
+                    let prev_path = output
+                        .run_dir()
+                        .join(format!("{}_iter{}.md", prev_file_key, prev_iteration));
                     format!(
                         "{}Read the previous agent output from file and build on it.\n\nPrevious agent: {}\nFile: {}\n\nUse that file as the source of truth and provide an improved response.",
                         task_prefix,
-                        prev_kind.display_name(),
+                        prev_name,
                         prev_path.display()
                     )
                 } else {
                     format!(
                         "{}Here is the output from {} (the previous agent):\n\n---\n{}\n---\n\nPlease build upon and improve this work.",
-                        task_prefix, prev_kind.display_name(), last_output
+                        task_prefix, prev_name, last_output
                     )
                 }
             };
 
             // Use select! so cancel aborts the in-flight request
             let (live_tx, mut live_rx) = mpsc::unbounded_channel::<String>();
-            providers[i].set_live_log_sender(Some(live_tx));
+            agents[i].1.set_live_log_sender(Some(live_tx));
             let live_progress_tx = progress_tx.clone();
+            let live_name = name.clone();
+            let live_kind = *kind;
             let live_forward = tokio::spawn(async move {
                 while let Some(line) = live_rx.recv().await {
                     let _ = live_progress_tx.send(ProgressEvent::AgentLog {
-                        kind,
+                        agent: live_name.clone(),
+                        kind: live_kind,
                         iteration,
                         message: format!("CLI {line}"),
                     });
                 }
             });
             let result = tokio::select! {
-                res = providers[i].send(&message) => Some(res),
+                res = agents[i].1.send(&message) => Some(res),
                 _ = wait_for_cancel(&cancel) => {
                     let _ = progress_tx.send(ProgressEvent::AgentLog {
-                        kind, iteration, message: "Cancelled".into(),
+                        agent: name.clone(), kind: *kind, iteration, message: "Cancelled".into(),
                     });
                     None
                 }
             };
-            providers[i].set_live_log_sender(None);
+            agents[i].1.set_live_log_sender(None);
             let _ = live_forward.await;
             let Some(result) = result else {
                 let _ = progress_tx.send(ProgressEvent::AllDone);
@@ -111,14 +121,16 @@ pub async fn run_relay(
                 Ok(resp) => {
                     for log in &resp.debug_logs {
                         let _ = progress_tx.send(ProgressEvent::AgentLog {
-                            kind,
+                            agent: name.clone(),
+                            kind: *kind,
                             iteration,
                             message: format!("CLI {log}"),
                         });
                     }
                     let preview = resp.content.lines().take(3).collect::<Vec<_>>().join(" | ");
                     let _ = progress_tx.send(ProgressEvent::AgentLog {
-                        kind,
+                        agent: name.clone(),
+                        kind: *kind,
                         iteration,
                         message: format!(
                             "Response received ({} chars): {}",
@@ -126,18 +138,20 @@ pub async fn run_relay(
                             truncate_chars(&preview, 80)
                         ),
                     });
-                    if let Err(e) = output.write_agent_output(kind, iteration, &resp.content) {
+                    if let Err(e) = output.write_agent_output(name, iteration, &resp.content) {
                         let err_str =
-                            format!("Failed to write output file for {kind} iter{iteration}: {e}");
+                            format!("Failed to write output file for {name} iter{iteration}: {e}");
                         if let Err(log_err) = output.append_error(&err_str) {
                             let _ = progress_tx.send(ProgressEvent::AgentLog {
-                                kind,
+                                agent: name.clone(),
+                                kind: *kind,
                                 iteration,
                                 message: format!("Failed to append error log: {log_err}"),
                             });
                         }
                         let _ = progress_tx.send(ProgressEvent::AgentError {
-                            kind,
+                            agent: name.clone(),
+                            kind: *kind,
                             iteration,
                             error: err_str.clone(),
                             details: Some(err_str),
@@ -145,27 +159,32 @@ pub async fn run_relay(
                         let _ = progress_tx.send(ProgressEvent::AllDone);
                         return Ok(());
                     }
-                    let _ = progress_tx.send(ProgressEvent::AgentFinished { kind, iteration });
+                    let _ = progress_tx.send(ProgressEvent::AgentFinished {
+                        agent: name.clone(),
+                        kind: *kind,
+                        iteration,
+                    });
                     last_output = resp.content;
                 }
                 Err(e) => {
                     let err_str = e.to_string();
                     if let Err(log_err) =
-                        output.append_error(&format!("{kind} iter{iteration}: {err_str}"))
+                        output.append_error(&format!("{name} iter{iteration}: {err_str}"))
                     {
                         let _ = progress_tx.send(ProgressEvent::AgentLog {
-                            kind,
+                            agent: name.clone(),
+                            kind: *kind,
                             iteration,
                             message: format!("Failed to append error log: {log_err}"),
                         });
                     }
                     let _ = progress_tx.send(ProgressEvent::AgentError {
-                        kind,
+                        agent: name.clone(),
+                        kind: *kind,
                         iteration,
                         error: err_str.clone(),
                         details: Some(err_str),
                     });
-                    // Stop the entire relay on failure
                     let _ = progress_tx.send(ProgressEvent::AllDone);
                     return Ok(());
                 }
@@ -183,8 +202,13 @@ pub async fn run_relay(
 mod tests {
     use super::*;
     use crate::execution::test_utils::{collect_progress_events, ok_response, MockProvider};
+    use crate::provider::ProviderKind;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    fn named(name: &str, _kind: ProviderKind, provider: Box<dyn crate::provider::Provider>) -> (String, Box<dyn crate::provider::Provider>) {
+        (name.to_string(), provider)
+    }
 
     #[tokio::test]
     async fn run_relay_one_iteration_passes_previous_output_to_next_agent() {
@@ -192,24 +216,24 @@ mod tests {
         let out = OutputManager::new(dir.path(), Some("relay")).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![
-            Box::new(MockProvider::with_responses(
+        let agents = vec![
+            named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::with_responses(
                 ProviderKind::Anthropic,
                 vec![ok_response("first output")],
                 recv_a.clone(),
-            )),
-            Box::new(MockProvider::with_responses(
+            ))),
+            named("Codex", ProviderKind::OpenAI, Box::new(MockProvider::with_responses(
                 ProviderKind::OpenAI,
                 vec![ok_response("second output")],
                 recv_b.clone(),
-            )),
+            ))),
         ];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
             "initial prompt",
-            providers,
+            agents,
             1,
             1,
             None,
@@ -226,8 +250,8 @@ mod tests {
         let b_msgs = recv_b.lock().expect("lock");
         assert_eq!(a_msgs[0], "initial prompt");
         assert!(b_msgs[0].contains("first output"));
-        assert!(out.run_dir().join("anthropic_iter1.md").exists());
-        assert!(out.run_dir().join("openai_iter1.md").exists());
+        assert!(out.run_dir().join("Claude_iter1.md").exists());
+        assert!(out.run_dir().join("Codex_iter1.md").exists());
         let events = collect_progress_events(rx);
         assert!(events
             .iter()
@@ -241,30 +265,30 @@ mod tests {
         let out = OutputManager::new(dir.path(), None).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![
-            Box::new(MockProvider::with_responses(
+        let agents = vec![
+            named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::with_responses(
                 ProviderKind::Anthropic,
                 vec![ok_response("a out")],
                 recv_a,
-            )),
-            Box::new(MockProvider::with_responses(
+            ))),
+            named("Codex", ProviderKind::OpenAI, Box::new(MockProvider::with_responses(
                 ProviderKind::OpenAI,
                 vec![ok_response("b out")],
                 recv_b.clone(),
-            )),
+            ))),
         ];
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut use_cli = HashMap::new();
-        use_cli.insert(ProviderKind::OpenAI, true);
+        use_cli.insert("Codex".to_string(), true);
 
-        run_relay("p", providers, 1, 1, None, false, use_cli, &out, tx, cancel)
+        run_relay("p", agents, 1, 1, None, false, use_cli, &out, tx, cancel)
             .await
             .expect("run");
 
         let b_msgs = recv_b.lock().expect("lock");
         assert!(b_msgs[0].contains("Read the previous agent output from file"));
-        assert!(b_msgs[0].contains("anthropic_iter1.md"));
+        assert!(b_msgs[0].contains("Claude_iter1.md"));
     }
 
     #[tokio::test]
@@ -272,17 +296,17 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
+        let agents = vec![named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
             vec![ok_response("new")],
             recv.clone(),
-        ))];
+        )))];
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
             "ignored",
-            providers,
+            agents,
             1,
             2,
             Some("resume seed".to_string()),
@@ -297,7 +321,7 @@ mod tests {
 
         let msg = recv.lock().expect("lock")[0].clone();
         assert!(msg.contains("resume seed"));
-        assert!(out.run_dir().join("anthropic_iter2.md").exists());
+        assert!(out.run_dir().join("Claude_iter2.md").exists());
     }
 
     #[tokio::test]
@@ -305,17 +329,17 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
+        let agents = vec![named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
             vec![ok_response("new")],
             recv.clone(),
-        ))];
+        )))];
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
             "initial prompt",
-            providers,
+            agents,
             1,
             3,
             None,
@@ -330,7 +354,7 @@ mod tests {
 
         let msg = recv.lock().expect("lock")[0].clone();
         assert_eq!(msg, "initial prompt");
-        assert!(out.run_dir().join("anthropic_iter3.md").exists());
+        assert!(out.run_dir().join("Claude_iter3.md").exists());
     }
 
     #[tokio::test]
@@ -338,15 +362,15 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::err(
+        let agents = vec![named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::err(
             ProviderKind::Anthropic,
             "bad",
             recv,
-        ))];
+        )))];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        run_relay("p", providers, 2, 1, None, false, HashMap::new(), &out, tx, cancel)
+        run_relay("p", agents, 2, 1, None, false, HashMap::new(), &out, tx, cancel)
             .await
             .expect("run");
 
@@ -364,15 +388,15 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
         let recv = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
+        let agents = vec![named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
             vec![ok_response("x")],
             recv.clone(),
-        ))];
+        )))];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(true));
 
-        run_relay("p", providers, 1, 1, None, false, HashMap::new(), &out, tx, cancel)
+        run_relay("p", agents, 1, 1, None, false, HashMap::new(), &out, tx, cancel)
             .await
             .expect("run");
 
@@ -386,17 +410,17 @@ mod tests {
     async fn run_relay_write_failure_emits_agent_error_and_stops() {
         let dir = tempdir().expect("tempdir");
         let out = OutputManager::new(dir.path(), None).expect("out");
-        std::fs::create_dir_all(out.run_dir().join("anthropic_iter1.md")).expect("mkdir");
+        std::fs::create_dir_all(out.run_dir().join("Claude_iter1.md")).expect("mkdir");
         let recv = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![Box::new(MockProvider::with_responses(
+        let agents = vec![named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::with_responses(
             ProviderKind::Anthropic,
             vec![ok_response("x")],
             recv,
-        ))];
+        )))];
         let (tx, rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        run_relay("p", providers, 2, 1, None, false, HashMap::new(), &out, tx, cancel)
+        run_relay("p", agents, 2, 1, None, false, HashMap::new(), &out, tx, cancel)
             .await
             .expect("run");
 
@@ -404,20 +428,11 @@ mod tests {
         assert!(events.iter().any(|e| {
             matches!(
                 e,
-                ProgressEvent::AgentError { kind: ProviderKind::Anthropic, error, .. }
+                ProgressEvent::AgentError { error, .. }
                 if error.contains("Failed to write output file")
             )
         }));
         assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
-        assert!(!events.iter().any(|e| {
-            matches!(
-                e,
-                ProgressEvent::AgentFinished {
-                    kind: ProviderKind::Anthropic,
-                    ..
-                }
-            )
-        }));
     }
 
     #[tokio::test]
@@ -426,24 +441,24 @@ mod tests {
         let out = OutputManager::new(dir.path(), None).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![
-            Box::new(MockProvider::with_responses(
+        let agents = vec![
+            named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::with_responses(
                 ProviderKind::Anthropic,
                 vec![ok_response("first output")],
                 recv_a.clone(),
-            )),
-            Box::new(MockProvider::with_responses(
+            ))),
+            named("Codex", ProviderKind::OpenAI, Box::new(MockProvider::with_responses(
                 ProviderKind::OpenAI,
                 vec![ok_response("second output")],
                 recv_b.clone(),
-            )),
+            ))),
         ];
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
             "write a poem",
-            providers,
+            agents,
             1,
             1,
             None,
@@ -470,26 +485,26 @@ mod tests {
         let out = OutputManager::new(dir.path(), None).expect("out");
         let recv_a = Arc::new(Mutex::new(Vec::new()));
         let recv_b = Arc::new(Mutex::new(Vec::new()));
-        let providers: Vec<Box<dyn Provider>> = vec![
-            Box::new(MockProvider::with_responses(
+        let agents = vec![
+            named("Claude", ProviderKind::Anthropic, Box::new(MockProvider::with_responses(
                 ProviderKind::Anthropic,
                 vec![ok_response("first output")],
                 recv_a,
-            )),
-            Box::new(MockProvider::with_responses(
+            ))),
+            named("Codex", ProviderKind::OpenAI, Box::new(MockProvider::with_responses(
                 ProviderKind::OpenAI,
                 vec![ok_response("second output")],
                 recv_b.clone(),
-            )),
+            ))),
         ];
         let (tx, _rx) = mpsc::unbounded_channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut use_cli = HashMap::new();
-        use_cli.insert(ProviderKind::OpenAI, true);
+        use_cli.insert("Codex".to_string(), true);
 
         run_relay(
             "write a poem",
-            providers,
+            agents,
             1,
             1,
             None,
@@ -505,6 +520,6 @@ mod tests {
         let b_msgs = recv_b.lock().expect("lock");
         assert!(b_msgs[0].contains("Original task: write a poem"));
         assert!(b_msgs[0].contains("Read the previous agent output from file"));
-        assert!(b_msgs[0].contains("anthropic_iter1.md"));
+        assert!(b_msgs[0].contains("Claude_iter1.md"));
     }
 }

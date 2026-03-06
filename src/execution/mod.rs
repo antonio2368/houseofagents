@@ -58,21 +58,26 @@ impl fmt::Display for ExecutionMode {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum ProgressEvent {
     AgentStarted {
+        agent: String,
         kind: ProviderKind,
         iteration: u32,
     },
     AgentLog {
+        agent: String,
         kind: ProviderKind,
         iteration: u32,
         message: String,
     },
     AgentFinished {
+        agent: String,
         kind: ProviderKind,
         iteration: u32,
     },
     AgentError {
+        agent: String,
         kind: ProviderKind,
         iteration: u32,
         error: String,

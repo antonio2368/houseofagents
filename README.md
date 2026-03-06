@@ -29,23 +29,25 @@ Run Claude, Codex, and Gemini in collaborative execution modes and save all arti
 | **OpenAI** (Codex) | `api_key` | `codex` binary |
 | **Google** (Gemini) | `api_key` | `gemini` binary |
 
-Each provider can run in API mode or CLI mode (`use_cli = true`). Mix and match freely.
+Each agent can run in API mode or CLI mode (`use_cli = true`). Mix and match freely.
 
 ## Features
 
 - **Terminal UI** — select agents, mode, prompt, and iteration count from an interactive TUI
+- **Named agents** — define multiple agents per provider with independent configs
 - **Resume runs** — pick up where you left off in relay or swarm sessions
 - **Forward Prompt** — relay mode option to include the original prompt in every handoff
-- **Consolidation** — merge multi-agent output into a single final markdown file
+- **Consolidation** — merge multi-agent output into a single final markdown file (any configured agent can consolidate)
 - **Diagnostics** — optional post-run analysis pass that writes `errors.md`
-- **Config editor** — edit provider settings, timeouts, and models live with a popup (`e`)
+- **Config editor** — add/remove/rename agents, edit settings, timeouts, and models live with a popup (`e`)
 - **Model picker** — browse available models from the API directly inside the config editor (`l`)
+- **CLI print mode** — Anthropic agents in CLI mode can toggle between print (`-p`) and agent mode
 
 ## Requirements
 
 - **Rust 1.88+** and Cargo
 - A terminal with TUI support
-- At least one provider configured via API key **or** locally-installed CLI with auth set up
+- At least one agent configured via API key **or** locally-installed CLI with auth set up
 
 ## Install
 
@@ -76,11 +78,11 @@ The install script runs `cargo install --path .` and writes a starter config via
 # 1. Initialize config (skip if you used install.sh)
 houseofagents --init-config
 
-# 2. Edit config — for at least one provider:
+# 2. Edit config — for at least one agent:
 #    - API mode: set `api_key` and `use_cli = false`
 #    - CLI mode: set `use_cli = true` and ensure the CLI is installed/authenticated
 #    Default location: ~/.config/houseofagents/config.toml
-#    Optional: uncomment diagnostic_provider to enable diagnostics
+#    Optional: set diagnostic_provider to an agent name to enable diagnostics
 
 # 3. Launch
 houseofagents
@@ -112,58 +114,38 @@ http_timeout_seconds = 120
 model_fetch_timeout_seconds = 30
 cli_timeout_seconds = 600
 
-# Optional: set one diagnostics provider ("anthropic", "openai", "gemini")
-# diagnostic_provider = "openai"
+# Optional: set to an agent name to enable diagnostics
+# diagnostic_provider = "Claude"
 
-[providers.openai]
+# Named agents — you can have multiple agents per provider
+[[agents]]
+name = "Codex"
+provider = "openai"
 api_key = ""
 model = "gpt-5.3-codex"
 reasoning_effort = "high"
 use_cli = true
 extra_cli_args = ""
 
-[providers.anthropic]
+[[agents]]
+name = "Claude"
+provider = "anthropic"
 api_key = ""
 model = "claude-opus-4-6"
 thinking_effort = "high"
 use_cli = true
+cli_print_mode = true
 extra_cli_args = ""
 
-[providers.gemini]
+[[agents]]
+name = "Gemini"
+provider = "gemini"
 api_key = ""
 model = "gemini-2.5-pro"
 thinking_effort = "medium"
 use_cli = true
 extra_cli_args = ""
 ```
-
-<details>
-<summary>Diagnostics providers (separate config block)</summary>
-
-```toml
-[diagnostics.anthropic]
-api_key = ""
-model = "claude-opus-4-6"
-thinking_effort = "low"
-use_cli = true
-extra_cli_args = ""
-
-[diagnostics.openai]
-api_key = ""
-model = "gpt-5.3-codex"
-reasoning_effort = "low"
-use_cli = true
-extra_cli_args = ""
-
-[diagnostics.gemini]
-api_key = ""
-model = "gemini-2.5-pro"
-thinking_effort = "low"
-use_cli = true
-extra_cli_args = ""
-```
-
-</details>
 
 ### Config Reference
 
@@ -177,15 +159,18 @@ extra_cli_args = ""
 | `http_timeout_seconds` | Timeout for API calls (`use_cli = false`) |
 | `model_fetch_timeout_seconds` | Timeout for model list fetch in config editor |
 | `cli_timeout_seconds` | Timeout for CLI calls (`use_cli = true`) |
-| `diagnostic_provider` | Optional provider key for the automatic diagnostics pass (disabled when unset) |
+| `diagnostic_provider` | Agent name for the automatic diagnostics pass (disabled when unset) |
 
-**Provider settings** (`[providers.*]` and `[diagnostics.*]`):
+**Agent settings** (`[[agents]]`):
 
 | Field | Description |
 |-------|-------------|
-| `api_key` | API key for the provider (required when `use_cli = false`, leave empty for CLI mode) |
+| `name` | Display name for the agent (must be unique) |
+| `provider` | Provider type — `anthropic`, `openai`, or `gemini` |
+| `api_key` | API key (required when `use_cli = false`, leave empty for CLI mode) |
 | `model` | Model identifier to use |
 | `use_cli` | Use local CLI binary instead of HTTP API |
+| `cli_print_mode` | Anthropic only: use print mode (`-p`) instead of agent mode (default: `true`) |
 | `extra_cli_args` | Raw string appended as one extra CLI argument |
 | `reasoning_effort` | OpenAI effort setting — `low` / `medium` / `high` |
 | `thinking_effort` | Anthropic & Gemini effort setting — `low` / `medium` / `high` |
@@ -200,6 +185,29 @@ extra_cli_args = ""
 | `Tab` | Switch panels |
 | `e` | Open config editor |
 | `Enter` | Continue to prompt |
+
+### Config Editor
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Navigate agents or timeouts |
+| `Tab` | Switch section (Agents / Timeouts) |
+| `n` | Add new agent |
+| `Del` / `Backspace` | Remove agent |
+| `r` | Rename agent |
+| `p` | Cycle provider (Anthropic / OpenAI / Gemini) |
+| `c` | Toggle CLI / API mode |
+| `b` | Toggle print / agent mode (Anthropic CLI) |
+| `a` | Edit API key |
+| `m` | Edit model |
+| `l` | Open model picker |
+| `t` | Cycle thinking / reasoning effort |
+| `x` | Edit extra CLI args |
+| `d` | Toggle diagnostic agent |
+| `o` | Edit output directory |
+| `e` | Edit selected timeout (Timeouts section) |
+| `s` | Save config to disk |
+| `Esc` | Close (keep changes for session) |
 
 ### Prompt Screen
 
@@ -246,9 +254,9 @@ output_dir/
   20260305_143022_a1b2/
     prompt.md                    # Original prompt
     session.toml                 # Run metadata
-    anthropic_iter1.md           # Provider output per iteration
-    openai_iter2.md
-    consolidated_anthropic.md    # Optional: merged output
+    Claude_iter1.md              # Agent output per iteration
+    Codex_iter2.md
+    consolidated_Claude.md       # Optional: merged output
     errors.md                    # Optional: diagnostics report
     _errors.log                  # Application-level error log
 ```
@@ -261,5 +269,5 @@ Directory names follow the pattern `YYYYMMDD_HHMMSS_<rand>` (with optional `_<se
   - With a session name: resumes the latest run matching that name
   - Without: resumes the latest compatible run (matching mode + agents)
 - **Forward Prompt** (toggle with `Space` on Prompt screen) — relay mode only; when enabled, downstream agents receive the original prompt alongside the previous agent's output, preventing context loss in the handoff chain
-- **Consolidation** — offered after non-cancelled swarm/solo runs; produces a single merged markdown
-- **Diagnostics** — when `diagnostic_provider` is set, a final analysis pass writes `errors.md`
+- **Consolidation** — offered after non-cancelled swarm/solo runs with 2+ agents; any configured agent can perform the consolidation (not limited to agents from the run)
+- **Diagnostics** — when `diagnostic_provider` is set to an agent name, a final analysis pass writes `errors.md`

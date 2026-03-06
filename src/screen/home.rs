@@ -72,17 +72,17 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_agents_panel(f: &mut Frame, app: &App, area: Rect) {
-    let providers = app.available_providers();
+    let agents = app.available_agents();
     let is_focused = app.home_section == HomeSection::Agents;
 
-    let items: Vec<ListItem> = providers
+    let items: Vec<ListItem> = agents
         .iter()
         .enumerate()
-        .map(|(i, (kind, available))| {
-            let selected = app.selected_agents.contains(kind);
+        .map(|(i, (agent, available))| {
+            let selected = app.selected_agents.contains(&agent.name);
             let marker = if selected { "[x]" } else { "[ ]" };
             let status = if *available { "" } else { " (unavailable)" };
-            let name = kind.display_name();
+            let name = &agent.name;
 
             let style = if !available {
                 Style::default().fg(Color::DarkGray)
@@ -269,21 +269,16 @@ fn draw_help_popup(f: &mut Frame, app: &App) {
 
 fn draw_edit_popup(f: &mut Frame, app: &App) {
     let area = centered_rect(70, 60, f.area());
-    let mut selected_line_idx = 0usize;
-    let diag_kind = diagnostic_provider_kind(app);
+    let mut selected_line_start = 0usize;
+    let diag_agent = app.config.diagnostic_provider.as_deref();
     let selected_cursor = match app.edit_popup_section {
         EditPopupSection::Providers => app.edit_popup_cursor,
-        EditPopupSection::Diagnostics => app.edit_popup_diagnostic_cursor,
         EditPopupSection::Timeouts => app.edit_popup_timeout_cursor,
     };
 
     let mut header_lines = vec![
         Line::from(Span::styled(
-            "j/k: navigate entries  Tab: switch section  [o]: output dir  [s]: save to disk",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "[c]: CLI/API  [a]: key  [m]: model  [x]: extra CLI args  [l]: list models  [t]: effort/reasoning  [d]: set/clear diagnostic provider  [e]/Enter: edit selected in Timeouts  Esc: keep for session",
+            "j/k: navigate  Tab: section  [o]: output dir  [s]: save  Esc: keep for session  [n]: new  [Del]: remove  [p]: provider  [r]: rename  [d]: diagnostic  [c]: CLI/API  [b]: print/agent  [a]: key  [m]: model  [l]: list  [t]: effort  [x]: extra CLI",
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(""),
@@ -291,8 +286,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
             Span::raw("Section: "),
             Span::styled(
                 match app.edit_popup_section {
-                    EditPopupSection::Providers => "Run Providers",
-                    EditPopupSection::Diagnostics => "Diagnostics",
+                    EditPopupSection::Providers => "Agents",
                     EditPopupSection::Timeouts => "Timeouts",
                 },
                 Style::default()
@@ -309,12 +303,10 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
             Span::styled("  [o]", Style::default().fg(Color::DarkGray)),
         ]),
         Line::from(vec![
-            Span::raw("Diagnostics Provider: "),
+            Span::raw("Diagnostic Agent: "),
             Span::styled(
-                diag_kind
-                    .map(|k| k.display_name().to_string())
-                    .unwrap_or_else(|| "off".into()),
-                if diag_kind.is_some() {
+                diag_agent.unwrap_or("off"),
+                if diag_agent.is_some() {
                     Style::default().fg(Color::Green)
                 } else {
                     Style::default().fg(Color::DarkGray)
@@ -348,14 +340,15 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
     let mut body_lines: Vec<Line> = Vec::new();
     match app.edit_popup_section {
         EditPopupSection::Providers => {
-            let providers = app.available_providers();
-            for (i, (kind, _available)) in providers.iter().enumerate() {
-                let config = app.effective_provider_config(*kind);
-                let cli_installed = app.cli_available.get(kind).copied().unwrap_or(false);
+            let agents = app.available_agents();
+            for (i, (agent_cfg, _available)) in agents.iter().enumerate() {
+                let config = app.effective_agent_config(&agent_cfg.name);
+                let provider = config.map(|c| c.provider).unwrap_or(agent_cfg.provider);
+                let cli_installed = app.cli_available.get(&provider).copied().unwrap_or(false);
                 let use_cli = config.map(|c| c.use_cli).unwrap_or(false);
                 let (key, model, extra_cli_args, thinking_label, has_api_key) = match config {
                     Some(c) => {
-                        let thinking = match kind {
+                        let thinking = match c.provider {
                             ProviderKind::OpenAI => match c.reasoning_effort.as_deref() {
                                 Some(e) => format!("reasoning: {e}"),
                                 None => "off".into(),
@@ -393,7 +386,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                 } else {
                     ("API", Style::default())
                 };
-                let effort_title = match kind {
+                let effort_title = match provider {
                     ProviderKind::OpenAI => "Reasoning",
                     ProviderKind::Anthropic | ProviderKind::Gemini => "Thinking",
                 };
@@ -407,19 +400,40 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     Style::default()
                 };
                 if is_selected {
-                    selected_line_idx = body_lines.len();
+                    selected_line_start = body_lines.len();
                 }
 
-                body_lines.push(Line::from(Span::styled(
-                    kind.display_name().to_string(),
+                let is_diag = diag_agent == Some(agent_cfg.name.as_str());
+                let mut name_spans = vec![Span::styled(
+                    format!("{} ({})", agent_cfg.name, provider.display_name()),
                     style,
-                )));
+                )];
+                if is_diag {
+                    name_spans.push(Span::styled(
+                        " [diag]",
+                        Style::default().fg(Color::Green),
+                    ));
+                }
+                body_lines.push(Line::from(name_spans));
+                let cli_print_mode = config.map(|c| c.cli_print_mode).unwrap_or(true);
                 if is_selected && !app.edit_popup_editing {
                     body_lines.push(Line::from(vec![
                         Span::raw("  Mode:     "),
                         Span::styled(mode_text, mode_style),
                         Span::styled("  [c]", Style::default().fg(Color::DarkGray)),
                     ]));
+                    if provider == ProviderKind::Anthropic && use_cli {
+                        let (cm_text, cm_style) = if cli_print_mode {
+                            ("print (-p)", Style::default())
+                        } else {
+                            ("agent", Style::default().fg(Color::Green))
+                        };
+                        body_lines.push(Line::from(vec![
+                            Span::raw("  CLI Mode: "),
+                            Span::styled(cm_text, cm_style),
+                            Span::styled("  [b]", Style::default().fg(Color::DarkGray)),
+                        ]));
+                    }
                     let key_style = if use_cli {
                         Style::default().fg(Color::DarkGray)
                     } else {
@@ -498,8 +512,9 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                         crate::app::EditField::ExtraCliArgs => "extra cli args",
                         crate::app::EditField::OutputDir => "output dir",
                         crate::app::EditField::TimeoutSeconds => "timeout",
+                        crate::app::EditField::AgentName => "name",
                     };
-                    selected_line_idx = body_lines.len();
+                    selected_line_start = body_lines.len();
                     body_lines.push(Line::from(Span::styled(
                         format!(
                             "  New {}: {}_ (Enter: save, Esc: cancel)",
@@ -510,151 +525,6 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                 }
 
                 body_lines.push(Line::from(""));
-            }
-        }
-        EditPopupSection::Diagnostics => {
-            let kind = ProviderKind::all()
-                .get(selected_cursor)
-                .copied()
-                .unwrap_or(ProviderKind::Anthropic);
-            let config = app.effective_diagnostic_config(kind);
-            let cli_installed = app.cli_available.get(&kind).copied().unwrap_or(false);
-            let use_cli = config.map(|c| c.use_cli).unwrap_or(false);
-            let (key, model, extra_cli_args, thinking_label, has_api_key) = match config {
-                Some(c) => {
-                    let thinking = match kind {
-                        ProviderKind::OpenAI => match c.reasoning_effort.as_deref() {
-                            Some(e) => format!("reasoning: {e}"),
-                            None => "off".into(),
-                        },
-                        _ => match c.thinking_effort.as_deref() {
-                            Some(e) => format!("effort: {e}"),
-                            None => "off".into(),
-                        },
-                    };
-                    (
-                        mask_key(&c.api_key),
-                        c.model.clone(),
-                        if c.extra_cli_args.trim().is_empty() {
-                            "(none)".into()
-                        } else {
-                            c.extra_cli_args.clone()
-                        },
-                        thinking,
-                        !c.api_key.trim().is_empty(),
-                    )
-                }
-                None => (
-                    "(not set)".into(),
-                    "(not set)".into(),
-                    "(none)".into(),
-                    "off".into(),
-                    false,
-                ),
-            };
-            let (mode_text, mode_style) = if use_cli {
-                ("CLI", Style::default().fg(Color::Green))
-            } else if !cli_installed {
-                ("API (no CLI)", Style::default().fg(Color::DarkGray))
-            } else {
-                ("API", Style::default())
-            };
-            let effort_title = match kind {
-                ProviderKind::OpenAI => "Reasoning",
-                ProviderKind::Anthropic | ProviderKind::Gemini => "Thinking",
-            };
-            let active = is_diagnostic_provider(app, kind);
-            body_lines.push(Line::from(vec![
-                Span::raw("Provider: "),
-                Span::styled(
-                    kind.display_name(),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  (j/k)", Style::default().fg(Color::DarkGray)),
-            ]));
-            body_lines.push(Line::from(vec![
-                Span::raw("  Active:   "),
-                Span::styled(
-                    if active { "yes" } else { "no" },
-                    if active {
-                        Style::default().fg(Color::Green)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-                Span::styled("  [d]", Style::default().fg(Color::DarkGray)),
-            ]));
-            body_lines.push(Line::from(vec![
-                Span::raw("  Mode:     "),
-                Span::styled(mode_text, mode_style),
-                Span::styled("  [c]", Style::default().fg(Color::DarkGray)),
-            ]));
-            let key_style = if use_cli {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            body_lines.push(Line::from(vec![
-                Span::styled("  Key:      ", key_style),
-                Span::styled(key, key_style),
-                Span::styled("  [a]", Style::default().fg(Color::DarkGray)),
-            ]));
-            let extra_cli_style = cli_dependent_style(use_cli);
-            body_lines.push(Line::from(vec![
-                Span::styled("  Extra CLI:", extra_cli_style),
-                Span::styled(format!(" {extra_cli_args}"), extra_cli_style),
-                Span::styled("  [x]", Style::default().fg(Color::DarkGray)),
-            ]));
-            if !active {
-                body_lines.push(Line::from(Span::styled(
-                    "  Diagnostics are currently off for this provider",
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            if active {
-                body_lines.push(Line::from(vec![
-                    Span::raw("  Model:    "),
-                    Span::raw(model.clone()),
-                    Span::styled("  [m] [l]", Style::default().fg(Color::DarkGray)),
-                ]));
-                if !has_api_key {
-                    body_lines.push(Line::from(Span::styled(
-                        "            Add API key to fetch model list",
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-                let thinking_style = if thinking_label == "off" {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::Magenta)
-                };
-                body_lines.push(Line::from(vec![
-                    Span::raw(format!("  {effort_title}: ").to_string()),
-                    Span::styled(thinking_label, thinking_style),
-                    Span::styled("  [t]", Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-
-            if app.edit_popup_editing
-                && !matches!(app.edit_popup_field, crate::app::EditField::OutputDir)
-            {
-                let field_name = match app.edit_popup_field {
-                    crate::app::EditField::ApiKey => "key",
-                    crate::app::EditField::Model => "model",
-                    crate::app::EditField::ExtraCliArgs => "extra cli args",
-                    crate::app::EditField::OutputDir => "output dir",
-                    crate::app::EditField::TimeoutSeconds => "timeout",
-                };
-                selected_line_idx = body_lines.len();
-                body_lines.push(Line::from(Span::styled(
-                    format!(
-                        "  New {}: {}_ (Enter: save, Esc: cancel)",
-                        field_name, app.edit_buffer
-                    ),
-                    Style::default().fg(Color::Yellow),
-                )));
             }
         }
         EditPopupSection::Timeouts => {
@@ -697,7 +567,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     Style::default()
                 };
                 if is_selected {
-                    selected_line_idx = body_lines.len();
+                    selected_line_start = body_lines.len();
                 }
 
                 body_lines.push(Line::from(vec![
@@ -725,7 +595,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     && app.edit_popup_editing
                     && matches!(app.edit_popup_field, crate::app::EditField::TimeoutSeconds)
                 {
-                    selected_line_idx = body_lines.len();
+                    selected_line_start = body_lines.len();
                     body_lines.push(Line::from(Span::styled(
                         format!(
                             "   New timeout: {}_ (seconds, Enter: save, Esc: cancel)",
@@ -749,7 +619,18 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
     f.render_widget(block, area);
 
     if inner.width > 0 && inner.height > 0 {
-        let header_height = header_lines.len().min(inner.height as usize) as u16;
+        let header_height = if inner.width > 0 {
+            header_lines
+                .iter()
+                .map(|l| {
+                    let w: usize = l.spans.iter().map(|s| s.content.len()).sum();
+                    1usize.max(w.div_ceil(inner.width as usize))
+                })
+                .sum::<usize>()
+                .min(inner.height as usize)
+        } else {
+            header_lines.len().min(inner.height as usize)
+        } as u16;
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(header_height), Constraint::Min(0)])
@@ -767,9 +648,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
             let body_height = sections[1].height as usize;
             if body_height > 0 && lines_len > body_height {
                 let max_scroll = lines_len - body_height;
-                let scroll = selected_line_idx
-                    .saturating_sub(body_height / 2)
-                    .min(max_scroll) as u16;
+                let scroll = selected_line_start.min(max_scroll) as u16;
                 body = body.scroll((scroll, 0));
             }
             f.render_widget(body, sections[1]);
@@ -785,14 +664,11 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
 fn draw_model_picker(f: &mut Frame, app: &App) {
     let area = centered_rect(60, 70, f.area());
 
-    let cursor = match app.edit_popup_section {
-        EditPopupSection::Providers => app.edit_popup_cursor,
-        EditPopupSection::Diagnostics => app.edit_popup_diagnostic_cursor,
-        EditPopupSection::Timeouts => app.edit_popup_cursor,
-    };
-    let provider_name = ProviderKind::all()
-        .get(cursor)
-        .map(|k| k.display_name())
+    let provider_name: &str = app
+        .config
+        .agents
+        .get(app.edit_popup_cursor)
+        .map(|a| a.name.as_str())
         .unwrap_or("?");
 
     if app.model_picker_loading {
@@ -913,33 +789,9 @@ fn mask_key(key: &str) -> String {
     }
 }
 
-fn is_diagnostic_provider(app: &App, kind: ProviderKind) -> bool {
-    diagnostic_provider_kind(app) == Some(kind)
-}
-
-fn diagnostic_provider_kind(app: &App) -> Option<ProviderKind> {
-    ProviderKind::from_selector(app.config.diagnostic_provider.as_deref()?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AppConfig;
-    use std::collections::HashMap;
-
-    fn app_with_diagnostic(diag: Option<&str>) -> App {
-        App::new(AppConfig {
-            output_dir: "/tmp".to_string(),
-            default_max_tokens: 4096,
-            max_history_messages: 50,
-            http_timeout_seconds: 120,
-            model_fetch_timeout_seconds: 30,
-            cli_timeout_seconds: 600,
-            diagnostic_provider: diag.map(|s| s.to_string()),
-            providers: HashMap::new(),
-            diagnostics: HashMap::new(),
-        })
-    }
 
     #[test]
     fn help_lines_contains_mode_headers() {
@@ -980,28 +832,4 @@ mod tests {
         assert_eq!(mask_key("ééééabcdéééé"), "éééé...éééé");
     }
 
-    #[test]
-    fn is_diagnostic_provider_true_when_matching() {
-        let app = app_with_diagnostic(Some("openai"));
-        assert!(is_diagnostic_provider(&app, ProviderKind::OpenAI));
-        assert!(!is_diagnostic_provider(&app, ProviderKind::Anthropic));
-    }
-
-    #[test]
-    fn diagnostic_provider_kind_matches_config_key() {
-        let app = app_with_diagnostic(Some("gemini"));
-        assert_eq!(diagnostic_provider_kind(&app), Some(ProviderKind::Gemini));
-    }
-
-    #[test]
-    fn diagnostic_provider_kind_none_when_missing() {
-        let app = app_with_diagnostic(None);
-        assert_eq!(diagnostic_provider_kind(&app), None);
-    }
-
-    #[test]
-    fn diagnostic_provider_kind_matches_display_name_case_insensitive() {
-        let app = app_with_diagnostic(Some("cOdEx"));
-        assert_eq!(diagnostic_provider_kind(&app), Some(ProviderKind::OpenAI));
-    }
 }

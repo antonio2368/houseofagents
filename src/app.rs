@@ -1,5 +1,6 @@
-use crate::config::{AppConfig, ProviderConfig};
+use crate::config::{AgentConfig, AppConfig};
 use crate::execution::{ExecutionMode, ProgressEvent};
+use crate::output::OutputManager;
 use crate::provider::ProviderKind;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,16 +20,16 @@ pub enum Screen {
 pub struct App {
     pub config: AppConfig,
     pub config_path_override: Option<String>,
-    pub session_overrides: HashMap<String, ProviderConfig>,
-    pub session_diagnostic_overrides: HashMap<String, ProviderConfig>,
+    /// Session overrides keyed by agent name
+    pub session_overrides: HashMap<String, AgentConfig>,
     pub session_http_timeout_seconds: Option<u64>,
     pub session_model_fetch_timeout_seconds: Option<u64>,
     pub session_cli_timeout_seconds: Option<u64>,
     pub screen: Screen,
     pub should_quit: bool,
 
-    // Home screen state
-    pub selected_agents: Vec<ProviderKind>,
+    // Home screen state — selected agents by name
+    pub selected_agents: Vec<String>,
     pub selected_mode: ExecutionMode,
     pub home_cursor: usize,
     pub home_section: HomeSection,
@@ -69,7 +70,6 @@ pub struct App {
     pub show_edit_popup: bool,
     pub edit_popup_section: EditPopupSection,
     pub edit_popup_cursor: usize,
-    pub edit_popup_diagnostic_cursor: usize,
     pub edit_popup_timeout_cursor: usize,
     pub edit_popup_field: EditField,
     pub edit_popup_editing: bool,
@@ -88,7 +88,7 @@ pub struct App {
     pub config_save_in_progress: bool,
     pub config_save_rx: Option<mpsc::UnboundedReceiver<Result<(), String>>>,
 
-    // CLI availability per provider
+    // CLI availability per provider kind
     pub cli_available: HashMap<ProviderKind, bool>,
 
     // Help popup
@@ -127,12 +127,12 @@ pub enum EditField {
     ExtraCliArgs,
     OutputDir,
     TimeoutSeconds,
+    AgentName,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditPopupSection {
     Providers,
-    Diagnostics,
     Timeouts,
 }
 
@@ -162,25 +162,13 @@ impl App {
 
         // Auto-default: if no API key but CLI available, insert session override with use_cli
         let mut session_overrides = HashMap::new();
-        for kind in ProviderKind::all() {
-            let key = kind.config_key();
-            let existing = config.providers.get(key).cloned();
-            let has_key = existing
-                .as_ref()
-                .map(|c| !c.api_key.is_empty())
-                .unwrap_or(false);
-            let has_cli = cli_available.get(kind).copied().unwrap_or(false);
+        for agent in &config.agents {
+            let has_key = !agent.api_key.is_empty();
+            let has_cli = cli_available.get(&agent.provider).copied().unwrap_or(false);
             if !has_key && has_cli {
-                let mut cfg = existing.unwrap_or(ProviderConfig {
-                    api_key: String::new(),
-                    model: String::new(),
-                    reasoning_effort: None,
-                    thinking_effort: None,
-                    use_cli: false,
-                    extra_cli_args: String::new(),
-                });
-                cfg.use_cli = true;
-                session_overrides.insert(key.to_string(), cfg);
+                let mut override_agent = agent.clone();
+                override_agent.use_cli = true;
+                session_overrides.insert(agent.name.clone(), override_agent);
             }
         }
 
@@ -188,7 +176,6 @@ impl App {
             config,
             config_path_override: None,
             session_overrides,
-            session_diagnostic_overrides: HashMap::new(),
             session_http_timeout_seconds: None,
             session_model_fetch_timeout_seconds: None,
             session_cli_timeout_seconds: None,
@@ -225,7 +212,6 @@ impl App {
             show_edit_popup: false,
             edit_popup_section: EditPopupSection::Providers,
             edit_popup_cursor: 0,
-            edit_popup_diagnostic_cursor: 0,
             edit_popup_timeout_cursor: 0,
             edit_popup_field: EditField::ApiKey,
             edit_popup_editing: false,
@@ -249,32 +235,27 @@ impl App {
         }
     }
 
-    pub fn available_providers(&self) -> Vec<(ProviderKind, bool)> {
-        ProviderKind::all()
+    /// Returns list of (agent_config, is_available) for all configured agents
+    pub fn available_agents(&self) -> Vec<(&AgentConfig, bool)> {
+        self.config
+            .agents
             .iter()
-            .map(|&kind| {
-                let config = self.effective_provider_config(kind);
-                let has_key = config.map(|c| !c.api_key.is_empty()).unwrap_or(false);
-                let using_cli = config.map(|c| c.use_cli).unwrap_or(false);
-                let cli_ok = self.cli_available.get(&kind).copied().unwrap_or(false);
+            .map(|agent| {
+                let config = self.effective_agent_config(&agent.name).unwrap_or(agent);
+                let has_key = !config.api_key.is_empty();
+                let using_cli = config.use_cli;
+                let cli_ok = self.cli_available.get(&config.provider).copied().unwrap_or(false);
                 let available = if using_cli { cli_ok } else { has_key };
-                (kind, available)
+                (agent, available)
             })
             .collect()
     }
 
-    pub fn effective_provider_config(&self, kind: ProviderKind) -> Option<&ProviderConfig> {
-        let key = kind.config_key();
+    /// Get effective agent config by name (session override or global)
+    pub fn effective_agent_config(&self, name: &str) -> Option<&AgentConfig> {
         self.session_overrides
-            .get(key)
-            .or_else(|| self.config.providers.get(key))
-    }
-
-    pub fn effective_diagnostic_config(&self, kind: ProviderKind) -> Option<&ProviderConfig> {
-        let key = kind.config_key();
-        self.session_diagnostic_overrides
-            .get(key)
-            .or_else(|| self.config.diagnostics.get(key))
+            .get(name)
+            .or_else(|| self.config.agents.iter().find(|a| a.name == name))
     }
 
     pub fn effective_http_timeout_seconds(&self) -> u64 {
@@ -292,12 +273,17 @@ impl App {
             .unwrap_or(self.config.cli_timeout_seconds)
     }
 
-    pub fn toggle_agent(&mut self, kind: ProviderKind) {
-        if let Some(pos) = self.selected_agents.iter().position(|&k| k == kind) {
+    pub fn toggle_agent(&mut self, name: &str) {
+        if let Some(pos) = self.selected_agents.iter().position(|n| n == name) {
             self.selected_agents.remove(pos);
         } else {
-            self.selected_agents.push(kind);
+            self.selected_agents.push(name.to_string());
         }
+    }
+
+    /// Get the sanitized filename key for an agent name
+    pub fn agent_file_key(name: &str) -> String {
+        OutputManager::sanitize_session_name(name)
     }
 
     pub fn move_order_up(&mut self) {
@@ -324,39 +310,28 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProviderConfig;
+    use crate::config::AgentConfig;
 
-    fn provider_cfg(api_key: &str, use_cli: bool) -> ProviderConfig {
-        ProviderConfig {
+    fn agent_cfg(name: &str, provider: ProviderKind, api_key: &str, use_cli: bool) -> AgentConfig {
+        AgentConfig {
+            name: name.to_string(),
+            provider,
             api_key: api_key.to_string(),
             model: "m".to_string(),
             reasoning_effort: Some("medium".to_string()),
             thinking_effort: Some("medium".to_string()),
             use_cli,
+            cli_print_mode: true,
             extra_cli_args: String::new(),
         }
     }
 
     fn base_config() -> AppConfig {
-        let mut providers = HashMap::new();
-        providers.insert(
-            ProviderKind::Anthropic.config_key().to_string(),
-            provider_cfg("k1", false),
-        );
-        providers.insert(
-            ProviderKind::OpenAI.config_key().to_string(),
-            provider_cfg("k2", false),
-        );
-        providers.insert(
-            ProviderKind::Gemini.config_key().to_string(),
-            provider_cfg("", true),
-        );
-
-        let mut diagnostics = HashMap::new();
-        diagnostics.insert(
-            ProviderKind::OpenAI.config_key().to_string(),
-            provider_cfg("diag", false),
-        );
+        let agents = vec![
+            agent_cfg("Claude", ProviderKind::Anthropic, "k1", false),
+            agent_cfg("Codex", ProviderKind::OpenAI, "k2", false),
+            agent_cfg("Gemini", ProviderKind::Gemini, "", true),
+        ];
 
         AppConfig {
             output_dir: "/tmp/out".to_string(),
@@ -366,8 +341,8 @@ mod tests {
             model_fetch_timeout_seconds: 30,
             cli_timeout_seconds: 600,
             diagnostic_provider: None,
-            providers,
-            diagnostics,
+            agents,
+            providers: HashMap::new(),
         }
     }
 
@@ -392,50 +367,27 @@ mod tests {
     }
 
     #[test]
-    fn effective_provider_config_prefers_session_override() {
+    fn effective_agent_config_prefers_session_override() {
         let mut app = app_with_known_cli();
         app.session_overrides.insert(
-            ProviderKind::OpenAI.config_key().to_string(),
-            provider_cfg("override", true),
+            "Codex".to_string(),
+            agent_cfg("Codex", ProviderKind::OpenAI, "override", true),
         );
         let cfg = app
-            .effective_provider_config(ProviderKind::OpenAI)
+            .effective_agent_config("Codex")
             .expect("config");
         assert_eq!(cfg.api_key, "override");
         assert!(cfg.use_cli);
     }
 
     #[test]
-    fn effective_provider_config_falls_back_to_global() {
+    fn effective_agent_config_falls_back_to_global() {
         let app = app_with_known_cli();
         let cfg = app
-            .effective_provider_config(ProviderKind::Anthropic)
+            .effective_agent_config("Claude")
             .expect("config");
         assert_eq!(cfg.api_key, "k1");
         assert!(!cfg.use_cli);
-    }
-
-    #[test]
-    fn effective_diagnostic_config_prefers_session_override() {
-        let mut app = app_with_known_cli();
-        app.session_diagnostic_overrides.insert(
-            ProviderKind::OpenAI.config_key().to_string(),
-            provider_cfg("diag-override", true),
-        );
-        let cfg = app
-            .effective_diagnostic_config(ProviderKind::OpenAI)
-            .expect("config");
-        assert_eq!(cfg.api_key, "diag-override");
-        assert!(cfg.use_cli);
-    }
-
-    #[test]
-    fn effective_diagnostic_config_falls_back_to_global() {
-        let app = app_with_known_cli();
-        let cfg = app
-            .effective_diagnostic_config(ProviderKind::OpenAI)
-            .expect("config");
-        assert_eq!(cfg.api_key, "diag");
     }
 
     #[test]
@@ -460,51 +412,35 @@ mod tests {
     #[test]
     fn toggle_agent_adds_and_removes() {
         let mut app = app_with_known_cli();
-        app.toggle_agent(ProviderKind::Anthropic);
-        assert_eq!(app.selected_agents, vec![ProviderKind::Anthropic]);
-        app.toggle_agent(ProviderKind::Anthropic);
+        app.toggle_agent("Claude");
+        assert_eq!(app.selected_agents, vec!["Claude"]);
+        app.toggle_agent("Claude");
         assert!(app.selected_agents.is_empty());
     }
 
     #[test]
     fn move_order_up_without_grabbed_only_moves_cursor() {
         let mut app = app_with_known_cli();
-        app.selected_agents = vec![
-            ProviderKind::Anthropic,
-            ProviderKind::OpenAI,
-            ProviderKind::Gemini,
-        ];
+        app.selected_agents = vec!["Claude".into(), "Codex".into(), "Gemini".into()];
         app.order_cursor = 2;
         app.move_order_up();
         assert_eq!(app.order_cursor, 1);
         assert_eq!(
             app.selected_agents,
-            vec![
-                ProviderKind::Anthropic,
-                ProviderKind::OpenAI,
-                ProviderKind::Gemini
-            ]
+            vec!["Claude", "Codex", "Gemini"]
         );
     }
 
     #[test]
     fn move_order_up_with_grabbed_swaps_agents() {
         let mut app = app_with_known_cli();
-        app.selected_agents = vec![
-            ProviderKind::Anthropic,
-            ProviderKind::OpenAI,
-            ProviderKind::Gemini,
-        ];
+        app.selected_agents = vec!["Claude".into(), "Codex".into(), "Gemini".into()];
         app.order_cursor = 2;
         app.order_grabbed = Some(2);
         app.move_order_up();
         assert_eq!(
             app.selected_agents,
-            vec![
-                ProviderKind::Anthropic,
-                ProviderKind::Gemini,
-                ProviderKind::OpenAI
-            ]
+            vec!["Claude", "Gemini", "Codex"]
         );
         assert_eq!(app.order_cursor, 1);
         assert_eq!(app.order_grabbed, Some(1));
@@ -513,79 +449,66 @@ mod tests {
     #[test]
     fn move_order_down_without_grabbed_only_moves_cursor() {
         let mut app = app_with_known_cli();
-        app.selected_agents = vec![
-            ProviderKind::Anthropic,
-            ProviderKind::OpenAI,
-            ProviderKind::Gemini,
-        ];
+        app.selected_agents = vec!["Claude".into(), "Codex".into(), "Gemini".into()];
         app.order_cursor = 0;
         app.move_order_down();
         assert_eq!(app.order_cursor, 1);
         assert_eq!(
             app.selected_agents,
-            vec![
-                ProviderKind::Anthropic,
-                ProviderKind::OpenAI,
-                ProviderKind::Gemini
-            ]
+            vec!["Claude", "Codex", "Gemini"]
         );
     }
 
     #[test]
     fn move_order_down_with_grabbed_swaps_agents() {
         let mut app = app_with_known_cli();
-        app.selected_agents = vec![
-            ProviderKind::Anthropic,
-            ProviderKind::OpenAI,
-            ProviderKind::Gemini,
-        ];
+        app.selected_agents = vec!["Claude".into(), "Codex".into(), "Gemini".into()];
         app.order_cursor = 0;
         app.order_grabbed = Some(0);
         app.move_order_down();
         assert_eq!(
             app.selected_agents,
-            vec![
-                ProviderKind::OpenAI,
-                ProviderKind::Anthropic,
-                ProviderKind::Gemini
-            ]
+            vec!["Codex", "Claude", "Gemini"]
         );
         assert_eq!(app.order_cursor, 1);
         assert_eq!(app.order_grabbed, Some(1));
     }
 
     #[test]
-    fn available_providers_api_requires_key() {
+    fn available_agents_api_requires_key() {
         let mut app = app_with_known_cli();
         app.session_overrides.insert(
-            ProviderKind::Anthropic.config_key().to_string(),
-            provider_cfg("", false),
+            "Claude".to_string(),
+            agent_cfg("Claude", ProviderKind::Anthropic, "", false),
         );
-        let map: HashMap<ProviderKind, bool> = app.available_providers().into_iter().collect();
-        assert_eq!(map.get(&ProviderKind::Anthropic), Some(&false));
+        let agents = app.available_agents();
+        let claude = agents.iter().find(|(a, _)| a.name == "Claude").unwrap();
+        assert!(!claude.1);
     }
 
     #[test]
-    fn available_providers_cli_requires_installed_cli() {
+    fn available_agents_cli_requires_installed_cli() {
         let mut app = app_with_known_cli();
         app.session_overrides.insert(
-            ProviderKind::OpenAI.config_key().to_string(),
-            provider_cfg("", true),
+            "Codex".to_string(),
+            agent_cfg("Codex", ProviderKind::OpenAI, "", true),
         );
         app.cli_available.insert(ProviderKind::OpenAI, false);
-        let map: HashMap<ProviderKind, bool> = app.available_providers().into_iter().collect();
-        assert_eq!(map.get(&ProviderKind::OpenAI), Some(&false));
+        let agents = app.available_agents();
+        let codex = agents.iter().find(|(a, _)| a.name == "Codex").unwrap();
+        assert!(!codex.1);
     }
 
     #[test]
-    fn available_providers_cli_available_when_installed() {
+    fn available_agents_cli_available_when_installed() {
         let mut app = app_with_known_cli();
         app.session_overrides.insert(
-            ProviderKind::Gemini.config_key().to_string(),
-            provider_cfg("", true),
+            "Gemini".to_string(),
+            agent_cfg("Gemini", ProviderKind::Gemini, "", true),
         );
         app.cli_available.insert(ProviderKind::Gemini, true);
-        let map: HashMap<ProviderKind, bool> = app.available_providers().into_iter().collect();
-        assert_eq!(map.get(&ProviderKind::Gemini), Some(&true));
+        let agents = app.available_agents();
+        let gemini = agents.iter().find(|(a, _)| a.name == "Gemini").unwrap();
+        assert!(gemini.1);
     }
 }

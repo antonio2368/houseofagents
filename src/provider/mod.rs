@@ -3,7 +3,7 @@ pub mod cli;
 pub mod gemini;
 pub mod openai;
 
-use crate::config::ProviderConfig;
+use crate::config::{AgentConfig, ProviderConfig};
 use crate::error::AppError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ use std::fmt;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Anthropic,
     OpenAI,
@@ -110,6 +111,7 @@ pub fn create_provider(
             config.reasoning_effort.clone(),
             config.thinking_effort.clone(),
             config.extra_cli_args.clone(),
+            config.cli_print_mode,
             vec![],
             cli_timeout_seconds,
             max_history_messages,
@@ -141,6 +143,24 @@ pub fn create_provider(
             config.thinking_effort.clone(),
         )),
     }
+}
+
+#[allow(dead_code)]
+pub fn create_provider_from_agent(
+    agent: &AgentConfig,
+    client: reqwest::Client,
+    max_tokens: u32,
+    max_history_messages: usize,
+    cli_timeout_seconds: u64,
+) -> Box<dyn Provider> {
+    create_provider(
+        agent.provider,
+        &agent.to_provider_config(),
+        client,
+        max_tokens,
+        max_history_messages,
+        cli_timeout_seconds,
+    )
 }
 
 pub fn effort_to_budget(effort: &str) -> u32 {
@@ -181,6 +201,7 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             thinking_effort: Some("low".to_string()),
             use_cli,
+            cli_print_mode: true,
             extra_cli_args: "--x".to_string(),
         }
     }
@@ -342,5 +363,31 @@ mod tests {
         let assistant = serde_json::to_string(&Role::Assistant).expect("serialize");
         assert_eq!(user, "\"user\"");
         assert_eq!(assistant, "\"assistant\"");
+    }
+
+    #[test]
+    fn provider_kind_serialization_is_lowercase() {
+        #[derive(serde::Serialize)]
+        struct W {
+            kind: ProviderKind,
+        }
+        let s = toml::to_string(&W { kind: ProviderKind::Anthropic }).expect("serialize");
+        assert!(s.contains("anthropic"));
+        let s = toml::to_string(&W { kind: ProviderKind::OpenAI }).expect("serialize");
+        assert!(s.contains("openai"));
+        let s = toml::to_string(&W { kind: ProviderKind::Gemini }).expect("serialize");
+        assert!(s.contains("gemini"));
+    }
+
+    #[test]
+    fn provider_kind_deserialization_from_lowercase() {
+        #[derive(serde::Deserialize)]
+        struct W {
+            kind: ProviderKind,
+        }
+        let w: W = toml::from_str("kind = \"anthropic\"").expect("deserialize");
+        assert_eq!(w.kind, ProviderKind::Anthropic);
+        let w: W = toml::from_str("kind = \"openai\"").expect("deserialize");
+        assert_eq!(w.kind, ProviderKind::OpenAI);
     }
 }

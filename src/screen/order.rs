@@ -51,7 +51,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Style::default()
             };
 
-            ListItem::new(format!("{prefix}{}", kind.display_name())).style(style)
+            ListItem::new(format!("{prefix}{kind}")).style(style)
         })
         .collect();
 

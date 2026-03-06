@@ -1,6 +1,5 @@
 use crate::error::AppError;
 use crate::execution::ExecutionMode;
-use crate::provider::ProviderKind;
 use chrono::Local;
 use rand::Rng;
 use std::path::{Path, PathBuf};
@@ -83,13 +82,14 @@ impl OutputManager {
         Ok(())
     }
 
+    /// Write session metadata. agents is a list of (agent_name, provider_kind_key) pairs.
     pub fn write_session_info(
         &self,
         mode: &ExecutionMode,
-        agents: &[ProviderKind],
+        agents: &[(String, String)],
         iterations: u32,
         session_name: Option<&str>,
-        models: &[(ProviderKind, String)],
+        models: &[(String, String)],
     ) -> Result<(), AppError> {
         let mut root = toml::map::Map::new();
         if let Some(name) = session_name.filter(|n| !n.is_empty()) {
@@ -101,15 +101,16 @@ impl OutputManager {
             Value::Array(
                 agents
                     .iter()
-                    .map(|a| Value::String(a.config_key().to_string()))
+                    .map(|(name, _)| Value::String(name.clone()))
                     .collect(),
             ),
         );
         root.insert("iterations".into(), Value::Integer(iterations as i64));
 
         let mut model_table = toml::map::Map::new();
-        for (kind, model) in models {
-            model_table.insert(kind.config_key().to_string(), Value::String(model.clone()));
+        for (agent_name, model) in models {
+            let key = Self::sanitize_session_name(agent_name);
+            model_table.insert(key, Value::String(model.clone()));
         }
         root.insert("models".into(), Value::Table(model_table));
 
@@ -120,13 +121,15 @@ impl OutputManager {
         Ok(())
     }
 
+    /// Write agent output file using sanitized agent name
     pub fn write_agent_output(
         &self,
-        kind: ProviderKind,
+        agent_name: &str,
         iteration: u32,
         content: &str,
     ) -> Result<PathBuf, AppError> {
-        let filename = format!("{}_iter{}.md", kind.config_key(), iteration);
+        let sanitized = Self::sanitize_session_name(agent_name);
+        let filename = format!("{}_iter{}.md", sanitized, iteration);
         let path = self.run_dir.join(&filename);
         std::fs::write(&path, content)?;
         Ok(path)
@@ -245,12 +248,15 @@ mod tests {
         let mgr = OutputManager::new(base.path(), Some("sess")).expect("new");
         mgr.write_session_info(
             &ExecutionMode::Relay,
-            &[ProviderKind::Anthropic, ProviderKind::OpenAI],
+            &[
+                ("Claude".to_string(), "anthropic".to_string()),
+                ("Codex".to_string(), "openai".to_string()),
+            ],
             3,
             Some("sess"),
             &[
-                (ProviderKind::Anthropic, "claude".to_string()),
-                (ProviderKind::OpenAI, "gpt".to_string()),
+                ("Claude".to_string(), "claude-model".to_string()),
+                ("Codex".to_string(), "gpt-model".to_string()),
             ],
         )
         .expect("write");
@@ -262,14 +268,10 @@ mod tests {
         assert_eq!(value["iterations"].as_integer(), Some(3));
         let agents = value["agents"].as_array().expect("agents");
         assert_eq!(agents.len(), 2);
-        assert!(agents
-            .iter()
-            .any(|v| v.as_str() == Some(ProviderKind::Anthropic.config_key())));
-        assert!(agents
-            .iter()
-            .any(|v| v.as_str() == Some(ProviderKind::OpenAI.config_key())));
-        assert_eq!(value["models"]["anthropic"].as_str(), Some("claude"));
-        assert_eq!(value["models"]["openai"].as_str(), Some("gpt"));
+        assert!(agents.iter().any(|v| v.as_str() == Some("Claude")));
+        assert!(agents.iter().any(|v| v.as_str() == Some("Codex")));
+        assert_eq!(value["models"]["Claude"].as_str(), Some("claude-model"));
+        assert_eq!(value["models"]["Codex"].as_str(), Some("gpt-model"));
     }
 
     #[test]
@@ -277,11 +279,21 @@ mod tests {
         let base = tempdir().expect("tempdir");
         let mgr = OutputManager::new(base.path(), None).expect("new");
         let path = mgr
-            .write_agent_output(ProviderKind::Gemini, 7, "answer")
+            .write_agent_output("Gemini", 7, "answer")
             .expect("write");
-        assert!(path.ends_with("gemini_iter7.md"));
+        assert!(path.ends_with("Gemini_iter7.md"));
         let content = std::fs::read_to_string(path).expect("read");
         assert_eq!(content, "answer");
+    }
+
+    #[test]
+    fn write_agent_output_sanitizes_name() {
+        let base = tempdir().expect("tempdir");
+        let mgr = OutputManager::new(base.path(), None).expect("new");
+        let path = mgr
+            .write_agent_output("Claude Analyzer", 1, "answer")
+            .expect("write");
+        assert!(path.ends_with("Claude_Analyzer_iter1.md"));
     }
 
     #[test]

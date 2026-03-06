@@ -1,7 +1,7 @@
 use crate::app::{
     App, ConsolidationPhase, EditField, EditPopupSection, HomeSection, PromptFocus, Screen,
 };
-use crate::config::ProviderConfig;
+use crate::config::{AgentConfig, ProviderConfig};
 use crate::event::{Event, EventHandler};
 use crate::execution::relay::run_relay;
 use crate::execution::solo::run_solo;
@@ -160,7 +160,14 @@ fn handle_paste(app: &mut App, text: &str) {
         return;
     }
 
-    if app.show_help_popup || app.show_edit_popup {
+    if app.show_help_popup {
+        return;
+    }
+
+    if app.show_edit_popup {
+        if app.edit_popup_editing {
+            app.edit_buffer.push_str(text);
+        }
         return;
     }
 
@@ -180,9 +187,6 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
             app.show_edit_popup = true;
             app.edit_popup_section = EditPopupSection::Providers;
             app.edit_popup_cursor = 0;
-            app.edit_popup_diagnostic_cursor = diagnostic_provider_kind(app)
-                .and_then(|kind| ProviderKind::all().iter().position(|k| *k == kind))
-                .unwrap_or(0);
             app.edit_popup_timeout_cursor = 0;
             app.edit_popup_editing = false;
             app.edit_buffer.clear();
@@ -199,7 +203,7 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Down | KeyCode::Char('j') => {
             let max = match app.home_section {
-                HomeSection::Agents => ProviderKind::all().len().saturating_sub(1),
+                HomeSection::Agents => app.config.agents.len().saturating_sub(1),
                 HomeSection::Mode => ExecutionMode::all().len().saturating_sub(1),
             };
             if app.home_cursor < max {
@@ -208,10 +212,11 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char(' ') => match app.home_section {
             HomeSection::Agents => {
-                let providers = app.available_providers();
-                if let Some((kind, available)) = providers.get(app.home_cursor) {
+                let agents = app.available_agents();
+                if let Some((agent, available)) = agents.get(app.home_cursor) {
                     if *available {
-                        app.toggle_agent(*kind);
+                        let name = agent.name.clone();
+                        app.toggle_agent(&name);
                     }
                 }
             }
@@ -702,7 +707,7 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
     match app.consolidation_phase {
         ConsolidationPhase::Confirm => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                app.consolidation_phase = if app.selected_agents.len() <= 1 {
+                app.consolidation_phase = if app.config.agents.len() <= 1 {
                     ConsolidationPhase::Prompt
                 } else {
                     ConsolidationPhase::Provider
@@ -721,7 +726,7 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
                     app.consolidation_provider_cursor.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let max = app.selected_agents.len().saturating_sub(1);
+                let max = app.config.agents.len().saturating_sub(1);
                 if app.consolidation_provider_cursor < max {
                     app.consolidation_provider_cursor += 1;
                 }
@@ -742,7 +747,7 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Char(c) => app.consolidation_prompt.push(c),
             KeyCode::Esc => {
-                if app.selected_agents.len() <= 1 {
+                if app.config.agents.len() <= 1 {
                     app.consolidation_phase = ConsolidationPhase::Confirm;
                 } else {
                     app.consolidation_phase = ConsolidationPhase::Provider;
@@ -812,8 +817,7 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab if !app.edit_popup_editing => {
             app.edit_popup_section = match app.edit_popup_section {
-                EditPopupSection::Providers => EditPopupSection::Diagnostics,
-                EditPopupSection::Diagnostics => EditPopupSection::Timeouts,
+                EditPopupSection::Providers => EditPopupSection::Timeouts,
                 EditPopupSection::Timeouts => EditPopupSection::Providers,
             };
             app.edit_buffer.clear();
@@ -823,10 +827,6 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 EditPopupSection::Providers => {
                     app.edit_popup_cursor = app.edit_popup_cursor.saturating_sub(1);
                 }
-                EditPopupSection::Diagnostics => {
-                    app.edit_popup_diagnostic_cursor =
-                        app.edit_popup_diagnostic_cursor.saturating_sub(1);
-                }
                 EditPopupSection::Timeouts => {
                     app.edit_popup_timeout_cursor = app.edit_popup_timeout_cursor.saturating_sub(1);
                 }
@@ -835,15 +835,9 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') if !app.edit_popup_editing => {
             match app.edit_popup_section {
                 EditPopupSection::Providers => {
-                    let max = ProviderKind::all().len().saturating_sub(1);
+                    let max = app.config.agents.len().saturating_sub(1);
                     if app.edit_popup_cursor < max {
                         app.edit_popup_cursor += 1;
-                    }
-                }
-                EditPopupSection::Diagnostics => {
-                    let max = ProviderKind::all().len().saturating_sub(1);
-                    if app.edit_popup_diagnostic_cursor < max {
-                        app.edit_popup_diagnostic_cursor += 1;
                     }
                 }
                 EditPopupSection::Timeouts => {
@@ -855,50 +849,35 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('a')
-            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
         {
             app.edit_popup_field = EditField::ApiKey;
-            app.edit_buffer = selected_kind_for_edit(app)
-                .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
-                .map(|c| c.api_key.clone())
+            app.edit_buffer = effective_section_config(app)
+                .map(|c| c.api_key)
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
         KeyCode::Char('m')
-            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
         {
-            if app.edit_popup_section == EditPopupSection::Diagnostics
-                && !is_selected_diagnostic_active(app)
-            {
-                app.error_modal = Some("Enable this diagnostics provider with [d] first".into());
-                return;
-            }
             app.edit_popup_field = EditField::Model;
-            app.edit_buffer = selected_kind_for_edit(app)
-                .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
-                .map(|c| c.model.clone())
+            app.edit_buffer = effective_section_config(app)
+                .map(|c| c.model)
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
         KeyCode::Char('x')
-            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
         {
             app.edit_popup_field = EditField::ExtraCliArgs;
-            app.edit_buffer = selected_kind_for_edit(app)
-                .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
-                .map(|c| c.extra_cli_args.clone())
+            app.edit_buffer = effective_section_config(app)
+                .map(|c| c.extra_cli_args)
                 .unwrap_or_default();
             app.edit_popup_editing = true;
         }
         KeyCode::Char('l')
-            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
         {
-            if app.edit_popup_section == EditPopupSection::Diagnostics
-                && !is_selected_diagnostic_active(app)
-            {
-                app.error_modal = Some("Enable this diagnostics provider with [d] first".into());
-                return;
-            }
             app.edit_popup_field = EditField::Model;
             start_model_fetch(app);
         }
@@ -911,31 +890,48 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             save_config_globally(app);
         }
         KeyCode::Char('c')
-            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
         {
             toggle_cli_mode(app);
         }
         KeyCode::Char('d')
-            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
         {
-            if app.edit_popup_section == EditPopupSection::Diagnostics {
-                cycle_diagnostic_provider(app);
-            } else {
-                app.error_modal = Some(
-                    "Switch to Diagnostics section with Tab to set diagnostic provider".into(),
-                );
-            }
+            toggle_diagnostic_agent(app);
         }
         KeyCode::Char('t')
-            if !app.edit_popup_editing && app.edit_popup_section != EditPopupSection::Timeouts =>
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
         {
-            if app.edit_popup_section == EditPopupSection::Diagnostics
-                && !is_selected_diagnostic_active(app)
-            {
-                app.error_modal = Some("Enable this diagnostics provider with [d] first".into());
-                return;
-            }
             cycle_reasoning(app);
+        }
+        KeyCode::Char('b')
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
+        {
+            toggle_cli_print_mode(app);
+        }
+        KeyCode::Char('n')
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
+        {
+            add_new_agent(app);
+        }
+        KeyCode::Char('p')
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
+        {
+            cycle_agent_provider(app);
+        }
+        KeyCode::Char('r')
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
+        {
+            if let Some(agent) = app.config.agents.get(app.edit_popup_cursor) {
+                app.edit_popup_field = EditField::AgentName;
+                app.edit_buffer = agent.name.clone();
+                app.edit_popup_editing = true;
+            }
+        }
+        KeyCode::Delete | KeyCode::Backspace
+            if !app.edit_popup_editing && app.edit_popup_section == EditPopupSection::Providers =>
+        {
+            remove_agent(app);
         }
         KeyCode::Char('e') if !app.edit_popup_editing => {
             if app.edit_popup_section == EditPopupSection::Timeouts {
@@ -943,15 +939,12 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Enter if !app.edit_popup_editing => {
-            if app.edit_popup_section == EditPopupSection::Diagnostics {
-                cycle_diagnostic_provider(app);
-            } else if app.edit_popup_section == EditPopupSection::Timeouts {
+            if app.edit_popup_section == EditPopupSection::Timeouts {
                 begin_timeout_edit(app);
             } else {
                 app.edit_popup_field = EditField::ApiKey;
-                app.edit_buffer = selected_kind_for_edit(app)
-                    .and_then(|kind| effective_section_config(app, app.edit_popup_section, kind))
-                    .map(|c| c.api_key.clone())
+                app.edit_buffer = effective_section_config(app)
+                    .map(|c| c.api_key)
                     .unwrap_or_default();
                 app.edit_popup_editing = true;
             }
@@ -964,6 +957,9 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                 } else {
                     app.config.output_dir = new_output_dir.to_string();
                 }
+            } else if matches!(app.edit_popup_field, EditField::AgentName) {
+                commit_agent_rename(app);
+                return;
             } else if app.edit_popup_section == EditPopupSection::Timeouts
                 || matches!(app.edit_popup_field, EditField::TimeoutSeconds)
             {
@@ -971,17 +967,16 @@ fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                     app.error_modal = Some(e);
                     return;
                 }
-            } else if let Some(kind) = selected_kind_for_edit(app) {
-                let mut config = effective_section_config(app, app.edit_popup_section, kind)
-                    .cloned()
+            } else {
+                let mut config = effective_section_config(app)
                     .unwrap_or_else(empty_provider_config);
                 match app.edit_popup_field {
                     EditField::ApiKey => config.api_key = app.edit_buffer.clone(),
                     EditField::Model => config.model = app.edit_buffer.clone(),
                     EditField::ExtraCliArgs => config.extra_cli_args = app.edit_buffer.clone(),
-                    EditField::OutputDir | EditField::TimeoutSeconds => {}
+                    EditField::OutputDir | EditField::TimeoutSeconds | EditField::AgentName => {}
                 }
-                set_section_config_override(app, app.edit_popup_section, kind, config);
+                set_section_config_override(app, config);
             }
             app.edit_buffer.clear();
             app.edit_popup_editing = false;
@@ -1030,13 +1025,10 @@ fn handle_model_picker_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             if let Some(model) = app.model_picker_list.get(app.model_picker_cursor).cloned() {
-                if let Some(kind) = selected_kind_for_edit(app) {
-                    let mut config = effective_section_config(app, app.edit_popup_section, kind)
-                        .cloned()
-                        .unwrap_or_else(empty_provider_config);
-                    config.model = model;
-                    set_section_config_override(app, app.edit_popup_section, kind, config);
-                }
+                let mut config = effective_section_config(app)
+                    .unwrap_or_else(empty_provider_config);
+                config.model = model;
+                set_section_config_override(app, config);
             }
             app.model_picker_active = false;
             app.model_picker_list.clear();
@@ -1074,8 +1066,8 @@ fn start_model_fetch(app: &mut App) {
         Some(k) => k,
         None => return,
     };
-    let api_key = match effective_section_config(app, app.edit_popup_section, kind) {
-        Some(c) if !c.api_key.is_empty() => c.api_key.clone(),
+    let api_key = match effective_section_config(app) {
+        Some(c) if !c.api_key.is_empty() => c.api_key,
         _ => {
             app.error_modal = Some(
                 "Add API key to fetch model list. You can type model manually with [m].".into(),
@@ -1125,11 +1117,10 @@ fn handle_model_list_result(app: &mut App, result: Result<Vec<String>, String>) 
         }
         Ok(models) => {
             // Pre-select the current model if it's in the list
-            let current_model = selected_kind_for_edit(app)
-                .and_then(|k| effective_section_config(app, app.edit_popup_section, k))
-                .map(|c| c.model.as_str());
+            let current_model = effective_section_config(app);
             app.model_picker_cursor = current_model
-                .and_then(|m| models.iter().position(|x| *x == m))
+                .as_ref()
+                .and_then(|c| models.iter().position(|x| x == &c.model))
                 .unwrap_or(0);
             app.model_picker_all_models = models.clone();
             app.model_picker_list = models;
@@ -1146,17 +1137,10 @@ fn save_config_globally(app: &mut App) {
         return;
     }
 
-    // Merge session overrides into config
-    for kind in ProviderKind::all() {
-        let key = kind.config_key().to_string();
-        if let Some(override_config) = app.session_overrides.get(&key) {
-            app.config.providers.insert(key, override_config.clone());
-        }
-    }
-    for kind in ProviderKind::all() {
-        let key = kind.config_key().to_string();
-        if let Some(override_config) = app.session_diagnostic_overrides.get(&key) {
-            app.config.diagnostics.insert(key, override_config.clone());
+    // Merge session agent overrides into config.agents
+    for (name, override_agent) in &app.session_overrides {
+        if let Some(idx) = app.config.agents.iter().position(|a| &a.name == name) {
+            app.config.agents[idx] = override_agent.clone();
         }
     }
     if let Some(value) = app.session_http_timeout_seconds {
@@ -1199,7 +1183,6 @@ fn handle_config_save_result(app: &mut App, result: Result<(), String>) {
     match result {
         Ok(()) => {
             app.session_overrides.clear();
-            app.session_diagnostic_overrides.clear();
             app.session_http_timeout_seconds = None;
             app.session_model_fetch_timeout_seconds = None;
             app.session_cli_timeout_seconds = None;
@@ -1216,13 +1199,11 @@ fn cycle_reasoning(app: &mut App) {
         Some(k) => k,
         None => return,
     };
-    let mut config = effective_section_config(app, app.edit_popup_section, kind)
-        .cloned()
+    let mut config = effective_section_config(app)
         .unwrap_or_else(empty_provider_config);
 
     match kind {
         ProviderKind::OpenAI => {
-            // Cycle: None -> low -> medium -> high -> None
             config.reasoning_effort = match config.reasoning_effort.as_deref() {
                 None => Some("low".into()),
                 Some("low") => Some("medium".into()),
@@ -1231,7 +1212,6 @@ fn cycle_reasoning(app: &mut App) {
             };
         }
         ProviderKind::Anthropic | ProviderKind::Gemini => {
-            // Cycle: None -> low -> medium -> high -> None
             config.thinking_effort = match config.thinking_effort.as_deref() {
                 None => Some("low".into()),
                 Some("low") => Some("medium".into()),
@@ -1240,21 +1220,18 @@ fn cycle_reasoning(app: &mut App) {
             };
         }
     }
-    set_section_config_override(app, app.edit_popup_section, kind, config);
+    set_section_config_override(app, config);
 }
 
-fn cycle_diagnostic_provider(app: &mut App) {
-    let Some(kind) = ProviderKind::all()
-        .get(app.edit_popup_diagnostic_cursor)
-        .copied()
-    else {
-        return;
+fn toggle_diagnostic_agent(app: &mut App) {
+    let agent_name = match app.config.agents.get(app.edit_popup_cursor) {
+        Some(a) => a.name.clone(),
+        None => return,
     };
-    let key = kind.config_key().to_string();
-    if app.config.diagnostic_provider.as_deref() == Some(key.as_str()) {
+    if app.config.diagnostic_provider.as_deref() == Some(agent_name.as_str()) {
         app.config.diagnostic_provider = None;
     } else {
-        app.config.diagnostic_provider = Some(key);
+        app.config.diagnostic_provider = Some(agent_name);
     }
 }
 
@@ -1264,18 +1241,156 @@ fn toggle_cli_mode(app: &mut App) {
         None => return,
     };
     let cli_installed = app.cli_available.get(&kind).copied().unwrap_or(false);
-    let mut config = effective_section_config(app, app.edit_popup_section, kind)
-        .cloned()
+    let mut config = effective_section_config(app)
         .unwrap_or_else(empty_provider_config);
 
-    // Allow turning CLI mode off even when binary is missing, but block turning it on.
     if !config.use_cli && !cli_installed {
         app.error_modal = Some(format!("{} CLI not installed", kind.display_name()));
         return;
     }
 
     config.use_cli = !config.use_cli;
-    set_section_config_override(app, app.edit_popup_section, kind, config);
+    set_section_config_override(app, config);
+}
+
+fn toggle_cli_print_mode(app: &mut App) {
+    let kind = match selected_kind_for_edit(app) {
+        Some(k) => k,
+        None => return,
+    };
+    if kind != ProviderKind::Anthropic {
+        return;
+    }
+    let mut config = effective_section_config(app).unwrap_or_else(empty_provider_config);
+    config.cli_print_mode = !config.cli_print_mode;
+    set_section_config_override(app, config);
+}
+
+fn add_new_agent(app: &mut App) {
+    let existing: Vec<String> = app
+        .config
+        .agents
+        .iter()
+        .map(|a| a.name.to_lowercase())
+        .collect();
+    let mut idx = 1u32;
+    let name = loop {
+        let candidate = format!("Agent-{idx}");
+        if !existing.contains(&candidate.to_lowercase()) {
+            break candidate;
+        }
+        idx += 1;
+    };
+    app.config.agents.push(AgentConfig {
+        name: name.clone(),
+        provider: ProviderKind::Anthropic,
+        api_key: String::new(),
+        model: String::new(),
+        reasoning_effort: None,
+        thinking_effort: None,
+        use_cli: false,
+        cli_print_mode: true,
+        extra_cli_args: String::new(),
+    });
+    app.edit_popup_cursor = app.config.agents.len() - 1;
+    app.edit_popup_field = EditField::AgentName;
+    app.edit_buffer = name;
+    app.edit_popup_editing = true;
+}
+
+fn remove_agent(app: &mut App) {
+    if app.config.agents.len() <= 1 {
+        app.error_modal = Some("Cannot remove the last agent".into());
+        return;
+    }
+    let idx = app.edit_popup_cursor;
+    if idx >= app.config.agents.len() {
+        return;
+    }
+    let removed_name = app.config.agents[idx].name.clone();
+    app.config.agents.remove(idx);
+    app.session_overrides.remove(&removed_name);
+    app.selected_agents.retain(|n| n != &removed_name);
+    if app.config.diagnostic_provider.as_deref() == Some(removed_name.as_str()) {
+        app.config.diagnostic_provider = None;
+    }
+    app.edit_popup_cursor = app.edit_popup_cursor.min(app.config.agents.len().saturating_sub(1));
+}
+
+fn cycle_agent_provider(app: &mut App) {
+    let idx = app.edit_popup_cursor;
+    if let Some(agent) = app.config.agents.get_mut(idx) {
+        let old_kind = agent.provider;
+        agent.provider = match old_kind {
+            ProviderKind::Anthropic => ProviderKind::OpenAI,
+            ProviderKind::OpenAI => ProviderKind::Gemini,
+            ProviderKind::Gemini => ProviderKind::Anthropic,
+        };
+        // Clear provider-specific effort
+        match old_kind {
+            ProviderKind::OpenAI => agent.reasoning_effort = None,
+            ProviderKind::Anthropic | ProviderKind::Gemini => agent.thinking_effort = None,
+        }
+        let name = agent.name.clone();
+        if let Some(ov) = app.session_overrides.get_mut(&name) {
+            ov.provider = agent.provider;
+            match old_kind {
+                ProviderKind::OpenAI => ov.reasoning_effort = None,
+                ProviderKind::Anthropic | ProviderKind::Gemini => ov.thinking_effort = None,
+            }
+        }
+    }
+}
+
+fn commit_agent_rename(app: &mut App) {
+    let new_name = app.edit_buffer.trim().to_string();
+    if new_name.is_empty() {
+        app.error_modal = Some("Agent name cannot be empty".into());
+        return;
+    }
+    let idx = app.edit_popup_cursor;
+    let old_name = match app.config.agents.get(idx) {
+        Some(a) => a.name.clone(),
+        None => return,
+    };
+    // Check uniqueness (case-insensitive, excluding current)
+    let lower = new_name.to_lowercase();
+    for (i, a) in app.config.agents.iter().enumerate() {
+        if i != idx && a.name.to_lowercase() == lower {
+            app.error_modal = Some(format!("Agent name '{}' already exists", new_name));
+            return;
+        }
+    }
+    // Check sanitized collision
+    let sanitized = OutputManager::sanitize_session_name(&new_name).to_lowercase();
+    for (i, a) in app.config.agents.iter().enumerate() {
+        if i != idx
+            && OutputManager::sanitize_session_name(&a.name).to_lowercase() == sanitized
+        {
+            app.error_modal = Some(format!(
+                "Agent name '{}' would collide with '{}' after sanitization",
+                new_name, a.name
+            ));
+            return;
+        }
+    }
+    // Apply rename
+    app.config.agents[idx].name = new_name.clone();
+    if let Some(ov) = app.session_overrides.remove(&old_name) {
+        let mut updated = ov;
+        updated.name = new_name.clone();
+        app.session_overrides.insert(new_name.clone(), updated);
+    }
+    for entry in &mut app.selected_agents {
+        if entry == &old_name {
+            *entry = new_name.clone();
+        }
+    }
+    if app.config.diagnostic_provider.as_deref() == Some(old_name.as_str()) {
+        app.config.diagnostic_provider = Some(new_name);
+    }
+    app.edit_buffer.clear();
+    app.edit_popup_editing = false;
 }
 
 fn timeout_field_count() -> usize {
@@ -1317,48 +1432,21 @@ fn set_timeout_override_from_buffer(app: &mut App) -> Result<(), String> {
 }
 
 fn selected_kind_for_edit(app: &App) -> Option<ProviderKind> {
-    match app.edit_popup_section {
-        EditPopupSection::Providers => ProviderKind::all().get(app.edit_popup_cursor).copied(),
-        EditPopupSection::Diagnostics => ProviderKind::all()
-            .get(app.edit_popup_diagnostic_cursor)
-            .copied(),
-        EditPopupSection::Timeouts => None,
-    }
+    app.config.agents.get(app.edit_popup_cursor).map(|a| a.provider)
 }
 
-fn is_selected_diagnostic_active(app: &App) -> bool {
-    selected_kind_for_edit(app)
-        .map(|kind| app.config.diagnostic_provider.as_deref() == Some(kind.config_key()))
-        .unwrap_or(false)
+/// Returns a ProviderConfig view for the current edit selection (Providers section).
+fn effective_section_config(app: &App) -> Option<ProviderConfig> {
+    let name = app.config.agents.get(app.edit_popup_cursor).map(|a| a.name.as_str())?;
+    app.effective_agent_config(name).map(|a| a.to_provider_config())
 }
 
-fn effective_section_config(
-    app: &App,
-    section: EditPopupSection,
-    kind: ProviderKind,
-) -> Option<&ProviderConfig> {
-    match section {
-        EditPopupSection::Providers => app.effective_provider_config(kind),
-        EditPopupSection::Diagnostics => app.effective_diagnostic_config(kind),
-        EditPopupSection::Timeouts => None,
-    }
-}
-
-fn set_section_config_override(
-    app: &mut App,
-    section: EditPopupSection,
-    kind: ProviderKind,
-    config: ProviderConfig,
-) {
-    let key = kind.config_key().to_string();
-    match section {
-        EditPopupSection::Providers => {
-            app.session_overrides.insert(key, config);
-        }
-        EditPopupSection::Diagnostics => {
-            app.session_diagnostic_overrides.insert(key, config);
-        }
-        EditPopupSection::Timeouts => {}
+fn set_section_config_override(app: &mut App, config: ProviderConfig) {
+    if let Some(agent) = app.config.agents.get(app.edit_popup_cursor) {
+        let name = agent.name.clone();
+        let provider = agent.provider;
+        let agent_config = AgentConfig::from_provider_config(name.clone(), provider, &config);
+        app.session_overrides.insert(name, agent_config);
     }
 }
 
@@ -1369,6 +1457,7 @@ fn empty_provider_config() -> ProviderConfig {
         reasoning_effort: None,
         thinking_effort: None,
         use_cli: false,
+        cli_print_mode: true,
         extra_cli_args: String::new(),
     }
 }
@@ -1399,8 +1488,8 @@ fn start_execution(app: &mut App) {
     let config = app.config.clone();
     let http_timeout_secs = app.effective_http_timeout_seconds().max(1);
     let cli_timeout_secs = app.effective_cli_timeout_seconds().max(1);
-    let has_any_cli = app.selected_agents.iter().any(|kind| {
-        app.effective_provider_config(*kind)
+    let has_any_cli = app.selected_agents.iter().any(|name| {
+        app.effective_agent_config(name)
             .map(|c| c.use_cli)
             .unwrap_or(false)
     });
@@ -1419,12 +1508,12 @@ fn start_execution(app: &mut App) {
     } else {
         app.prompt_text.clone()
     };
-    if diagnostic_provider_kind(app).is_some() {
+    if app.config.diagnostic_provider.is_some() {
         prompt.push_str(
             "\n\nWrite any encountered issues (for example permission, tool, or environment issues) to an explicit \"Errors\" section of your report.",
         );
     }
-    let agents = app.selected_agents.clone();
+    let agent_names = app.selected_agents.clone();
     let mode = app.selected_mode;
     let forward_prompt_flag = app.forward_prompt;
     let iterations = if mode == ExecutionMode::Solo {
@@ -1446,52 +1535,67 @@ fn start_execution(app: &mut App) {
         }
     };
 
-    let mut providers: Vec<Box<dyn provider::Provider>> = Vec::new();
-    let mut use_cli_by_kind: std::collections::HashMap<ProviderKind, bool> =
+    let mut agents: Vec<(String, Box<dyn provider::Provider>)> = Vec::new();
+    let mut use_cli_by_agent: std::collections::HashMap<String, bool> =
         std::collections::HashMap::new();
-    let mut run_models: Vec<(ProviderKind, String)> = Vec::new();
-    for kind in &agents {
-        let pconfig = match app.effective_provider_config(*kind).cloned() {
+    let mut run_models: Vec<(String, String)> = Vec::new();
+    let mut agent_info: Vec<(String, String)> = Vec::new();
+    for name in &agent_names {
+        let agent_config = match app.effective_agent_config(name).cloned() {
             Some(cfg) => cfg,
             None => {
-                app.error_modal = Some(format!("{} is not configured", kind.display_name()));
+                app.error_modal = Some(format!("{name} is not configured"));
                 app.screen = Screen::Prompt;
                 app.is_running = false;
                 return;
             }
         };
 
-        if pconfig.use_cli && !app.cli_available.get(kind).copied().unwrap_or(false) {
-            app.error_modal = Some(format!("{} CLI is not installed", kind.display_name()));
+        if agent_config.use_cli
+            && !app
+                .cli_available
+                .get(&agent_config.provider)
+                .copied()
+                .unwrap_or(false)
+        {
+            app.error_modal = Some(format!(
+                "{} CLI is not installed",
+                agent_config.provider.display_name()
+            ));
             app.screen = Screen::Prompt;
             app.is_running = false;
             return;
         }
 
-        if !pconfig.use_cli && pconfig.api_key.trim().is_empty() {
-            app.error_modal = Some(format!("{} API key is missing", kind.display_name()));
+        if !agent_config.use_cli && agent_config.api_key.trim().is_empty() {
+            app.error_modal = Some(format!("{name} API key is missing"));
             app.screen = Screen::Prompt;
             app.is_running = false;
             return;
         }
 
         run_models.push((
-            *kind,
-            if pconfig.model.trim().is_empty() {
+            name.clone(),
+            if agent_config.model.trim().is_empty() {
                 "(default)".to_string()
             } else {
-                pconfig.model.clone()
+                agent_config.model.clone()
             },
         ));
-        use_cli_by_kind.insert(*kind, pconfig.use_cli);
+        agent_info.push((name.clone(), agent_config.provider.config_key().to_string()));
+        use_cli_by_agent.insert(name.clone(), agent_config.use_cli);
 
-        providers.push(provider::create_provider(
-            *kind,
-            &pconfig,
-            client.clone(),
-            config.default_max_tokens,
-            config.max_history_messages,
-            cli_timeout_secs,
+        let pconfig = agent_config.to_provider_config();
+        agents.push((
+            name.clone(),
+            provider::create_provider(
+                agent_config.provider,
+                &pconfig,
+                client.clone(),
+                config.default_max_tokens,
+                config.max_history_messages,
+                cli_timeout_secs,
+            ),
         ));
     }
 
@@ -1503,7 +1607,7 @@ fn start_execution(app: &mut App) {
     };
     let mut start_iteration = 1u32;
     let mut relay_initial_last_output: Option<String> = None;
-    let mut swarm_initial_outputs: std::collections::HashMap<ProviderKind, String> =
+    let mut swarm_initial_outputs: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut resumed_run = false;
 
@@ -1530,7 +1634,7 @@ fn start_execution(app: &mut App) {
                 }
             }
         } else {
-            match find_latest_compatible_run(&output_dir, mode, &agents) {
+            match find_latest_compatible_run(&output_dir, mode, &agent_names) {
                 Some(path) => path,
                 None => {
                     app.error_modal = Some("No compatible previous run found to resume".into());
@@ -1541,21 +1645,22 @@ fn start_execution(app: &mut App) {
             }
         };
 
-        let last_iteration = match find_last_complete_iteration_for_agents(&run_dir, &agents) {
-            Some(i) if i >= 1 => i,
-            _ => {
-                app.error_modal = Some("No previous iteration files found to resume".into());
-                app.screen = Screen::Prompt;
-                app.is_running = false;
-                return;
-            }
-        };
+        let last_iteration =
+            match find_last_complete_iteration_for_agents(&run_dir, &agent_names) {
+                Some(i) if i >= 1 => i,
+                _ => {
+                    app.error_modal = Some("No previous iteration files found to resume".into());
+                    app.screen = Screen::Prompt;
+                    app.is_running = false;
+                    return;
+                }
+            };
         start_iteration = last_iteration + 1;
 
         match mode {
             ExecutionMode::Relay => {
-                let last_kind = match agents.last().copied() {
-                    Some(k) => k,
+                let last_agent = match agent_names.last() {
+                    Some(n) => n,
                     None => {
                         app.error_modal = Some("No agents selected".into());
                         app.screen = Screen::Prompt;
@@ -1563,11 +1668,9 @@ fn start_execution(app: &mut App) {
                         return;
                     }
                 };
-                let prev_path = run_dir.join(format!(
-                    "{}_iter{}.md",
-                    last_kind.config_key(),
-                    last_iteration
-                ));
+                let file_key = App::agent_file_key(last_agent);
+                let prev_path =
+                    run_dir.join(format!("{}_iter{}.md", file_key, last_iteration));
                 relay_initial_last_output = match std::fs::read_to_string(&prev_path) {
                     Ok(content) => Some(content),
                     Err(e) => {
@@ -1582,11 +1685,12 @@ fn start_execution(app: &mut App) {
                 };
             }
             ExecutionMode::Swarm => {
-                for kind in &agents {
+                for agent_name in &agent_names {
+                    let file_key = App::agent_file_key(agent_name);
                     let prev_path =
-                        run_dir.join(format!("{}_iter{}.md", kind.config_key(), last_iteration));
+                        run_dir.join(format!("{}_iter{}.md", file_key, last_iteration));
                     if let Ok(content) = std::fs::read_to_string(&prev_path) {
-                        swarm_initial_outputs.insert(*kind, content);
+                        swarm_initial_outputs.insert(agent_name.clone(), content);
                     }
                 }
                 if swarm_initial_outputs.is_empty() {
@@ -1629,7 +1733,7 @@ fn start_execution(app: &mut App) {
             return;
         }
         if let Err(e) =
-            output.write_session_info(&mode, &agents, iterations, session_name, &run_models)
+            output.write_session_info(&mode, &agent_info, iterations, session_name, &run_models)
         {
             app.error_modal = Some(format!("Failed to write session metadata: {e}"));
             app.screen = Screen::Prompt;
@@ -1658,16 +1762,16 @@ fn start_execution(app: &mut App) {
 
     tokio::spawn(async move {
         let result = match mode {
-            ExecutionMode::Solo => run_solo(&prompt, providers, &output, tx.clone(), cancel).await,
+            ExecutionMode::Solo => run_solo(&prompt, agents, &output, tx.clone(), cancel).await,
             ExecutionMode::Relay => {
                 run_relay(
                     &prompt,
-                    providers,
+                    agents,
                     iterations,
                     start_iteration,
                     relay_initial_last_output,
                     forward_prompt_flag,
-                    use_cli_by_kind.clone(),
+                    use_cli_by_agent.clone(),
                     &output,
                     tx.clone(),
                     cancel,
@@ -1677,11 +1781,11 @@ fn start_execution(app: &mut App) {
             ExecutionMode::Swarm => {
                 run_swarm(
                     &prompt,
-                    providers,
+                    agents,
                     iterations,
                     start_iteration,
                     swarm_initial_outputs,
-                    use_cli_by_kind,
+                    use_cli_by_agent,
                     &output,
                     tx.clone(),
                     cancel,
@@ -1692,7 +1796,8 @@ fn start_execution(app: &mut App) {
         if let Err(e) = result {
             let err_str = e.to_string();
             let _ = tx.send(ProgressEvent::AgentError {
-                kind: agents.first().copied().unwrap_or(ProviderKind::Anthropic),
+                agent: agent_names.first().cloned().unwrap_or_default(),
+                kind: ProviderKind::Anthropic,
                 iteration: 0,
                 error: err_str.clone(),
                 details: Some(err_str),
@@ -1725,6 +1830,9 @@ fn should_offer_consolidation(app: &App) -> bool {
     if app.cancel_flag.load(Ordering::Relaxed) {
         return false;
     }
+    if app.selected_agents.len() <= 1 {
+        return false;
+    }
     if !matches!(
         app.selected_mode,
         ExecutionMode::Swarm | ExecutionMode::Solo
@@ -1735,17 +1843,26 @@ fn should_offer_consolidation(app: &App) -> bool {
     let Some(run_dir) = app.run_dir.as_ref() else {
         return false;
     };
-    find_last_iteration(run_dir).is_some()
+    let agent_keys: Vec<String> = app.selected_agents.iter().map(|n| App::agent_file_key(n)).collect();
+    find_last_iteration(run_dir, &agent_keys).is_some()
 }
 
-fn find_last_iteration(run_dir: &std::path::Path) -> Option<u32> {
+fn find_last_iteration(run_dir: &std::path::Path, agent_keys: &[String]) -> Option<u32> {
     let mut max_iter: Option<u32> = None;
     let entries = std::fs::read_dir(run_dir).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(iter) = parse_iteration_from_filename(&name) {
-            max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
+        if agent_keys.is_empty() {
+            if let Some(iter) = parse_iteration_from_filename(&name) {
+                max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
+            }
+        } else {
+            for key in agent_keys {
+                if let Some(iter) = parse_agent_iteration_filename(&name, key) {
+                    max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
+                }
+            }
         }
     }
     max_iter
@@ -1753,7 +1870,7 @@ fn find_last_iteration(run_dir: &std::path::Path) -> Option<u32> {
 
 fn find_last_complete_iteration_for_agents(
     run_dir: &std::path::Path,
-    agents: &[ProviderKind],
+    agents: &[String],
 ) -> Option<u32> {
     use std::collections::{HashMap, HashSet};
 
@@ -1761,17 +1878,18 @@ fn find_last_complete_iteration_for_agents(
         return None;
     }
 
-    let mut iter_to_agents: HashMap<u32, HashSet<&'static str>> = HashMap::new();
+    let agent_keys: Vec<String> = agents.iter().map(|n| App::agent_file_key(n)).collect();
+    let mut iter_to_agents: HashMap<u32, HashSet<String>> = HashMap::new();
     let entries = std::fs::read_dir(run_dir).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        for kind in agents {
-            if let Some(iter) = parse_agent_iteration_filename(&name, kind.config_key()) {
+        for key in &agent_keys {
+            if let Some(iter) = parse_agent_iteration_filename(&name, key) {
                 iter_to_agents
                     .entry(iter)
                     .or_default()
-                    .insert(kind.config_key());
+                    .insert(key.clone());
             }
         }
     }
@@ -1786,7 +1904,7 @@ fn find_last_complete_iteration_for_agents(
 fn find_latest_compatible_run(
     base_dir: &std::path::Path,
     mode: ExecutionMode,
-    agents: &[ProviderKind],
+    agents: &[String],
 ) -> Option<std::path::PathBuf> {
     let mut dirs: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(base_dir)
         .ok()?
@@ -1818,7 +1936,7 @@ fn find_latest_compatible_run(
 fn run_dir_matches_mode_and_agents(
     run_dir: &std::path::Path,
     mode: ExecutionMode,
-    agents: &[ProviderKind],
+    agents: &[String],
 ) -> bool {
     let session_path = run_dir.join("session.toml");
     let Ok(content) = std::fs::read_to_string(session_path) else {
@@ -1842,8 +1960,8 @@ fn run_dir_matches_mode_and_agents(
         .iter()
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
         .collect();
-    for kind in agents {
-        if !stored.contains(kind.config_key()) {
+    for agent_name in agents {
+        if !stored.contains(agent_name) {
             return false;
         }
     }
@@ -1864,12 +1982,14 @@ fn parse_agent_iteration_filename(name: &str, agent_key: &str) -> Option<u32> {
 }
 
 fn parse_iteration_from_filename(name: &str) -> Option<u32> {
-    for kind in ProviderKind::all() {
-        if let Some(iter) = parse_agent_iteration_filename(name, kind.config_key()) {
-            return Some(iter);
-        }
+    // Match any pattern of {agent_key}_iter{N}.md
+    if !name.ends_with(".md") {
+        return None;
     }
-    None
+    let stem = name.trim_end_matches(".md");
+    let iter_pos = stem.rfind("_iter")?;
+    let iter_str = &stem[iter_pos + 5..];
+    iter_str.parse::<u32>().ok()
 }
 
 fn start_consolidation(app: &mut App) {
@@ -1885,7 +2005,8 @@ fn start_consolidation(app: &mut App) {
         }
     };
 
-    let last_iteration = match find_last_iteration(&run_dir) {
+    let agent_keys: Vec<String> = app.selected_agents.iter().map(|n| App::agent_file_key(n)).collect();
+    let last_iteration = match find_last_iteration(&run_dir, &agent_keys) {
         Some(i) => i,
         None => {
             app.error_modal = Some("No iteration outputs found to consolidate".into());
@@ -1893,55 +2014,51 @@ fn start_consolidation(app: &mut App) {
         }
     };
 
-    let provider_kind = match app
-        .selected_agents
+    let agent_name = match app
+        .config
+        .agents
         .get(app.consolidation_provider_cursor)
-        .copied()
+        .map(|a| a.name.clone())
     {
-        Some(k) => k,
+        Some(n) => n,
         None => {
-            app.error_modal = Some("Select a provider for consolidation".into());
+            app.error_modal = Some("Select an agent for consolidation".into());
             return;
         }
     };
 
-    let pconfig = match app.effective_provider_config(provider_kind).cloned() {
+    let agent_config = match app.effective_agent_config(&agent_name).cloned() {
         Some(cfg) => cfg,
         None => {
-            app.error_modal = Some(format!(
-                "{} is not configured",
-                provider_kind.display_name()
-            ));
+            app.error_modal = Some(format!("{agent_name} is not configured"));
             return;
         }
     };
 
-    if pconfig.use_cli
+    if agent_config.use_cli
         && !app
             .cli_available
-            .get(&provider_kind)
+            .get(&agent_config.provider)
             .copied()
             .unwrap_or(false)
     {
         app.error_modal = Some(format!(
             "{} CLI is not installed",
-            provider_kind.display_name()
+            agent_config.provider.display_name()
         ));
         return;
     }
-    if !pconfig.use_cli && pconfig.api_key.trim().is_empty() {
-        app.error_modal = Some(format!(
-            "{} API key is missing",
-            provider_kind.display_name()
-        ));
+    if !agent_config.use_cli && agent_config.api_key.trim().is_empty() {
+        app.error_modal = Some(format!("{agent_name} API key is missing"));
         return;
     }
 
     let mut file_lines = Vec::new();
-    for kind in &app.selected_agents {
-        let path = run_dir.join(format!("{}_iter{}.md", kind.config_key(), last_iteration));
+    for name in &app.selected_agents {
+        let file_key = App::agent_file_key(name);
+        let path = run_dir.join(format!("{file_key}_iter{last_iteration}.md"));
         if path.exists() {
-            file_lines.push(format!("- {}: {}", kind.display_name(), path.display()));
+            file_lines.push(format!("- {name}: {}", path.display()));
         }
     }
     if file_lines.is_empty() {
@@ -1979,6 +2096,8 @@ fn start_consolidation(app: &mut App) {
         }
     };
 
+    let pconfig = agent_config.to_provider_config();
+    let provider_kind = agent_config.provider;
     let provider = provider::create_provider(
         provider_kind,
         &pconfig,
@@ -1989,16 +2108,19 @@ fn start_consolidation(app: &mut App) {
     );
 
     app.progress_events.push(ProgressEvent::AgentStarted {
+        agent: agent_name.clone(),
         kind: provider_kind,
         iteration: last_iteration + 1,
     });
     app.progress_events.push(ProgressEvent::AgentLog {
+        agent: agent_name.clone(),
         kind: provider_kind,
         iteration: last_iteration + 1,
         message: "consolidating reports".into(),
     });
 
-    let output_path = run_dir.join(format!("consolidated_{}.md", provider_kind.config_key()));
+    let file_key = App::agent_file_key(&agent_name);
+    let output_path = run_dir.join(format!("consolidated_{file_key}.md"));
     let (tx, rx) = mpsc::unbounded_channel();
     app.consolidation_rx = Some(rx);
     app.consolidation_running = true;
@@ -2023,23 +2145,33 @@ fn handle_consolidation_result(app: &mut App, result: Result<String, String>) {
     app.is_running = false;
     app.consolidation_rx = None;
 
-    let kind = app
-        .selected_agents
+    let agent_name = app
+        .config
+        .agents
         .get(app.consolidation_provider_cursor)
-        .copied()
+        .map(|a| a.name.clone())
+        .unwrap_or_default();
+    let kind = app
+        .effective_agent_config(&agent_name)
+        .map(|a| a.provider)
         .unwrap_or(ProviderKind::Anthropic);
+    let agent_keys: Vec<String> = app.selected_agents.iter().map(|n| App::agent_file_key(n)).collect();
     let iteration = app
         .run_dir
         .as_deref()
-        .and_then(find_last_iteration)
+        .and_then(|d| find_last_iteration(d, &agent_keys))
         .unwrap_or(1)
         + 1;
 
     match result {
         Ok(path) => {
-            app.progress_events
-                .push(ProgressEvent::AgentFinished { kind, iteration });
+            app.progress_events.push(ProgressEvent::AgentFinished {
+                agent: agent_name.clone(),
+                kind,
+                iteration,
+            });
             app.progress_events.push(ProgressEvent::AgentLog {
+                agent: agent_name,
                 kind,
                 iteration,
                 message: format!("Consolidation saved to {path}"),
@@ -2049,6 +2181,7 @@ fn handle_consolidation_result(app: &mut App, result: Result<String, String>) {
         }
         Err(e) => {
             app.progress_events.push(ProgressEvent::AgentError {
+                agent: agent_name,
                 kind,
                 iteration,
                 error: e.clone(),
@@ -2069,24 +2202,26 @@ fn maybe_start_diagnostics(app: &mut App) {
         return;
     }
 
-    let diagnostic_kind = match diagnostic_provider_kind(app) {
-        Some(kind) => kind,
+    let diag_agent_name = match app.config.diagnostic_provider.as_deref() {
+        Some(name) => name.to_string(),
         None => return,
     };
     let run_dir = match app.run_dir.clone() {
         Some(path) => path,
         None => return,
     };
-    let pconfig = match app.effective_diagnostic_config(diagnostic_kind).cloned() {
+    let agent_config = match app.effective_agent_config(&diag_agent_name).cloned() {
         Some(cfg) => cfg,
         None => {
             app.error_modal = Some(format!(
-                "Diagnostic provider {} is not configured in Diagnostics section",
-                diagnostic_kind.display_name()
+                "Diagnostic agent '{}' is not configured",
+                diag_agent_name
             ));
             return;
         }
     };
+    let diagnostic_kind = agent_config.provider;
+    let pconfig = agent_config.to_provider_config();
 
     if pconfig.use_cli
         && !app
@@ -2096,15 +2231,15 @@ fn maybe_start_diagnostics(app: &mut App) {
             .unwrap_or(false)
     {
         app.error_modal = Some(format!(
-            "Diagnostic provider {} CLI is not installed",
-            diagnostic_kind.display_name()
+            "Diagnostic agent '{}' CLI is not installed",
+            diag_agent_name
         ));
         return;
     }
     if !pconfig.use_cli && pconfig.api_key.trim().is_empty() {
         app.error_modal = Some(format!(
-            "Diagnostic provider {} API key is missing",
-            diagnostic_kind.display_name()
+            "Diagnostic agent '{}' API key is missing",
+            diag_agent_name
         ));
         return;
     }
@@ -2135,6 +2270,7 @@ fn maybe_start_diagnostics(app: &mut App) {
     );
 
     app.progress_events.push(ProgressEvent::AgentLog {
+        agent: diag_agent_name,
         kind: diagnostic_kind,
         iteration: 0,
         message: "analyzing reports for errors".into(),
@@ -2164,11 +2300,20 @@ fn handle_diagnostic_result(app: &mut App, result: Result<String, String>) {
     app.is_running = false;
     app.diagnostic_rx = None;
 
-    let kind = diagnostic_provider_kind(app).unwrap_or(ProviderKind::Anthropic);
+    let agent_name = app
+        .config
+        .diagnostic_provider
+        .clone()
+        .unwrap_or_else(|| "diagnostics".into());
+    let kind = app
+        .effective_agent_config(&agent_name)
+        .map(|a| a.provider)
+        .unwrap_or(ProviderKind::Anthropic);
 
     match result {
         Ok(path) => {
             app.progress_events.push(ProgressEvent::AgentLog {
+                agent: agent_name,
                 kind,
                 iteration: 0,
                 message: format!("Diagnostic report saved to {path}"),
@@ -2176,6 +2321,7 @@ fn handle_diagnostic_result(app: &mut App, result: Result<String, String>) {
         }
         Err(e) => {
             app.progress_events.push(ProgressEvent::AgentError {
+                agent: agent_name,
                 kind,
                 iteration: 0,
                 error: e.clone(),
@@ -2183,10 +2329,6 @@ fn handle_diagnostic_result(app: &mut App, result: Result<String, String>) {
             });
         }
     }
-}
-
-fn diagnostic_provider_kind(app: &App) -> Option<ProviderKind> {
-    ProviderKind::from_selector(app.config.diagnostic_provider.as_deref()?)
 }
 
 fn collect_report_files(run_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -2220,19 +2362,15 @@ fn collect_application_errors(app: &App, run_dir: &std::path::Path) -> Vec<Strin
     let mut errors = Vec::new();
     for event in &app.progress_events {
         if let ProgressEvent::AgentError {
-            kind,
+            agent,
             iteration,
             error,
             details,
+            ..
         } = event
         {
             let body = details.as_deref().unwrap_or(error);
-            errors.push(format!(
-                "[{} iter {}] {}",
-                kind.display_name(),
-                iteration,
-                body
-            ));
+            errors.push(format!("[{agent} iter {iteration}] {body}"));
         }
     }
 
@@ -2364,8 +2502,8 @@ mod tests {
             model_fetch_timeout_seconds: 30,
             cli_timeout_seconds: 600,
             diagnostic_provider: None,
+            agents: Vec::new(),
             providers: HashMap::new(),
-            diagnostics: HashMap::new(),
         }
     }
 
@@ -2449,19 +2587,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_iteration_from_filename_rejects_non_agent_files_with_iter_suffix() {
-        assert_eq!(parse_iteration_from_filename("notes_iter42.md"), None);
+    fn parse_iteration_from_filename_accepts_any_iter_suffix() {
+        // Low-level parser matches any {name}_iter{N}.md pattern;
+        // find_last_iteration filters by known agent keys.
+        assert_eq!(parse_iteration_from_filename("notes_iter42.md"), Some(42));
     }
 
     #[test]
     fn find_last_iteration_multiple_files() {
         let dir = tempdir().unwrap();
-        write_agent_iter(dir.path(), "anthropic", 1);
-        write_agent_iter(dir.path(), "openai", 3);
-        write_agent_iter(dir.path(), "gemini", 2);
-        fs::write(dir.path().join("notes_iter99.md"), "ignore").unwrap();
+        write_agent_iter(dir.path(), "Claude", 1);
+        write_agent_iter(dir.path(), "Codex", 3);
+        write_agent_iter(dir.path(), "Gemini", 2);
 
-        assert_eq!(find_last_iteration(dir.path()), Some(3));
+        let keys: Vec<String> = ["Claude", "Codex", "Gemini"]
+            .iter()
+            .map(|n| App::agent_file_key(n))
+            .collect();
+        assert_eq!(find_last_iteration(dir.path(), &keys), Some(3));
+    }
+
+    #[test]
+    fn find_last_iteration_ignores_unknown_files() {
+        let dir = tempdir().unwrap();
+        write_agent_iter(dir.path(), "Claude", 2);
+        // Stray file that looks like an iteration but isn't a known agent
+        std::fs::write(dir.path().join("notes_iter42.md"), "stray").unwrap();
+
+        let keys = vec![App::agent_file_key("Claude")];
+        assert_eq!(find_last_iteration(dir.path(), &keys), Some(2));
     }
 
     #[test]
@@ -2472,7 +2626,7 @@ mod tests {
         assert!(run_dir_matches_mode_and_agents(
             dir.path(),
             ExecutionMode::Relay,
-            &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+            &["anthropic".to_string(), "openai".to_string()]
         ));
     }
 
@@ -2484,7 +2638,7 @@ mod tests {
         assert!(!run_dir_matches_mode_and_agents(
             dir.path(),
             ExecutionMode::Relay,
-            &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+            &["anthropic".to_string(), "openai".to_string()]
         ));
     }
 
@@ -2496,7 +2650,7 @@ mod tests {
         assert!(run_dir_matches_mode_and_agents(
             dir.path(),
             ExecutionMode::Relay,
-            &[ProviderKind::Anthropic]
+            &["anthropic".to_string()]
         ));
     }
 
@@ -2508,7 +2662,7 @@ mod tests {
         assert!(!run_dir_matches_mode_and_agents(
             dir.path(),
             ExecutionMode::Relay,
-            &[ProviderKind::Anthropic, ProviderKind::Gemini]
+            &["anthropic".to_string(), "gemini".to_string()]
         ));
     }
 
@@ -2518,7 +2672,7 @@ mod tests {
         assert!(!run_dir_matches_mode_and_agents(
             dir.path(),
             ExecutionMode::Relay,
-            &[ProviderKind::Anthropic]
+            &["anthropic".to_string()]
         ));
     }
 
@@ -2534,7 +2688,7 @@ mod tests {
         assert!(!run_dir_matches_mode_and_agents(
             dir.path(),
             ExecutionMode::Relay,
-            &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+            &["anthropic".to_string(), "openai".to_string()]
         ));
     }
 
@@ -2546,7 +2700,7 @@ mod tests {
         assert!(!run_dir_matches_mode_and_agents(
             dir.path(),
             ExecutionMode::Relay,
-            &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+            &["anthropic".to_string(), "openai".to_string()]
         ));
     }
 
@@ -2576,7 +2730,7 @@ mod tests {
             find_latest_compatible_run(
                 dir.path(),
                 ExecutionMode::Relay,
-                &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+                &["anthropic".to_string(), "openai".to_string()]
             ),
             Some(run2)
         );
@@ -2594,7 +2748,7 @@ mod tests {
             find_latest_compatible_run(
                 dir.path(),
                 ExecutionMode::Relay,
-                &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+                &["anthropic".to_string(), "openai".to_string()]
             ),
             None
         );
@@ -2620,7 +2774,7 @@ mod tests {
             find_latest_compatible_run(
                 dir.path(),
                 ExecutionMode::Relay,
-                &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+                &["anthropic".to_string(), "openai".to_string()]
             ),
             Some(good)
         );
@@ -2636,7 +2790,7 @@ mod tests {
         assert_eq!(
             find_last_complete_iteration_for_agents(
                 dir.path(),
-                &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+                &["anthropic".to_string(), "openai".to_string()]
             ),
             Some(1)
         );
@@ -2651,7 +2805,7 @@ mod tests {
         assert_eq!(
             find_last_complete_iteration_for_agents(
                 dir.path(),
-                &[ProviderKind::Anthropic, ProviderKind::OpenAI]
+                &["anthropic".to_string(), "openai".to_string()]
             ),
             None
         );
@@ -2704,12 +2858,14 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut app = test_app();
         app.progress_events.push(ProgressEvent::AgentError {
+            agent: "Claude".to_string(),
             kind: ProviderKind::Anthropic,
             iteration: 1,
             error: "boom".to_string(),
             details: None,
         });
         app.progress_events.push(ProgressEvent::AgentError {
+            agent: "Claude".to_string(),
             kind: ProviderKind::Anthropic,
             iteration: 1,
             error: "boom".to_string(),
@@ -2726,6 +2882,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut app = test_app();
         app.progress_events.push(ProgressEvent::AgentError {
+            agent: "Codex".to_string(),
             kind: ProviderKind::OpenAI,
             iteration: 2,
             error: "api failed".to_string(),

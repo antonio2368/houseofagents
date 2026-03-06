@@ -16,6 +16,7 @@ pub struct CliProvider {
     reasoning_effort: Option<String>,
     thinking_effort: Option<String>,
     extra_cli_args: String,
+    cli_print_mode: bool,
     add_dirs: Vec<String>,
     session_id: Option<String>,
     session_started: bool,
@@ -33,6 +34,7 @@ impl CliProvider {
         reasoning_effort: Option<String>,
         thinking_effort: Option<String>,
         extra_cli_args: String,
+        cli_print_mode: bool,
         add_dirs: Vec<String>,
         timeout_seconds: u64,
         max_history_messages: usize,
@@ -43,6 +45,7 @@ impl CliProvider {
             reasoning_effort,
             thinking_effort,
             extra_cli_args,
+            cli_print_mode,
             add_dirs,
             session_id: match kind {
                 ProviderKind::Anthropic => Some(Uuid::new_v4().to_string()),
@@ -273,21 +276,28 @@ impl Provider for CliProvider {
             content: message.to_string(),
         });
         prune_history(&mut self.history, self.max_history_messages);
-        let prompt = if self.uses_native_session() {
+        let mut prompt = if self.uses_native_session() {
             message.to_string()
         } else {
             self.build_prompt_from_history()
         };
 
+        if self.kind == ProviderKind::Anthropic && self.cli_print_mode && !self.session_started {
+            prompt = format!(
+                "IMPORTANT: Do NOT write any files. Return everything in your output.\n\n{prompt}"
+            );
+        }
+
         let bin = self.bin_name();
         let mut codex_output_path: Option<PathBuf> = None;
         let mut args: Vec<String> = match self.kind {
             ProviderKind::Anthropic => {
-                let mut args = vec![
-                    "-p".to_string(),
-                    "--output-format".to_string(),
-                    "text".to_string(),
-                ];
+                let mut args = Vec::new();
+                if self.cli_print_mode {
+                    args.push("-p".to_string());
+                }
+                args.push("--output-format".to_string());
+                args.push("text".to_string());
                 for dir in &self.add_dirs {
                     args.push("--add-dir".to_string());
                     args.push(dir.clone());
@@ -575,6 +585,7 @@ mod tests {
             None,
             None,
             extra.to_string(),
+            true,
             Vec::new(),
             30,
             50,

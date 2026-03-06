@@ -28,7 +28,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let agents_str: Vec<&str> = app
         .selected_agents
         .iter()
-        .map(|a| a.display_name())
+        .map(|a| a.as_str())
         .collect();
     let title = Paragraph::new(format!(
         "Prompt — {} mode with {}",

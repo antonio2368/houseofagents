@@ -1,4 +1,5 @@
 use crate::error::AppError;
+use crate::provider::ProviderKind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,9 +20,63 @@ pub struct AppConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic_provider: Option<String>,
     #[serde(default)]
+    pub agents: Vec<AgentConfig>,
+    /// Legacy field — kept only for deserialization/migration. Not serialized.
+    #[serde(default, skip_serializing)]
     pub providers: HashMap<String, ProviderConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentConfig {
+    pub name: String,
+    pub provider: ProviderKind,
+    pub api_key: String,
+    pub model: String,
+    /// OpenAI reasoning effort: "low", "medium", "high" (for o-series models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Thinking effort: "low", "medium", "high" (for Claude / Gemini models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_effort: Option<String>,
+    /// Use CLI tool instead of API for this provider
     #[serde(default)]
-    pub diagnostics: HashMap<String, ProviderConfig>,
+    pub use_cli: bool,
+    /// Use print mode (-p) instead of agent mode for Anthropic CLI
+    #[serde(default = "default_true")]
+    pub cli_print_mode: bool,
+    /// Extra CLI argument appended as a single raw argument to provider CLI calls (no splitting)
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub extra_cli_args: String,
+}
+
+impl AgentConfig {
+    /// Create an AgentConfig from a ProviderConfig (used for legacy migration)
+    pub fn from_provider_config(name: String, provider: ProviderKind, pc: &ProviderConfig) -> Self {
+        Self {
+            name,
+            provider,
+            api_key: pc.api_key.clone(),
+            model: pc.model.clone(),
+            reasoning_effort: pc.reasoning_effort.clone(),
+            thinking_effort: pc.thinking_effort.clone(),
+            use_cli: pc.use_cli,
+            cli_print_mode: pc.cli_print_mode,
+            extra_cli_args: pc.extra_cli_args.clone(),
+        }
+    }
+
+    /// Convert to ProviderConfig (for diagnostics interop and create_provider)
+    pub fn to_provider_config(&self) -> ProviderConfig {
+        ProviderConfig {
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            thinking_effort: self.thinking_effort.clone(),
+            use_cli: self.use_cli,
+            cli_print_mode: self.cli_print_mode,
+            extra_cli_args: self.extra_cli_args.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +92,9 @@ pub struct ProviderConfig {
     /// Use CLI tool instead of API for this provider
     #[serde(default)]
     pub use_cli: bool,
+    /// Use print mode (-p) instead of agent mode for Anthropic CLI
+    #[serde(default = "default_true")]
+    pub cli_print_mode: bool,
     /// Extra CLI argument appended as a single raw argument to provider CLI calls (no splitting)
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub extra_cli_args: String,
@@ -56,6 +114,10 @@ fn default_http_timeout_seconds() -> u64 {
 
 fn default_model_fetch_timeout_seconds() -> u64 {
     30
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_cli_timeout_seconds() -> u64 {
@@ -81,9 +143,83 @@ impl AppConfig {
         }
         let content = std::fs::read_to_string(&path)
             .map_err(|e| AppError::Config(format!("Failed to read config: {e}")))?;
-        let config: AppConfig = toml::from_str(&content)
+        let mut config: AppConfig = toml::from_str(&content)
             .map_err(|e| AppError::Config(format!("Failed to parse config: {e}")))?;
+
+        // Legacy migration: convert [providers.*] to [[agents]]
+        if config.agents.is_empty() && !config.providers.is_empty() {
+            config.migrate_providers_to_agents();
+        }
+
+        // Legacy migration: if diagnostic_provider contains a provider key like "openai",
+        // try to find a matching agent by provider kind and replace with that agent's name.
+        // Also normalize case to match the actual agent name.
+        if let Some(ref dp) = config.diagnostic_provider {
+            if ProviderKind::from_selector(dp).is_some()
+                && !config.agents.iter().any(|a| a.name.eq_ignore_ascii_case(dp))
+            {
+                let kind = ProviderKind::from_selector(dp).unwrap();
+                if let Some(agent) = config.agents.iter().find(|a| a.provider == kind) {
+                    config.diagnostic_provider = Some(agent.name.clone());
+                }
+            } else if let Some(agent) =
+                config.agents.iter().find(|a| a.name.eq_ignore_ascii_case(dp))
+            {
+                // Normalize case to match the actual agent name
+                if agent.name != *dp {
+                    config.diagnostic_provider = Some(agent.name.clone());
+                }
+            }
+        }
+
+        config.validate_agents()?;
         Ok(config)
+    }
+
+    /// Migrate legacy `[providers.*]` HashMap into `[[agents]]` Vec.
+    fn migrate_providers_to_agents(&mut self) {
+        // Use a fixed order for deterministic migration
+        let order = [ProviderKind::Anthropic, ProviderKind::OpenAI, ProviderKind::Gemini];
+        for kind in &order {
+            let key = kind.config_key();
+            if let Some(pc) = self.providers.get(key) {
+                self.agents.push(AgentConfig::from_provider_config(
+                    kind.display_name().to_string(),
+                    *kind,
+                    pc,
+                ));
+            }
+        }
+        self.providers.clear();
+    }
+
+    /// Validate agent configs: unique names, non-empty, valid sanitized names
+    fn validate_agents(&self) -> Result<(), AppError> {
+        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_sanitized = std::collections::HashSet::new();
+
+        for agent in &self.agents {
+            if agent.name.trim().is_empty() {
+                return Err(AppError::Config("Agent name cannot be empty".into()));
+            }
+
+            let lower = agent.name.to_lowercase();
+            if !seen_names.insert(lower) {
+                return Err(AppError::Config(format!(
+                    "Duplicate agent name (case-insensitive): '{}'",
+                    agent.name
+                )));
+            }
+
+            let sanitized = crate::output::OutputManager::sanitize_session_name(&agent.name).to_lowercase();
+            if !seen_sanitized.insert(sanitized.clone()) {
+                return Err(AppError::Config(format!(
+                    "Agents '{}' would produce duplicate filenames after sanitization",
+                    agent.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn config_path() -> Result<PathBuf, AppError> {
@@ -142,49 +278,35 @@ http_timeout_seconds = 120
 model_fetch_timeout_seconds = 30
 cli_timeout_seconds = 600
 
-# Optional: set one diagnostics provider ("anthropic", "openai", "gemini")
-# diagnostic_provider = "openai"
+# Optional: set the diagnostic agent (agent name, e.g. "Claude")
+# diagnostic_provider = "Claude"
 
-[providers.openai]
+# Named agents — you can have multiple agents per provider
+[[agents]]
+name = "Codex"
+provider = "openai"
 api_key = ""
 model = "gpt-5.3-codex"
 reasoning_effort = "high"
 use_cli = true
 extra_cli_args = ""
 
-[providers.anthropic]
+[[agents]]
+name = "Claude"
+provider = "anthropic"
 api_key = ""
 model = "claude-opus-4-6"
 thinking_effort = "high"
 use_cli = true
+cli_print_mode = true
 extra_cli_args = ""
 
-[providers.gemini]
+[[agents]]
+name = "Gemini"
+provider = "gemini"
 api_key = ""
 model = "gemini-2.5-pro"
 thinking_effort = "medium"
-use_cli = true
-extra_cli_args = ""
-
-# Diagnostics are configured separately from run providers.
-[diagnostics.anthropic]
-api_key = ""
-model = "claude-opus-4-6"
-thinking_effort = "low"
-use_cli = true
-extra_cli_args = ""
-
-[diagnostics.openai]
-api_key = ""
-model = "gpt-5.3-codex"
-reasoning_effort = "low"
-use_cli = true
-extra_cli_args = ""
-
-[diagnostics.gemini]
-api_key = ""
-model = "gemini-2.5-pro"
-thinking_effort = "low"
 use_cli = true
 extra_cli_args = ""
 "#;
@@ -221,8 +343,22 @@ mod tests {
             model_fetch_timeout_seconds: 30,
             cli_timeout_seconds: 600,
             diagnostic_provider: None,
+            agents: Vec::new(),
             providers: HashMap::new(),
-            diagnostics: HashMap::new(),
+        }
+    }
+
+    fn sample_agent(name: &str, provider: ProviderKind) -> AgentConfig {
+        AgentConfig {
+            name: name.to_string(),
+            provider,
+            api_key: String::new(),
+            model: String::new(),
+            reasoning_effort: None,
+            thinking_effort: None,
+            use_cli: false,
+            cli_print_mode: true,
+            extra_cli_args: String::new(),
         }
     }
 
@@ -247,7 +383,8 @@ mod tests {
     fn load_with_override_valid_round_trip() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        let cfg = sample_config();
+        let mut cfg = sample_config();
+        cfg.agents.push(sample_agent("Claude", ProviderKind::Anthropic));
         cfg.save_with_override(path.to_str()).expect("save");
         let loaded = AppConfig::load_with_override(path.to_str()).expect("load");
         assert_eq!(loaded.output_dir, cfg.output_dir);
@@ -260,6 +397,8 @@ mod tests {
         );
         assert_eq!(loaded.cli_timeout_seconds, cfg.cli_timeout_seconds);
         assert_eq!(loaded.diagnostic_provider, cfg.diagnostic_provider);
+        assert_eq!(loaded.agents.len(), 1);
+        assert_eq!(loaded.agents[0].name, "Claude");
     }
 
     #[test]
@@ -280,12 +419,9 @@ mod tests {
         assert_eq!(written, path);
         let body = std::fs::read_to_string(&written).expect("read");
         assert!(body.contains("output_dir"));
-        assert!(body.contains("[providers.openai]"));
-        assert!(body.contains("[diagnostics.gemini]"));
-        assert!(!body
-            .lines()
-            .any(|line| line.trim() == "diagnostic_provider = \"openai\""));
-        assert!(body.contains("# diagnostic_provider = \"openai\""));
+        assert!(body.contains("[[agents]]"));
+        assert!(!body.contains("[diagnostics."));
+        assert!(body.contains("# diagnostic_provider = \"Claude\""));
     }
 
     #[test]
@@ -325,20 +461,99 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_uses_timeout_defaults_when_missing() {
+    fn legacy_providers_migration() {
         let body = r#"
 output_dir = "/tmp/hoa"
 
 [providers.openai]
+api_key = "ok"
+model = "gpt-5"
+
+[providers.anthropic]
+api_key = "ak"
+model = "claude"
+"#;
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).expect("write");
+        let cfg = AppConfig::load_with_override(path.to_str()).expect("load");
+        assert!(cfg.providers.is_empty());
+        assert_eq!(cfg.agents.len(), 2);
+        // Should be in fixed order: Anthropic, OpenAI, Gemini
+        assert_eq!(cfg.agents[0].name, "Claude");
+        assert_eq!(cfg.agents[0].provider, ProviderKind::Anthropic);
+        assert_eq!(cfg.agents[0].api_key, "ak");
+        assert_eq!(cfg.agents[1].name, "Codex");
+        assert_eq!(cfg.agents[1].provider, ProviderKind::OpenAI);
+        assert_eq!(cfg.agents[1].api_key, "ok");
+    }
+
+    #[test]
+    fn deserialize_uses_timeout_defaults_when_missing() {
+        let body = r#"
+output_dir = "/tmp/hoa"
+
+[[agents]]
+name = "Codex"
+provider = "openai"
 api_key = ""
 model = "gpt-5"
 "#;
-        let cfg: AppConfig = toml::from_str(body).expect("parse");
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).expect("write");
+        let cfg = AppConfig::load_with_override(path.to_str()).expect("parse");
         assert_eq!(cfg.http_timeout_seconds, 120);
         assert_eq!(cfg.model_fetch_timeout_seconds, 30);
         assert_eq!(cfg.cli_timeout_seconds, 600);
         assert_eq!(cfg.default_max_tokens, 4096);
         assert_eq!(cfg.max_history_messages, 50);
         assert_eq!(cfg.diagnostic_provider, None);
+    }
+
+    #[test]
+    fn validate_agents_rejects_duplicate_names() {
+        let mut cfg = sample_config();
+        cfg.agents.push(sample_agent("Claude", ProviderKind::Anthropic));
+        cfg.agents.push(sample_agent("claude", ProviderKind::Anthropic));
+        let err = cfg.validate_agents().expect_err("should reject");
+        assert!(err.to_string().contains("Duplicate agent name"));
+    }
+
+    #[test]
+    fn validate_agents_rejects_empty_name() {
+        let mut cfg = sample_config();
+        cfg.agents.push(sample_agent("", ProviderKind::Anthropic));
+        let err = cfg.validate_agents().expect_err("should reject");
+        assert!(err.to_string().contains("cannot be empty"));
+    }
+
+    #[test]
+    fn validate_agents_rejects_sanitized_collisions() {
+        let mut cfg = sample_config();
+        cfg.agents.push(sample_agent("Claude/1", ProviderKind::Anthropic));
+        cfg.agents.push(sample_agent("Claude 1", ProviderKind::Anthropic));
+        let err = cfg.validate_agents().expect_err("should reject");
+        assert!(err.to_string().contains("duplicate filenames"));
+    }
+
+    #[test]
+    fn agent_config_to_provider_config_round_trip() {
+        let pc = ProviderConfig {
+            api_key: "key".to_string(),
+            model: "m".to_string(),
+            reasoning_effort: Some("high".to_string()),
+            thinking_effort: None,
+            use_cli: true,
+            cli_print_mode: true,
+            extra_cli_args: "--x".to_string(),
+        };
+        let ac = AgentConfig::from_provider_config("Test".to_string(), ProviderKind::OpenAI, &pc);
+        let pc2 = ac.to_provider_config();
+        assert_eq!(pc2.api_key, "key");
+        assert_eq!(pc2.model, "m");
+        assert_eq!(pc2.reasoning_effort, Some("high".to_string()));
+        assert!(pc2.use_cli);
+        assert_eq!(pc2.extra_cli_args, "--x");
     }
 }

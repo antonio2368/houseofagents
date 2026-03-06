@@ -305,8 +305,8 @@ mod tests {
             model_fetch_timeout_seconds: 30,
             cli_timeout_seconds: 600,
             diagnostic_provider: None,
+            agents: Vec::new(),
             providers: HashMap::new(),
-            diagnostics: HashMap::new(),
         };
         let mut app = App::new(cfg);
         app.result_files = files;
