@@ -36,10 +36,38 @@ struct WireCell {
     dirs: u8,
     color: Color,
     is_arrow: bool,
+    arrow_char: char,
 }
 
 type WirePoint = (i16, i16);
 type ConnectionRaster = HashMap<WirePoint, WireCell>;
+
+/// Deterministic color palette for normal (non-highlighted) wires.
+const WIRE_PALETTE: [Color; 6] = [
+    Color::Blue,
+    Color::Green,
+    Color::Magenta,
+    Color::Cyan,
+    Color::LightBlue,
+    Color::LightGreen,
+];
+
+/// Choose arrow character based on the direction of a wire segment's endpoint.
+fn arrow_for_seg(seg: &WireSeg) -> char {
+    let dx = seg.x2 - seg.x1;
+    let dy = seg.y2 - seg.y1;
+    if dx > 0 {
+        '▶'
+    } else if dx < 0 {
+        '◀'
+    } else if dy > 0 {
+        '▼'
+    } else if dy < 0 {
+        '▲'
+    } else {
+        '▶'
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -315,6 +343,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
     // ── Connection rendering (two-phase: route then paint) ──
     let grid_occ = grid_occupancy(&app.pipeline_def.blocks);
     let lanes = assign_lanes(&app.pipeline_def.connections, &app.pipeline_def.blocks);
+    let ports = assign_ports(&app.pipeline_def.connections, &app.pipeline_def.blocks);
 
     // Resolve pipeline_conn_cursor (index into filtered subset) to global connection index
     let highlighted_global_idx = if app.pipeline_removing_conn {
@@ -345,21 +374,31 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         } else if removing {
             Color::Yellow
         } else {
-            Color::DarkGray
+            WIRE_PALETTE[ci % WIRE_PALETTE.len()]
         };
 
-        let segs = route_wire(fb.position, tb.position, &grid_occ, lanes[ci]);
+        let (exit_y_off, entry_y_off) = ports[ci];
+        let segs = route_wire(
+            fb.position,
+            tb.position,
+            &grid_occ,
+            lanes[ci],
+            exit_y_off,
+            entry_y_off,
+        );
         let mut conn_map: ConnectionRaster = HashMap::new();
         for seg in &segs {
             rasterize_seg(seg, color, &mut conn_map);
         }
         if let Some(last) = segs.last() {
+            let arrow_ch = arrow_for_seg(last);
             if let Some(cell) = conn_map.get_mut(&(last.x2, last.y2)) {
                 cell.is_arrow = true;
+                cell.arrow_char = arrow_ch;
             } else {
                 conn_map.insert(
                     (last.x2, last.y2),
-                    WireCell { dirs: 0, color, is_arrow: true },
+                    WireCell { dirs: 0, color, is_arrow: true, arrow_char: arrow_ch },
                 );
             }
         }
@@ -375,7 +414,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
             if pixel_hits_block(wx, wy, &app.pipeline_def.blocks) {
                 continue;
             }
-            let ch = if cell.is_arrow { '▶' } else { dirs_to_char(cell.dirs) };
+            let ch = if cell.is_arrow { cell.arrow_char } else { dirs_to_char(cell.dirs) };
             put_char(
                 f,
                 canvas_inner,
@@ -458,28 +497,112 @@ fn assign_lanes(
     lanes
 }
 
+/// Assign per-connection exit/entry Y offsets so fan-in/fan-out wires don't stack.
+fn assign_ports(
+    conns: &[crate::execution::pipeline::PipelineConnection],
+    blocks: &[crate::execution::pipeline::PipelineBlock],
+) -> Vec<(i16, i16)> {
+    let bmap: HashMap<BlockId, (u16, u16)> =
+        blocks.iter().map(|b| (b.id, b.position)).collect();
+
+    let mut outgoing: HashMap<BlockId, Vec<usize>> = HashMap::new();
+    let mut incoming: HashMap<BlockId, Vec<usize>> = HashMap::new();
+    for (ci, conn) in conns.iter().enumerate() {
+        outgoing.entry(conn.from).or_default().push(ci);
+        incoming.entry(conn.to).or_default().push(ci);
+    }
+
+    // Symmetric offset sequence: 0, -1, +1, -2, +2, ...
+    let offset_seq = |n: usize| -> Vec<i16> {
+        let mut offsets = Vec::with_capacity(n);
+        offsets.push(0);
+        let mut d = 1i16;
+        while offsets.len() < n {
+            offsets.push(-d);
+            if offsets.len() < n {
+                offsets.push(d);
+            }
+            d += 1;
+        }
+        offsets
+    };
+
+    let max_off = (BLOCK_H as i16 / 2).saturating_sub(1).max(1);
+
+    let mut ports = vec![(0i16, 0i16); conns.len()];
+
+    for group in outgoing.values_mut() {
+        group.sort_by(|&a, &b| {
+            let ta = bmap.get(&conns[a].to).copied().unwrap_or((0, 0));
+            let tb = bmap.get(&conns[b].to).copied().unwrap_or((0, 0));
+            (ta.1, ta.0, a).cmp(&(tb.1, tb.0, b))
+        });
+        let offsets = offset_seq(group.len());
+        for (i, &ci) in group.iter().enumerate() {
+            ports[ci].0 = offsets[i].clamp(-max_off, max_off);
+        }
+    }
+
+    for group in incoming.values_mut() {
+        group.sort_by(|&a, &b| {
+            let fa = bmap.get(&conns[a].from).copied().unwrap_or((0, 0));
+            let fb = bmap.get(&conns[b].from).copied().unwrap_or((0, 0));
+            (fa.1, fa.0, a).cmp(&(fb.1, fb.0, b))
+        });
+        let offsets = offset_seq(group.len());
+        for (i, &ci) in group.iter().enumerate() {
+            ports[ci].1 = offsets[i].clamp(-max_off, max_off);
+        }
+    }
+
+    ports
+}
+
 fn route_wire(
     from_grid: (u16, u16),
     to_grid: (u16, u16),
-    _grid_occ: &HashSet<(u16, u16)>,
+    grid_occ: &HashSet<(u16, u16)>,
     lane: usize,
+    exit_y_off: i16,
+    entry_y_off: i16,
 ) -> Vec<WireSeg> {
     let (fc, fr) = from_grid;
     let (tc, tr) = to_grid;
 
     let ex = fc as i16 * CELL_W as i16 + BLOCK_W as i16;
-    let ey = fr as i16 * CELL_H as i16 + BLOCK_H as i16 / 2;
+    let ey = fr as i16 * CELL_H as i16 + BLOCK_H as i16 / 2 + exit_y_off;
     let nx = tc as i16 * CELL_W as i16 - 1;
-    let ny = tr as i16 * CELL_H as i16 + BLOCK_H as i16 / 2;
-    // Keep 3 side lanes close to blocks, then add routing tiers further below.
-    let side_lane = (lane % 3) as i16 * 2 + 1;
-    let tier = (lane / 3) as i16;
+    let ny = tr as i16 * CELL_H as i16 + BLOCK_H as i16 / 2 + entry_y_off;
+
+    // Case A: Forward same row with clear corridor
+    if fc < tc && fr == tr {
+        let corridor_clear = (fc + 1..tc).all(|c| !grid_occ.contains(&(c, fr)));
+        if corridor_clear {
+            if ey == ny {
+                return vec![WireSeg { x1: ex, y1: ey, x2: nx, y2: ny }];
+            }
+            let mid_x = (ex + nx) / 2;
+            return vec![
+                WireSeg { x1: ex, y1: ey, x2: mid_x, y2: ey },
+                WireSeg { x1: mid_x, y1: ey, x2: mid_x, y2: ny },
+                WireSeg { x1: mid_x, y1: ny, x2: nx, y2: ny },
+            ];
+        }
+    }
+
+    // Case B: Forward different row (or blocked same-row forward)
+    // Case C: Backward or same column
+    // Both use 5-segment U-route with monotonic lane/tier separation.
+    let gap = (CELL_W as i16 - BLOCK_W as i16).max(2);
+    let side_lane = ((lane % gap as usize) as i16) * 2 + 1;
+    let side_clamp = gap - 1;
+    let tier = lane as i16;
     let hy = fr.max(tr) as i16 * CELL_H as i16
         + BLOCK_H as i16
         + 1
-        + tier * CELL_H as i16;
-    let v1 = ex + side_lane;
-    let v2 = nx - side_lane;
+        + tier * 2;
+    let v1 = ex + side_lane.min(side_clamp);
+    let v2 = nx - side_lane.min(side_clamp);
 
     vec![
         WireSeg { x1: ex, y1: ey, x2: v1, y2: ey },
@@ -505,7 +628,7 @@ fn rasterize_seg(seg: &WireSeg, color: Color, map: &mut HashMap<(i16, i16), Wire
         for x in lo..=hi {
             let c = map
                 .entry((x, y))
-                .or_insert(WireCell { dirs: 0, color, is_arrow: false });
+                .or_insert(WireCell { dirs: 0, color, is_arrow: false, arrow_char: ' ' });
             if x > lo { c.dirs |= DIR_W; }
             if x < hi { c.dirs |= DIR_E; }
             if color_rank(color) > color_rank(c.color) { c.color = color; }
@@ -516,7 +639,7 @@ fn rasterize_seg(seg: &WireSeg, color: Color, map: &mut HashMap<(i16, i16), Wire
         for y in lo..=hi {
             let c = map
                 .entry((x, y))
-                .or_insert(WireCell { dirs: 0, color, is_arrow: false });
+                .or_insert(WireCell { dirs: 0, color, is_arrow: false, arrow_char: ' ' });
             if y > lo { c.dirs |= DIR_N; }
             if y < hi { c.dirs |= DIR_S; }
             if color_rank(color) > color_rank(c.color) { c.color = color; }
@@ -562,7 +685,7 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
     } else if app.pipeline_removing_conn {
         "j/k: cycle | Enter: remove | Esc: cancel"
     } else {
-        "Arrows/hjkl: move block | Shift+Arrows/Shift+HJKL: select | Ctrl+Arrows: scroll | a: add | d: delete | e: edit | c: connect | x: disconnect | Ctrl+S: save | Ctrl+L: load | F5: run | ?: help | Esc: back"
+        "Arrows/hjkl: select | Shift+Arrows/HJKL: move block | Ctrl+Arrows: scroll | a: add | d: delete | e: edit | c: connect | x: disconnect | Ctrl+S: save | Ctrl+L: load | F5: run | ?: help | Esc: back"
     };
     let help_p = Paragraph::new(help)
         .style(Style::default().fg(Color::DarkGray))
@@ -809,8 +932,17 @@ mod routing_tests {
     fn route_same_row_clear() {
         let blocks = vec![block_at(1, 0, 0), block_at(2, 1, 0)];
         let occ = grid_occupancy(&blocks);
-        let segs = route_wire((0, 0), (1, 0), &occ, 0);
-        assert_eq!(segs.len(), 5, "dedicated connection route = 5 segments");
+        let segs = route_wire((0, 0), (1, 0), &occ, 0, 0, 0);
+        assert_eq!(segs.len(), 1, "direct forward same-row clear = 1 segment");
+        no_seg_hits_block(&segs, &blocks);
+    }
+
+    #[test]
+    fn route_same_row_clear_with_port_offsets() {
+        let blocks = vec![block_at(1, 0, 0), block_at(2, 1, 0)];
+        let occ = grid_occupancy(&blocks);
+        let segs = route_wire((0, 0), (1, 0), &occ, 0, -1, 1);
+        assert_eq!(segs.len(), 3, "same-row clear with different port offsets = 3 segments");
         no_seg_hits_block(&segs, &blocks);
     }
 
@@ -818,7 +950,7 @@ mod routing_tests {
     fn route_same_row_blocked() {
         let blocks = vec![block_at(1, 0, 0), block_at(2, 1, 0), block_at(3, 2, 0)];
         let occ = grid_occupancy(&blocks);
-        let segs = route_wire((0, 0), (2, 0), &occ, 0);
+        let segs = route_wire((0, 0), (2, 0), &occ, 0, 0, 0);
         assert_eq!(segs.len(), 5, "detour around obstacle = 5 segments");
         no_seg_hits_block(&segs, &blocks);
     }
@@ -827,8 +959,8 @@ mod routing_tests {
     fn route_forward_diff_row() {
         let blocks = vec![block_at(1, 0, 0), block_at(2, 2, 2)];
         let occ = grid_occupancy(&blocks);
-        let segs = route_wire((0, 0), (2, 2), &occ, 0);
-        assert_eq!(segs.len(), 5, "dedicated connection route = 5 segments");
+        let segs = route_wire((0, 0), (2, 2), &occ, 0, 0, 0);
+        assert_eq!(segs.len(), 5, "forward different row = 5 segments");
         no_seg_hits_block(&segs, &blocks);
     }
 
@@ -836,7 +968,7 @@ mod routing_tests {
     fn route_backward() {
         let blocks = vec![block_at(1, 0, 0), block_at(2, 2, 0)];
         let occ = grid_occupancy(&blocks);
-        let segs = route_wire((2, 0), (0, 0), &occ, 0);
+        let segs = route_wire((2, 0), (0, 0), &occ, 0, 0, 0);
         assert_eq!(segs.len(), 5, "backward U-route = 5 segments");
         no_seg_hits_block(&segs, &blocks);
     }
@@ -845,7 +977,7 @@ mod routing_tests {
     fn route_same_col_diff_row() {
         let blocks = vec![block_at(1, 1, 0), block_at(2, 1, 2)];
         let occ = grid_occupancy(&blocks);
-        let segs = route_wire((1, 0), (1, 2), &occ, 0);
+        let segs = route_wire((1, 0), (1, 2), &occ, 0, 0, 0);
         assert_eq!(segs.len(), 5, "same column different row = backward U-route = 5 segments");
         no_seg_hits_block(&segs, &blocks);
     }
@@ -1029,11 +1161,136 @@ mod routing_tests {
         // Ensure the blocks are valid for route_wire (no panics)
         let occ = grid_occupancy(&blocks);
         let lanes = assign_lanes(&conns, &blocks);
+        let ports = assign_ports(&conns, &blocks);
         for (ci, conn) in conns.iter().enumerate() {
             let fb = blocks.iter().find(|b| b.id == conn.from).unwrap();
             let tb = blocks.iter().find(|b| b.id == conn.to).unwrap();
-            let segs = route_wire(fb.position, tb.position, &occ, lanes[ci]);
+            let (ey, ny) = ports[ci];
+            let segs = route_wire(fb.position, tb.position, &occ, lanes[ci], ey, ny);
             assert!(!segs.is_empty());
         }
+    }
+
+    #[test]
+    fn arrow_direction_matches_segment() {
+        assert_eq!(arrow_for_seg(&WireSeg { x1: 0, y1: 0, x2: 5, y2: 0 }), '▶');
+        assert_eq!(arrow_for_seg(&WireSeg { x1: 5, y1: 0, x2: 0, y2: 0 }), '◀');
+        assert_eq!(arrow_for_seg(&WireSeg { x1: 0, y1: 0, x2: 0, y2: 5 }), '▼');
+        assert_eq!(arrow_for_seg(&WireSeg { x1: 0, y1: 5, x2: 0, y2: 0 }), '▲');
+        assert_eq!(arrow_for_seg(&WireSeg { x1: 0, y1: 0, x2: 0, y2: 0 }), '▶');
+    }
+
+    #[test]
+    fn ports_produce_distinct_offsets() {
+        // Fan-out: one block with 3 outgoing connections
+        let blocks = vec![
+            block_at(1, 0, 0),
+            block_at(2, 1, 0),
+            block_at(3, 1, 1),
+            block_at(4, 1, 2),
+        ];
+        let conns = vec![
+            PipelineConnection { from: 1, to: 2 },
+            PipelineConnection { from: 1, to: 3 },
+            PipelineConnection { from: 1, to: 4 },
+        ];
+        let ports = assign_ports(&conns, &blocks);
+        let exit_offsets: Vec<i16> = ports.iter().map(|p| p.0).collect();
+        let mut unique_exits: Vec<i16> = exit_offsets.clone();
+        unique_exits.sort();
+        unique_exits.dedup();
+        assert_eq!(unique_exits.len(), exit_offsets.len(), "exit offsets must be distinct");
+
+        // Fan-in: 3 blocks into one
+        let conns_in = vec![
+            PipelineConnection { from: 2, to: 1 },
+            PipelineConnection { from: 3, to: 1 },
+            PipelineConnection { from: 4, to: 1 },
+        ];
+        let ports_in = assign_ports(&conns_in, &blocks);
+        let entry_offsets: Vec<i16> = ports_in.iter().map(|p| p.1).collect();
+        let mut unique_entries: Vec<i16> = entry_offsets.clone();
+        unique_entries.sort();
+        unique_entries.dedup();
+        assert_eq!(unique_entries.len(), entry_offsets.len(), "entry offsets must be distinct");
+    }
+
+    #[test]
+    fn fan_in_routes_are_distinct() {
+        // Three connections arriving at the same block should have mostly distinct routes.
+        // Crossing overlaps are expected (different colors handle visual distinction).
+        // Each route must have unique pixels not shared by any other route.
+        let blocks = vec![
+            block_at(1, 0, 0),
+            block_at(2, 0, 2),
+            block_at(3, 0, 4),
+            block_at(4, 2, 1),
+        ];
+        let conns = vec![
+            PipelineConnection { from: 1, to: 4 },
+            PipelineConnection { from: 2, to: 4 },
+            PipelineConnection { from: 3, to: 4 },
+        ];
+        let occ = grid_occupancy(&blocks);
+        let lanes = assign_lanes(&conns, &blocks);
+        let ports = assign_ports(&conns, &blocks);
+
+        let mut all_pixels: Vec<HashSet<(i16, i16)>> = Vec::new();
+        for (ci, conn) in conns.iter().enumerate() {
+            let fb = blocks.iter().find(|b| b.id == conn.from).unwrap();
+            let tb = blocks.iter().find(|b| b.id == conn.to).unwrap();
+            let (ey, ny) = ports[ci];
+            let segs = route_wire(fb.position, tb.position, &occ, lanes[ci], ey, ny);
+            let mut pixels = HashSet::new();
+            for seg in &segs {
+                if seg.y1 == seg.y2 {
+                    let y = seg.y1;
+                    let (lo, hi) = if seg.x1 <= seg.x2 { (seg.x1, seg.x2) } else { (seg.x2, seg.x1) };
+                    for x in lo..=hi { pixels.insert((x, y)); }
+                } else {
+                    let x = seg.x1;
+                    let (lo, hi) = if seg.y1 <= seg.y2 { (seg.y1, seg.y2) } else { (seg.y2, seg.y1) };
+                    for y in lo..=hi { pixels.insert((x, y)); }
+                }
+            }
+            all_pixels.push(pixels);
+        }
+
+        // Each route must have unique pixels that no other route shares
+        for i in 0..all_pixels.len() {
+            let unique_count = all_pixels[i]
+                .iter()
+                .filter(|p| {
+                    (0..all_pixels.len()).all(|j| j == i || !all_pixels[j].contains(p))
+                })
+                .count();
+            assert!(
+                unique_count > all_pixels[i].len() / 2,
+                "connection {i} shares too many pixels: only {unique_count}/{} unique",
+                all_pixels[i].len()
+            );
+        }
+
+        // Routes must not be identical
+        for i in 0..all_pixels.len() {
+            for j in (i + 1)..all_pixels.len() {
+                assert_ne!(
+                    all_pixels[i], all_pixels[j],
+                    "connections {i} and {j} have identical pixel sets"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grid_occ_blocks_direct_same_row() {
+        // With an obstacle at column 1, route from col 0 to col 2 on same row
+        // should NOT use the short direct path.
+        let blocks = vec![block_at(1, 0, 0), block_at(2, 1, 0), block_at(3, 2, 0)];
+        let occ = grid_occupancy(&blocks);
+        let segs = route_wire((0, 0), (2, 0), &occ, 0, 0, 0);
+        assert_eq!(segs.len(), 5, "blocked corridor forces 5-segment detour");
+        // Verify we don't get a 1-segment or 3-segment direct path
+        assert!(segs.len() > 3);
     }
 }

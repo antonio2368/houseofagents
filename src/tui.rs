@@ -932,66 +932,66 @@ fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
-        // Arrow/hjkl move selected block, Shift+Arrow/Shift+hjkl navigate selection.
+        // Arrow/hjkl navigate selection, Shift+Arrow/Shift+hjkl move selected block.
         // Ctrl+Arrow scrolls the canvas.
         KeyCode::Up | KeyCode::Char('k') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.pipeline_canvas_offset.1 = app.pipeline_canvas_offset.1.saturating_sub(1);
-            } else if pipeline_builder_nav_mode(&key) {
-                pipeline_spatial_nav(app, NavAxis::Vertical, true);
+            } else if pipeline_builder_move_mode(&key) {
+                pipeline_move_selected_block(app, 0, -1);
                 pipeline_ensure_visible(app);
             } else {
-                pipeline_move_selected_block(app, 0, -1);
+                pipeline_spatial_nav(app, NavAxis::Vertical, true);
                 pipeline_ensure_visible(app);
             }
         }
         KeyCode::Char('K') => {
-            pipeline_spatial_nav(app, NavAxis::Vertical, true);
+            pipeline_move_selected_block(app, 0, -1);
             pipeline_ensure_visible(app);
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.pipeline_canvas_offset.1 += 1;
-            } else if pipeline_builder_nav_mode(&key) {
-                pipeline_spatial_nav(app, NavAxis::Vertical, false);
+            } else if pipeline_builder_move_mode(&key) {
+                pipeline_move_selected_block(app, 0, 1);
                 pipeline_ensure_visible(app);
             } else {
-                pipeline_move_selected_block(app, 0, 1);
+                pipeline_spatial_nav(app, NavAxis::Vertical, false);
                 pipeline_ensure_visible(app);
             }
         }
         KeyCode::Char('J') => {
-            pipeline_spatial_nav(app, NavAxis::Vertical, false);
+            pipeline_move_selected_block(app, 0, 1);
             pipeline_ensure_visible(app);
         }
         KeyCode::Left | KeyCode::Char('h') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.pipeline_canvas_offset.0 = app.pipeline_canvas_offset.0.saturating_sub(1);
-            } else if pipeline_builder_nav_mode(&key) {
-                pipeline_spatial_nav(app, NavAxis::Horizontal, true);
+            } else if pipeline_builder_move_mode(&key) {
+                pipeline_move_selected_block(app, -1, 0);
                 pipeline_ensure_visible(app);
             } else {
-                pipeline_move_selected_block(app, -1, 0);
+                pipeline_spatial_nav(app, NavAxis::Horizontal, true);
                 pipeline_ensure_visible(app);
             }
         }
         KeyCode::Char('H') => {
-            pipeline_spatial_nav(app, NavAxis::Horizontal, true);
+            pipeline_move_selected_block(app, -1, 0);
             pipeline_ensure_visible(app);
         }
         KeyCode::Right | KeyCode::Char('l') => {
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.pipeline_canvas_offset.0 += 1;
-            } else if pipeline_builder_nav_mode(&key) {
-                pipeline_spatial_nav(app, NavAxis::Horizontal, false);
+            } else if pipeline_builder_move_mode(&key) {
+                pipeline_move_selected_block(app, 1, 0);
                 pipeline_ensure_visible(app);
             } else {
-                pipeline_move_selected_block(app, 1, 0);
+                pipeline_spatial_nav(app, NavAxis::Horizontal, false);
                 pipeline_ensure_visible(app);
             }
         }
         KeyCode::Char('L') => {
-            pipeline_spatial_nav(app, NavAxis::Horizontal, false);
+            pipeline_move_selected_block(app, 1, 0);
             pipeline_ensure_visible(app);
         }
         _ => {}
@@ -1003,7 +1003,7 @@ enum NavAxis {
     Vertical,
 }
 
-fn pipeline_builder_nav_mode(key: &KeyEvent) -> bool {
+fn pipeline_builder_move_mode(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
@@ -4286,7 +4286,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_builder_arrow_moves_block_shift_arrow_navigates() {
+    fn pipeline_builder_arrow_navigates_shift_arrow_moves_block() {
         let mut app = test_app();
         app.pipeline_def.blocks = vec![
             pipeline_mod::PipelineBlock {
@@ -4308,14 +4308,16 @@ mod tests {
         ];
         app.pipeline_block_cursor = Some(1);
 
+        // Unmodified arrow navigates to the nearest block (does not move block 1)
         handle_pipeline_builder_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        let moved = app.pipeline_def.blocks.iter().find(|b| b.id == 1).unwrap();
-        assert_eq!(moved.position, (3, 2));
-        assert_eq!(app.pipeline_block_cursor, Some(1));
-
-        handle_pipeline_builder_key(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
-        assert_eq!(app.pipeline_block_cursor, Some(2));
         let after_nav = app.pipeline_def.blocks.iter().find(|b| b.id == 1).unwrap();
-        assert_eq!(after_nav.position, (3, 2));
+        assert_eq!(after_nav.position, (2, 2), "unmodified arrow should not move the block");
+        assert_eq!(app.pipeline_block_cursor, Some(2), "cursor should navigate to block 2");
+
+        // Shift+arrow moves the selected block
+        handle_pipeline_builder_key(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        let moved = app.pipeline_def.blocks.iter().find(|b| b.id == 2).unwrap();
+        assert_eq!(moved.position, (4, 2), "Shift+arrow should move the block");
+        assert_eq!(app.pipeline_block_cursor, Some(2), "cursor stays on the moved block");
     }
 }
