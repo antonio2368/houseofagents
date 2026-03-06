@@ -514,18 +514,20 @@ impl Provider for CliProvider {
         self.emit_live_log(format!("exit {}", status));
         Self::append_stderr_debug(&mut debug_logs, &stderr_text);
 
+        let stdout_text: String = String::from_utf8_lossy(&stdout_bytes).into();
+
         if !status.success() {
             if let Some(path) = codex_output_path.as_ref() {
                 let _ = fs::remove_file(path).await;
             }
-            return Err(Self::provider_error_with_debug(
-                bin,
-                format!("exit {}: {}", status, stderr_text),
-                &debug_logs,
-            ));
+            let mut msg = format!("exit {}: {}", status, stderr_text);
+            let stdout_trimmed = stdout_text.trim();
+            if !stdout_trimmed.is_empty() {
+                msg.push_str("\nstdout: ");
+                msg.push_str(&Self::clip(stdout_trimmed, 1024));
+            }
+            return Err(Self::provider_error_with_debug(bin, msg, &debug_logs));
         }
-
-        let stdout_text: String = String::from_utf8_lossy(&stdout_bytes).into();
         if self.kind == ProviderKind::OpenAI {
             if let Some(session_id) = Self::extract_session_id_from_jsonl(&stdout_text) {
                 debug_logs.push(format!(
