@@ -278,7 +278,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(help, chunks[5]);
 }
 
-fn prompt_cursor_layout(
+pub(crate) fn prompt_cursor_layout(
     text: &str,
     cursor: usize,
     width: usize,

@@ -97,25 +97,25 @@ pub enum ProgressEvent {
     },
     BlockStarted {
         block_id: u32,
-        kind: ProviderKind,
+        agent_name: String,
         label: String,
         iteration: u32,
     },
     BlockLog {
         block_id: u32,
-        kind: ProviderKind,
+        agent_name: String,
         iteration: u32,
         message: String,
     },
     BlockFinished {
         block_id: u32,
-        kind: ProviderKind,
+        agent_name: String,
         label: String,
         iteration: u32,
     },
     BlockError {
         block_id: u32,
-        kind: ProviderKind,
+        agent_name: String,
         label: String,
         iteration: u32,
         error: String,
@@ -123,7 +123,7 @@ pub enum ProgressEvent {
     },
     BlockSkipped {
         block_id: u32,
-        kind: ProviderKind,
+        agent_name: String,
         label: String,
         iteration: u32,
         reason: String,

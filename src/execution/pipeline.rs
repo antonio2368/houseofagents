@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, ProviderConfig};
+use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::execution::{wait_for_cancel, ProgressEvent};
 use crate::output::OutputManager;
@@ -13,14 +13,14 @@ use tokio::sync::{mpsc, Mutex};
 
 pub type BlockId = u32;
 #[allow(dead_code)]
-type ProviderPool = HashMap<(ProviderKind, String), Arc<Mutex<Box<dyn provider::Provider>>>>;
+type ProviderPool = HashMap<(String, String), Arc<Mutex<Box<dyn provider::Provider>>>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineBlock {
     pub id: BlockId,
     #[serde(default)]
     pub name: String,
-    pub provider: ProviderKind,
+    pub agent: String,
     #[serde(default)]
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,8 +312,7 @@ pub fn list_pipeline_files() -> io::Result<Vec<PathBuf>> {
 pub async fn run_pipeline(
     def: &PipelineDefinition,
     config: &AppConfig,
-    provider_configs: HashMap<ProviderKind, ProviderConfig>,
-    use_cli_by_block: HashMap<BlockId, bool>,
+    agent_configs: HashMap<String, (ProviderKind, crate::config::ProviderConfig, bool)>,
     client: reqwest::Client,
     cli_timeout_secs: u64,
     output: &OutputManager,
@@ -326,7 +325,7 @@ pub async fn run_pipeline(
         return Ok(());
     }
 
-    // Build provider pool: key = (ProviderKind, session_key)
+    // Build provider pool: key = (agent_name, session_key)
     let mut provider_pool: ProviderPool = HashMap::new();
 
     for block in &def.blocks {
@@ -334,11 +333,11 @@ pub async fn run_pipeline(
             .session_id
             .clone()
             .unwrap_or_else(|| format!("__block_{}", block.id));
-        let pool_key = (block.provider, session_key);
+        let pool_key = (block.agent.clone(), session_key);
         if let std::collections::hash_map::Entry::Vacant(entry) = provider_pool.entry(pool_key) {
-            if let Some(cfg) = provider_configs.get(&block.provider) {
+            if let Some((kind, cfg, _use_cli)) = agent_configs.get(&block.agent) {
                 let p = provider::create_provider(
-                    block.provider,
+                    *kind,
                     cfg,
                     client.clone(),
                     config.default_max_tokens,
@@ -396,9 +395,9 @@ pub async fn run_pipeline(
                         Some(b) => b,
                         None => { completed += 1; continue; }
                     };
-                    let kind = block.provider;
+                    let agent_name = block.agent.clone();
                     let label = if block.name.trim().is_empty() {
-                        format!("Block {} ({})", block_id, kind.display_name())
+                        format!("Block {} ({})", block_id, agent_name)
                     } else {
                         block.name.clone()
                     };
@@ -413,7 +412,7 @@ pub async fn run_pipeline(
                         let reason = format!("upstream Block {} failed", failed_upstream[0]);
                         let _ = progress_tx.send(ProgressEvent::BlockSkipped {
                             block_id,
-                            kind,
+                            agent_name,
                             label,
                             iteration,
                             reason,
@@ -435,7 +434,7 @@ pub async fn run_pipeline(
 
                     // Build message
                     let is_root = upstream_of(def, block_id).is_empty();
-                    let use_cli = use_cli_by_block.get(&block_id).copied().unwrap_or(false);
+                    let use_cli = agent_configs.get(&agent_name).map(|(_, _, cli)| *cli).unwrap_or(false);
 
                     let message = if is_root && iteration == 1 {
                         if block.prompt.is_empty() {
@@ -472,7 +471,8 @@ pub async fn run_pipeline(
                             let mut file_refs = String::new();
                             for uid in &upstream_ids {
                                 if let Some(ub) = def.blocks.iter().find(|b| b.id == *uid) {
-                                    let fname = format!("block{}_{}_iter{}.md", uid, ub.provider.config_key(), iteration);
+                                    let sanitized = OutputManager::sanitize_session_name(&ub.agent);
+                                    let fname = format!("block{}_{}_iter{}.md", uid, sanitized, iteration);
                                     let fpath = output.run_dir().join(&fname);
                                     if fpath.exists() {
                                         file_refs.push_str(&format!("- {}\n", fpath.display()));
@@ -490,13 +490,13 @@ pub async fn run_pipeline(
                         .session_id
                         .clone()
                         .unwrap_or_else(|| format!("__block_{}", block.id));
-                    let pool_key = (kind, session_key);
+                    let pool_key = (agent_name.clone(), session_key);
                     let provider_arc = match provider_pool.get(&pool_key) {
                         Some(p) => p.clone(),
                         None => {
                             let _ = progress_tx.send(ProgressEvent::BlockError {
                                 block_id,
-                                kind,
+                                agent_name,
                                 label: label.clone(),
                                 iteration,
                                 error: "No provider available".into(),
@@ -519,7 +519,7 @@ pub async fn run_pipeline(
 
                     let _ = progress_tx.send(ProgressEvent::BlockStarted {
                         block_id,
-                        kind,
+                        agent_name: agent_name.clone(),
                         label: label.clone(),
                         iteration,
                     });
@@ -527,6 +527,7 @@ pub async fn run_pipeline(
                     let ptx = progress_tx.clone();
                     let cancel_clone = cancel.clone();
                     let output_run_dir = output.run_dir().to_path_buf();
+                    let file_key = OutputManager::sanitize_session_name(&agent_name);
 
                     tasks.spawn(async move {
                         let mut guard = provider_arc.lock().await;
@@ -536,14 +537,14 @@ pub async fn run_pipeline(
                         guard.set_live_log_sender(Some(live_tx));
 
                         let bid = block_id;
-                        let k = kind;
+                        let an = agent_name.clone();
                         let it = iteration;
                         let ptx2 = ptx.clone();
                         let live_forward = tokio::spawn(async move {
                             while let Some(line) = live_rx.recv().await {
                                 let _ = ptx2.send(ProgressEvent::BlockLog {
                                     block_id: bid,
-                                    kind: k,
+                                    agent_name: an.clone(),
                                     iteration: it,
                                     message: format!("CLI {line}"),
                                 });
@@ -569,19 +570,19 @@ pub async fn run_pipeline(
                                 for log in &resp.debug_logs {
                                     let _ = ptx.send(ProgressEvent::BlockLog {
                                         block_id,
-                                        kind,
+                                        agent_name: agent_name.clone(),
                                         iteration,
                                         message: log.clone(),
                                     });
                                 }
                                 // Write output
-                                let filename = format!("block{}_{}_iter{}.md", block_id, kind.config_key(), iteration);
+                                let filename = format!("block{}_{}_iter{}.md", block_id, file_key, iteration);
                                 let path = output_run_dir.join(&filename);
                                 if let Err(e) = std::fs::write(&path, &resp.content) {
                                     let error = format!("Failed to write output: {e}");
                                     let _ = ptx.send(ProgressEvent::BlockError {
                                         block_id,
-                                        kind,
+                                        agent_name,
                                         label,
                                         iteration,
                                         error: error.clone(),
@@ -591,7 +592,7 @@ pub async fn run_pipeline(
                                 } else {
                                     let _ = ptx.send(ProgressEvent::BlockFinished {
                                         block_id,
-                                        kind,
+                                        agent_name,
                                         label,
                                         iteration,
                                     });
@@ -601,7 +602,7 @@ pub async fn run_pipeline(
                             Some(Err(e)) => {
                                 let _ = ptx.send(ProgressEvent::BlockError {
                                     block_id,
-                                    kind,
+                                    agent_name,
                                     label,
                                     iteration,
                                     error: e.to_string(),
@@ -670,7 +671,7 @@ mod tests {
         PipelineBlock {
             id,
             name: format!("Block#{id}"),
-            provider: ProviderKind::Anthropic,
+            agent: "Claude".into(),
             prompt: format!("block {id}"),
             session_id: None,
             position: (col, row),
@@ -908,13 +909,13 @@ iterations = 1
 
 [[blocks]]
 id = 1
-provider = "Anthropic"
+agent = "Claude"
 prompt = "a"
 position = [0, 0]
 
 [[blocks]]
 id = 1
-provider = "Anthropic"
+agent = "Claude"
 prompt = "b"
 position = [1, 0]
 "#;
@@ -933,7 +934,7 @@ iterations = 1
 
 [[blocks]]
 id = 1
-provider = "Anthropic"
+agent = "Claude"
 prompt = "a"
 position = [0, 0]
 
@@ -956,13 +957,13 @@ iterations = 1
 
 [[blocks]]
 id = 1
-provider = "Anthropic"
+agent = "Claude"
 prompt = "a"
 position = [0, 0]
 
 [[blocks]]
 id = 2
-provider = "Anthropic"
+agent = "Claude"
 prompt = "b"
 position = [1, 0]
 
@@ -989,7 +990,7 @@ iterations = 1
 
 [[blocks]]
 id = 1
-provider = "Anthropic"
+agent = "Claude"
 prompt = "a"
 position = [0, 0]
 

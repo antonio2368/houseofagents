@@ -674,7 +674,7 @@ fn handle_pipeline_paste(app: &mut App, text: &str) {
                 app.pipeline_edit_session_buf.push_str(&clean);
                 app.pipeline_edit_session_cursor = app.pipeline_edit_session_buf.len();
             }
-            PipelineEditField::Provider => {}
+            PipelineEditField::Agent => {}
         }
     } else if let Some(PipelineDialogMode::Save) = app.pipeline_file_dialog {
         app.pipeline_file_input.push_str(text);
@@ -837,10 +837,13 @@ fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
             let pos = pipeline_mod::next_free_position(&app.pipeline_def);
             let id = app.pipeline_next_id;
             app.pipeline_next_id += 1;
+            let default_agent = app.config.agents.first()
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "Claude".to_string());
             app.pipeline_def.blocks.push(pipeline_mod::PipelineBlock {
                 id,
                 name: format!("Block#{id}"),
-                provider: ProviderKind::Anthropic,
+                agent: default_agent,
                 prompt: String::new(),
                 session_id: None,
                 position: pos,
@@ -876,9 +879,9 @@ fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     app.pipeline_edit_field = PipelineEditField::Name;
                     app.pipeline_edit_name_buf = block.name.clone();
                     app.pipeline_edit_name_cursor = block.name.len();
-                    app.pipeline_edit_provider_idx = ProviderKind::all()
+                    app.pipeline_edit_agent_idx = app.config.agents
                         .iter()
-                        .position(|&k| k == block.provider)
+                        .position(|a| a.name == block.agent)
                         .unwrap_or(0);
                     app.pipeline_edit_prompt_buf = block.prompt.clone();
                     app.pipeline_edit_prompt_cursor = block.prompt.len();
@@ -1031,8 +1034,8 @@ fn handle_pipeline_edit_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Tab => {
             app.pipeline_edit_field = match app.pipeline_edit_field {
-                PipelineEditField::Name => PipelineEditField::Provider,
-                PipelineEditField::Provider => PipelineEditField::Prompt,
+                PipelineEditField::Name => PipelineEditField::Agent,
+                PipelineEditField::Agent => PipelineEditField::Prompt,
                 PipelineEditField::Prompt => PipelineEditField::SessionId,
                 PipelineEditField::SessionId => PipelineEditField::Name,
             };
@@ -1040,7 +1043,7 @@ fn handle_pipeline_edit_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             match app.pipeline_edit_field {
                 PipelineEditField::Name
-                | PipelineEditField::Provider
+                | PipelineEditField::Agent
                 | PipelineEditField::SessionId => {
                     // Confirm and save
                     if let Some(sel) = app.pipeline_block_cursor {
@@ -1048,10 +1051,10 @@ fn handle_pipeline_edit_key(app: &mut App, key: KeyEvent) {
                             app.pipeline_def.blocks.iter_mut().find(|b| b.id == sel)
                         {
                             block.name = app.pipeline_edit_name_buf.clone();
-                            block.provider = ProviderKind::all()
-                                .get(app.pipeline_edit_provider_idx)
-                                .copied()
-                                .unwrap_or(ProviderKind::Anthropic);
+                            block.agent = app.config.agents
+                                .get(app.pipeline_edit_agent_idx)
+                                .map(|a| a.name.clone())
+                                .unwrap_or_else(|| "Claude".to_string());
                             block.prompt = app.pipeline_edit_prompt_buf.clone();
                             block.session_id = if app.pipeline_edit_session_buf.is_empty() {
                                 None
@@ -1084,15 +1087,16 @@ fn handle_pipeline_edit_key(app: &mut App, key: KeyEvent) {
                 }
                 _ => {}
             },
-            PipelineEditField::Provider => match key.code {
-                KeyCode::Left => {
-                    let len = ProviderKind::all().len();
-                    app.pipeline_edit_provider_idx =
-                        (app.pipeline_edit_provider_idx + len - 1) % len;
+            PipelineEditField::Agent => match key.code {
+                KeyCode::Left | KeyCode::Char('k') => {
+                    let len = app.config.agents.len().max(1);
+                    app.pipeline_edit_agent_idx =
+                        (app.pipeline_edit_agent_idx + len - 1) % len;
                 }
-                KeyCode::Right => {
-                    app.pipeline_edit_provider_idx =
-                        (app.pipeline_edit_provider_idx + 1) % ProviderKind::all().len();
+                KeyCode::Right | KeyCode::Char('j') => {
+                    let len = app.config.agents.len().max(1);
+                    app.pipeline_edit_agent_idx =
+                        (app.pipeline_edit_agent_idx + 1) % len;
                 }
                 _ => {}
             },
@@ -1252,14 +1256,20 @@ fn start_pipeline_execution(app: &mut App) {
         return;
     }
 
-    // Check provider availability per block
-    let avail_map: std::collections::HashMap<ProviderKind, bool> =
-        app.available_providers().into_iter().collect();
+    // Check agent availability per block
+    let avail_agents: std::collections::HashMap<String, bool> =
+        app.available_agents().into_iter().map(|(a, avail)| (a.name.clone(), avail)).collect();
     for block in &app.pipeline_def.blocks {
-        if !avail_map.get(&block.provider).copied().unwrap_or(false) {
-            let name = block.provider.display_name();
-            app.error_modal = Some(format!("{name} is not configured (block {})", block.id));
-            return;
+        match avail_agents.get(&block.agent) {
+            Some(true) => {}
+            Some(false) => {
+                app.error_modal = Some(format!("{} is not available (block {})", block.agent, block.id));
+                return;
+            }
+            None => {
+                app.error_modal = Some(format!("Agent '{}' not found (block {})", block.agent, block.id));
+                return;
+            }
         }
     }
 
@@ -1275,16 +1285,20 @@ fn start_pipeline_execution(app: &mut App) {
     app.prompt_text = app.pipeline_def.initial_prompt.clone();
     app.iterations = iterations;
 
-    // Build provider configs and CLI flags
-    let mut provider_configs: std::collections::HashMap<ProviderKind, ProviderConfig> =
-        std::collections::HashMap::new();
-    let mut use_cli_by_block: std::collections::HashMap<BlockId, bool> =
+    // Build agent configs keyed by agent name
+    let mut agent_configs: std::collections::HashMap<String, (ProviderKind, ProviderConfig, bool)> =
         std::collections::HashMap::new();
 
     for block in &app.pipeline_def.blocks {
-        if let Some(cfg) = app.effective_provider_config(block.provider) {
-            provider_configs.insert(block.provider, cfg.clone());
-            use_cli_by_block.insert(block.id, cfg.use_cli);
+        if agent_configs.contains_key(&block.agent) {
+            continue;
+        }
+        if let Some(agent_cfg) = app.config.agents.iter().find(|a| a.name == block.agent) {
+            let agent_cfg = app.effective_agent_config(&agent_cfg.name).unwrap_or(agent_cfg);
+            agent_configs.insert(
+                block.agent.clone(),
+                (agent_cfg.provider, agent_cfg.to_provider_config(), agent_cfg.use_cli),
+            );
         }
     }
 
@@ -1373,8 +1387,7 @@ fn start_pipeline_execution(app: &mut App) {
         let result = pipeline_mod::run_pipeline(
             &pipeline_def,
             &config,
-            provider_configs,
-            use_cli_by_block,
+            agent_configs,
             client,
             cli_timeout,
             &output,
@@ -1573,7 +1586,7 @@ fn reset_to_home(app: &mut App) {
     app.pipeline_edit_field = PipelineEditField::Name;
     app.pipeline_edit_name_buf.clear();
     app.pipeline_edit_name_cursor = 0;
-    app.pipeline_edit_provider_idx = 0;
+    app.pipeline_edit_agent_idx = 0;
     app.pipeline_edit_prompt_buf.clear();
     app.pipeline_edit_prompt_cursor = 0;
     app.pipeline_edit_session_buf.clear();
@@ -2771,6 +2784,7 @@ fn parse_agent_iteration_filename(name: &str, agent_key: &str) -> Option<u32> {
     iter_str.parse::<u32>().ok()
 }
 
+#[cfg(test)]
 fn parse_block_iteration_filename(name: &str) -> Option<u32> {
     if !name.ends_with(".md") {
         return None;
@@ -3481,7 +3495,7 @@ mod tests {
         write_agent_iter(dir.path(), "anthropic", 1);
         fs::write(dir.path().join("block1_openai_iter3.md"), "test").unwrap();
         fs::write(dir.path().join("block2_gemini_iter3.md"), "test").unwrap();
-        assert_eq!(find_last_iteration(dir.path()), Some(3));
+        assert_eq!(find_last_iteration(dir.path(), &[]), Some(3));
     }
 
     #[test]

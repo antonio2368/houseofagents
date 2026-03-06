@@ -139,11 +139,12 @@ impl OutputManager {
     pub fn write_block_output(
         &self,
         block_id: u32,
-        kind: ProviderKind,
+        agent_name: &str,
         iteration: u32,
         content: &str,
     ) -> Result<PathBuf, AppError> {
-        let filename = format!("block{}_{}_iter{}.md", block_id, kind.config_key(), iteration);
+        let sanitized = Self::sanitize_session_name(agent_name);
+        let filename = format!("block{}_{}_iter{}.md", block_id, sanitized, iteration);
         let path = self.run_dir.join(&filename);
         std::fs::write(&path, content)?;
         Ok(path)

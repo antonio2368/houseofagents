@@ -128,7 +128,7 @@ pub struct App {
     pub pipeline_edit_field: PipelineEditField,
     pub pipeline_edit_name_buf: String,
     pub pipeline_edit_name_cursor: usize,
-    pub pipeline_edit_provider_idx: usize,
+    pub pipeline_edit_agent_idx: usize,
     pub pipeline_edit_prompt_buf: String,
     pub pipeline_edit_prompt_cursor: usize,
     pub pipeline_edit_session_buf: String,
@@ -193,7 +193,7 @@ pub enum PipelineFocus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineEditField {
     Name,
-    Provider,
+    Agent,
     Prompt,
     SessionId,
 }
@@ -307,7 +307,7 @@ impl App {
             pipeline_edit_field: PipelineEditField::Name,
             pipeline_edit_name_buf: String::new(),
             pipeline_edit_name_cursor: 0,
-            pipeline_edit_provider_idx: 0,
+            pipeline_edit_agent_idx: 0,
             pipeline_edit_prompt_buf: String::new(),
             pipeline_edit_prompt_cursor: 0,
             pipeline_edit_session_buf: String::new(),

@@ -426,13 +426,13 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                     });
                 }
             }
-            ProgressEvent::BlockLog { kind, message, .. } => {
+            ProgressEvent::BlockLog { agent_name, message, .. } => {
                 if message.contains("consolidating reports")
                     || message.contains("analyzing reports for errors")
                     || message.contains("Diagnostic report saved to")
                 {
                     rows.push(Row::Log {
-                        name: kind.display_name().to_string(),
+                        name: agent_name.clone(),
                         message: message.clone(),
                     });
                 }
@@ -535,11 +535,11 @@ fn collect_active_agent_logs(app: &App) -> Vec<(String, String)> {
                 ..
             } => Some((agent.clone(), format!("[iter {iteration}] {message}"))),
             ProgressEvent::BlockLog {
-                kind,
+                agent_name,
                 iteration,
                 message,
                 ..
-            } => Some((kind.display_name().to_string(), format!("[iter {iteration}] {message}"))),
+            } => Some((agent_name.clone(), format!("[iter {iteration}] {message}"))),
             _ => None,
         })
         .take(10)
@@ -880,13 +880,13 @@ mod tests {
         a.progress_events = vec![
             ProgressEvent::BlockStarted {
                 block_id: 1,
-                kind: ProviderKind::Anthropic,
+                agent_name: "Claude".into(),
                 label: "Block 1 (Claude)".into(),
                 iteration: 1,
             },
             ProgressEvent::BlockStarted {
                 block_id: 2,
-                kind: ProviderKind::OpenAI,
+                agent_name: "Codex".into(),
                 label: "Block 2 (Codex)".into(),
                 iteration: 1,
             },
@@ -905,19 +905,19 @@ mod tests {
         a.progress_events = vec![
             ProgressEvent::BlockStarted {
                 block_id: 1,
-                kind: ProviderKind::Anthropic,
+                agent_name: "Claude".into(),
                 label: "Block 1 (Claude)".into(),
                 iteration: 1,
             },
             ProgressEvent::BlockFinished {
                 block_id: 1,
-                kind: ProviderKind::Anthropic,
+                agent_name: "Claude".into(),
                 label: "Block 1 (Claude)".into(),
                 iteration: 1,
             },
             ProgressEvent::BlockStarted {
                 block_id: 2,
-                kind: ProviderKind::OpenAI,
+                agent_name: "Codex".into(),
                 label: "Block 2 (Codex)".into(),
                 iteration: 1,
             },
@@ -934,7 +934,7 @@ mod tests {
         a.selected_mode = ExecutionMode::Pipeline;
         a.progress_events = vec![ProgressEvent::BlockFinished {
             block_id: 1,
-            kind: ProviderKind::Anthropic,
+            agent_name: "Claude".into(),
             label: "Block 1 (Claude)".into(),
             iteration: 1,
         }];

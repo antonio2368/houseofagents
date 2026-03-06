@@ -1,8 +1,8 @@
 use crate::app::{App, PipelineDialogMode, PipelineEditField, PipelineFocus};
 use crate::execution::pipeline::BlockId;
 use crate::execution::truncate_chars;
-use crate::provider::ProviderKind;
 use crate::screen::centered_rect;
+use crate::screen::prompt::prompt_cursor_layout;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -71,14 +71,47 @@ fn draw_prompt_area(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(prompt_style);
     let inner = prompt_block.inner(cols[0]);
-    f.render_widget(prompt_block, cols[0]);
-    let prompt_text = if app.pipeline_def.initial_prompt.is_empty() && !prompt_focus {
-        Paragraph::new("Enter initial prompt...")
-            .style(Style::default().fg(Color::DarkGray))
+
+    let display_text = if app.pipeline_def.initial_prompt.is_empty() && !prompt_focus {
+        "Enter initial prompt..."
     } else {
-        Paragraph::new(app.pipeline_def.initial_prompt.as_str())
+        app.pipeline_def.initial_prompt.as_str()
     };
-    f.render_widget(prompt_text, inner);
+
+    let text_style = if app.pipeline_def.initial_prompt.is_empty() && !prompt_focus {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    };
+
+    let (scroll_y, cursor_col, cursor_row) = if prompt_focus {
+        prompt_cursor_layout(
+            app.pipeline_def.initial_prompt.as_str(),
+            app.pipeline_prompt_cursor,
+            inner.width as usize,
+            inner.height as usize,
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    let prompt_p = Paragraph::new(display_text)
+        .style(text_style)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+    f.render_widget(prompt_block, cols[0]);
+    f.render_widget(prompt_p, inner);
+
+    let has_overlay =
+        app.pipeline_show_edit || app.pipeline_file_dialog.is_some() || app.error_modal.is_some();
+    if prompt_focus && !has_overlay && inner.width > 0 && inner.height > 0 {
+        let visible_row = cursor_row.saturating_sub(scroll_y as usize);
+        let x =
+            inner.x + (cursor_col.min(inner.width.saturating_sub(1) as usize) as u16);
+        let y = inner.y
+            + (visible_row.min(inner.height.saturating_sub(1) as usize) as u16);
+        f.set_cursor_position((x, y));
+    }
 
     // Iterations field
     let iter_focus = app.pipeline_focus == PipelineFocus::Iterations;
@@ -169,7 +202,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         };
 
         let title = if block.name.is_empty() {
-            format!(" {} ", block.provider.display_name())
+            format!(" {} ", block.agent)
         } else {
             format!(" {} ", block.name)
         };
@@ -181,14 +214,14 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         let inner = block_widget.inner(block_area);
         f.render_widget(block_widget, block_area);
 
-        // Line 1: Provider name
+        // Line 1: Agent name
         if inner.height > 0 && inner.width > 0 {
-            let provider_name = block.provider.display_name();
-            let prov_p = Paragraph::new(Span::styled(
-                provider_name,
+            let agent_display = truncate_chars(&block.agent, inner.width as usize);
+            let agent_p = Paragraph::new(Span::styled(
+                agent_display,
                 Style::default().fg(Color::White),
             ));
-            f.render_widget(prov_p, Rect::new(inner.x, inner.y, inner.width, 1));
+            f.render_widget(agent_p, Rect::new(inner.x, inner.y, inner.width, 1));
         }
 
         // Line 2: Prompt status
@@ -394,33 +427,32 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(name_line), chunks[0]);
 
-    // Provider selector
-    let prov_focus = app.pipeline_edit_field == PipelineEditField::Provider;
-    let all_providers = ProviderKind::all();
-    let provider = all_providers
-        .get(app.pipeline_edit_provider_idx)
-        .copied()
-        .unwrap_or(ProviderKind::Anthropic);
-    let avail_map: std::collections::HashMap<ProviderKind, bool> =
-        app.available_providers().into_iter().collect();
-    let is_avail = avail_map.get(&provider).copied().unwrap_or(false);
-    let prov_color = if is_avail { Color::Green } else { Color::Red };
-    let arrow_style = Style::default().fg(if prov_focus {
+    // Agent selector
+    let agent_focus = app.pipeline_edit_field == PipelineEditField::Agent;
+    let agent_name = app.config.agents
+        .get(app.pipeline_edit_agent_idx)
+        .map(|a| a.name.as_str())
+        .unwrap_or("(none)");
+    let avail_agents: std::collections::HashMap<&str, bool> =
+        app.available_agents().into_iter().map(|(a, avail)| (a.name.as_str(), avail)).collect();
+    let is_avail = avail_agents.get(agent_name).copied().unwrap_or(false);
+    let agent_color = if is_avail { Color::Green } else { Color::Red };
+    let arrow_style = Style::default().fg(if agent_focus {
         Color::White
     } else {
         Color::DarkGray
     });
-    let prov_line = Line::from(vec![
-        Span::styled("Provider: ", Style::default().fg(Color::White)),
+    let agent_line = Line::from(vec![
+        Span::styled("Agent: ", Style::default().fg(Color::White)),
         Span::styled("\u{25c4} ", arrow_style),
         Span::styled(
-            provider.display_name(),
-            Style::default().fg(prov_color).add_modifier(Modifier::BOLD),
+            agent_name,
+            Style::default().fg(agent_color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" \u{25ba}", arrow_style),
     ]);
-    let prov_p = Paragraph::new(prov_line);
-    f.render_widget(prov_p, chunks[2]);
+    let agent_p = Paragraph::new(agent_line);
+    f.render_widget(agent_p, chunks[2]);
 
     // Prompt textarea
     let prompt_focus = app.pipeline_edit_field == PipelineEditField::Prompt;
