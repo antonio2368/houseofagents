@@ -10,17 +10,17 @@ use unicode_width::UnicodeWidthChar;
 pub fn draw(f: &mut Frame, app: &App) {
     let is_solo = app.selected_mode == ExecutionMode::Solo;
     let options_height = if is_solo { 0 } else { 3 };
-    let iterations_height = if is_solo { 0 } else { 3 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),                 // Title
-            Constraint::Min(0),                    // Prompt text area
-            Constraint::Length(3),                 // Session name
-            Constraint::Length(iterations_height), // Iterations
-            Constraint::Length(options_height),    // Options row (Resume / Forward Prompt)
-            Constraint::Length(3),                 // Help bar
+            Constraint::Length(3),              // Title
+            Constraint::Min(0),                 // Prompt text area
+            Constraint::Length(3),              // Session name
+            Constraint::Length(3),              // Iterations
+            Constraint::Length(3),              // Runs / concurrency
+            Constraint::Length(options_height), // Options row (Resume / Forward Prompt)
+            Constraint::Length(3),              // Help bar
         ])
         .split(f.area());
 
@@ -148,6 +148,49 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
     f.render_widget(iterations, chunks[3]);
 
+    let run_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[4]);
+
+    let runs_border = if app.prompt_focus == PromptFocus::Runs {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let runs_text = if app.prompt_focus == PromptFocus::Runs {
+        format!("{}_", app.runs_buf)
+    } else {
+        app.runs.to_string()
+    };
+    let runs_widget = Paragraph::new(runs_text).block(
+        Block::default()
+            .title(" Runs ")
+            .borders(Borders::ALL)
+            .border_style(runs_border),
+    );
+    f.render_widget(runs_widget, run_cols[0]);
+
+    let concurrency_border = if app.prompt_focus == PromptFocus::Concurrency {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let concurrency_text = if app.prompt_focus == PromptFocus::Concurrency {
+        format!("{}_", app.concurrency_buf)
+    } else if app.concurrency == 0 {
+        "0 (unlimited)".to_string()
+    } else {
+        app.concurrency.to_string()
+    };
+    let concurrency_widget = Paragraph::new(concurrency_text).block(
+        Block::default()
+            .title(" Concurrency ")
+            .borders(Borders::ALL)
+            .border_style(concurrency_border),
+    );
+    f.render_widget(concurrency_widget, run_cols[1]);
+
     // Options row: Resume + Forward Prompt (hidden for Solo)
     if !is_solo {
         let is_relay = app.selected_mode == ExecutionMode::Relay;
@@ -155,13 +198,13 @@ pub fn draw(f: &mut Frame, app: &App) {
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(chunks[4])
+                .split(chunks[5])
         } else {
             // Swarm: only Resume, full width
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(100), Constraint::Min(0)])
-                .split(chunks[4])
+                .split(chunks[5])
         };
 
         // Resume box
@@ -229,6 +272,22 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Span::raw(": back"),
             ]
         }
+        PromptFocus::Runs | PromptFocus::Concurrency => {
+            vec![
+                Span::styled("Type", Style::default().fg(Color::Yellow)),
+                Span::raw(": set value  "),
+                Span::styled("↑/+", Style::default().fg(Color::Yellow)),
+                Span::raw(": increase  "),
+                Span::styled("↓/-", Style::default().fg(Color::Yellow)),
+                Span::raw(": decrease  "),
+                Span::styled("0", Style::default().fg(Color::Yellow)),
+                Span::raw(": unlimited concurrency  "),
+                Span::styled("Tab", Style::default().fg(Color::Yellow)),
+                Span::raw(": next field  "),
+                Span::styled("Enter/F5", Style::default().fg(Color::Yellow)),
+                Span::raw(": run"),
+            ]
+        }
         PromptFocus::Text => {
             vec![
                 Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
@@ -271,7 +330,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
     };
     let help = Paragraph::new(Line::from(help_spans)).block(Block::default().borders(Borders::TOP));
-    f.render_widget(help, chunks[5]);
+    f.render_widget(help, chunks[6]);
 }
 
 /// Character-wrap text into visual lines matching `prompt_cursor_layout` wrapping.

@@ -34,12 +34,13 @@ Each agent can run in API mode or CLI mode (`use_cli = true`). Mix and match fre
 
 ## Features
 
-- **Terminal UI** — select agents, mode, prompt, and iteration count from an interactive TUI
+- **Terminal UI** — select agents, mode, prompt, iterations, run count, and concurrency from an interactive TUI
 - **Named agents** — define multiple agents per provider with independent configs
 - **Pipeline builder** — visual DAG editor for wiring arbitrary agent blocks with dependency-driven execution and independent per-connection routing
+- **Multiple runs** — launch N independent copies of the same setup in parallel with bounded concurrency
 - **Resume runs** — pick up where you left off in relay or swarm sessions
 - **Forward Prompt** — relay mode option to include the original prompt in every handoff
-- **Consolidation** — merge multi-agent output into a single final markdown file (any configured agent can consolidate)
+- **Consolidation** — merge multi-agent output within a run or across multiple runs (any configured agent can consolidate)
 - **Diagnostics** — optional post-run analysis pass that writes `errors.md`
 - **Config editor** — add/remove/rename agents, edit settings, timeouts, and models live with a popup (`e`)
 - **Model picker** — browse available models from the API directly inside the config editor (`l`)
@@ -225,13 +226,13 @@ Anthropic `thinking_effort = "max"` is rejected in API mode. In CLI mode, House 
 | `Enter` / `F5` | Start run |
 | `Esc` | Back |
 
-Fields vary by mode: Solo shows only Prompt and Session Name; Swarm adds Iterations and Resume; Relay adds Forward Prompt alongside Resume.
+Fields vary by mode for options, but every prompt flow now includes Prompt, Session Name, Iterations, Runs, and Concurrency. Solo still forces execution to one iteration, but multi-run batching is available there too.
 
 ### Pipeline Builder Screen
 
 | Key | Action |
 |-----|--------|
-| `Tab` / `Shift+Tab` | Cycle focus: Initial Prompt → Session Name → Iterations → Builder |
+| `Tab` / `Shift+Tab` | Cycle focus: Initial Prompt → Session Name → Iterations → Runs → Concurrency → Builder |
 | `a` | Add a new block |
 | `d` | Delete selected block |
 | `e` | Edit selected block (name, agent, prompt, session ID) |
@@ -240,7 +241,7 @@ Fields vary by mode: Solo shows only Prompt and Session Name; Swarm adds Iterati
 | `Arrow keys` / `h j k l` | Navigate/select blocks spatially without moving |
 | `Shift+Arrow keys` / `Shift+H J K L` | Move selected block (swap with occupied target cell, otherwise move) |
 | `Ctrl+Arrow keys` | Scroll the builder canvas |
-| `↑`/`+` `↓`/`-` | Increment / decrement iterations (when Iterations focused) |
+| `↑`/`+` `↓`/`-` | Increment / decrement iterations, runs, or concurrency on the focused numeric field |
 | `Ctrl+S` | Save pipeline (always prompts for filename, prefills current name) |
 | `Ctrl+L` | Load pipeline from file |
 | `F5` | Validate and run the pipeline |
@@ -262,7 +263,8 @@ Inside the **edit popup**: `Tab` cycles between Name, Agent (use `Left`/`Right`)
 
 | Key | Action |
 |-----|--------|
-| `Esc` | Cancel in-flight run |
+| `j` / `k` | Select run row in batch mode |
+| `Esc` | Cancel in-flight run or batch |
 | `Enter` | Open results after completion |
 | `q` | Quit after run completes |
 
@@ -271,7 +273,8 @@ Inside the **edit popup**: `Tab` cycles between Name, Agent (use `Left`/`Right`)
 | Key | Action |
 |-----|--------|
 | `j` / `k` | Navigate files |
-| `Enter` / `Esc` | Return to home |
+| `Enter` / `l` | Expand/collapse run groups in batch results |
+| `Esc` | Return to home |
 | `q` | Quit |
 
 > `Ctrl+C` exits from any screen (cancels an active run first).
@@ -307,11 +310,30 @@ output_dir/
 
 Directory names follow the pattern `YYYYMMDD_HHMMSS_<rand>` (with optional `_<session_name>` suffix).
 
+When `runs > 1`, House of Agents creates a batch root and one subdirectory per independent run:
+
+```
+output_dir/
+  20260308_222551_735_my_session/
+    batch.toml
+    cross_run_consolidation.md   # Optional: synthesis across successful runs
+    run_1/
+      prompt.md
+      session.toml
+      Claude_iter1.md
+      consolidation.md           # Optional: per-run synthesis
+    run_2/
+      ...
+```
+
 ## Resume, Consolidation & Diagnostics
 
 - **Resume** (toggle with `Space` on Prompt screen) — available for relay and swarm modes
   - With a session name: resumes the latest run matching that name
   - Without: resumes the latest compatible run (matching mode + agents)
+  - Batch roots are excluded from resume lookup; resume is currently single-run only
 - **Forward Prompt** (toggle with `Space` on Prompt screen) — relay mode only; when enabled, downstream agents receive the original prompt alongside the previous agent's output, preventing context loss in the handoff chain
-- **Consolidation** — offered after non-cancelled swarm/solo runs with 2+ agents; any configured agent can perform the consolidation (not limited to agents from the run)
+- **Consolidation**
+  - Single-run: offered after non-cancelled swarm/solo/pipeline runs with 2+ final outputs
+  - Batch: first offers per-run consolidation, then optional cross-run consolidation across successful runs
 - **Diagnostics** — when `diagnostic_provider` is set to an agent name, a final analysis pass writes `errors.md`

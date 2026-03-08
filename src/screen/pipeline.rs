@@ -74,10 +74,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // title
-            Constraint::Length(6), // prompt + session/iterations
-            Constraint::Min(0),    // builder canvas
-            Constraint::Length(2), // help + status
+            Constraint::Length(3),  // title
+            Constraint::Length(12), // prompt + session/iterations/runs/concurrency
+            Constraint::Min(0),     // builder canvas
+            Constraint::Length(2),  // help + status
         ])
         .split(area);
 
@@ -169,10 +169,15 @@ fn draw_prompt_area(f: &mut Frame, app: &App, area: Rect) {
         f.set_cursor_position((x, y));
     }
 
-    // Right column: session name + iterations
+    // Right column: session name + iterations + runs + concurrency
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(0),
+        ])
         .split(cols[1]);
 
     // Session name field
@@ -225,6 +230,46 @@ fn draw_prompt_area(f: &mut Frame, app: &App, area: Rect) {
             .border_style(iter_border),
     );
     f.render_widget(iter_widget, right_chunks[1]);
+
+    let runs_focus = app.pipeline_focus == PipelineFocus::Runs;
+    let runs_border = if runs_focus {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let runs_display = if runs_focus {
+        format!("{}_", app.pipeline_runs_buf)
+    } else {
+        app.pipeline_runs.to_string()
+    };
+    let runs_widget = Paragraph::new(runs_display).block(
+        Block::default()
+            .title(" Runs ")
+            .borders(Borders::ALL)
+            .border_style(runs_border),
+    );
+    f.render_widget(runs_widget, right_chunks[2]);
+
+    let concurrency_focus = app.pipeline_focus == PipelineFocus::Concurrency;
+    let concurrency_border = if concurrency_focus {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let concurrency_display = if concurrency_focus {
+        format!("{}_", app.pipeline_concurrency_buf)
+    } else if app.pipeline_concurrency == 0 {
+        "0 (unlimited)".to_string()
+    } else {
+        app.pipeline_concurrency.to_string()
+    };
+    let concurrency_widget = Paragraph::new(concurrency_display).block(
+        Block::default()
+            .title(" Concurrency ")
+            .borders(Borders::ALL)
+            .border_style(concurrency_border),
+    );
+    f.render_widget(concurrency_widget, right_chunks[3]);
 }
 
 fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {

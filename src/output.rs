@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use crate::execution::ExecutionMode;
-use chrono::Local;
+use chrono::{Local, Utc};
 use rand::Rng;
 use std::path::{Path, PathBuf};
 use toml::Value;
@@ -11,6 +11,16 @@ pub struct OutputManager {
 
 impl OutputManager {
     pub fn new(base_dir: &Path, session_name: Option<&str>) -> Result<Self, AppError> {
+        let run_dir = Self::build_run_dir(base_dir, session_name);
+        std::fs::create_dir_all(&run_dir)?;
+        Ok(Self { run_dir })
+    }
+
+    pub fn new_batch_parent(base_dir: &Path, session_name: Option<&str>) -> Result<Self, AppError> {
+        Self::new(base_dir, session_name)
+    }
+
+    fn build_run_dir(base_dir: &Path, session_name: Option<&str>) -> PathBuf {
         let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
         let suffix: u16 = rand::rng().random_range(100..999);
         let dir_name = match session_name {
@@ -20,9 +30,7 @@ impl OutputManager {
             }
             _ => format!("{}_{}", timestamp, suffix),
         };
-        let run_dir = base_dir.join(dir_name);
-        std::fs::create_dir_all(&run_dir)?;
-        Ok(Self { run_dir })
+        base_dir.join(dir_name)
     }
 
     pub fn from_existing(run_dir: PathBuf) -> Result<Self, AppError> {
@@ -64,6 +72,9 @@ impl OutputManager {
             }
             let name = entry.file_name().to_string_lossy().to_string();
             if name.ends_with(&suffix) {
+                if Self::is_batch_root(&entry.path()) {
+                    continue;
+                }
                 matches.push((name, entry.path()));
             }
         }
@@ -74,6 +85,16 @@ impl OutputManager {
 
     pub fn run_dir(&self) -> &PathBuf {
         &self.run_dir
+    }
+
+    pub fn is_batch_root(path: &Path) -> bool {
+        path.join("batch.toml").is_file()
+    }
+
+    pub fn new_run_subdir(&self, run_id: u32) -> Result<Self, AppError> {
+        let run_dir = self.run_dir.join(format!("run_{run_id}"));
+        std::fs::create_dir_all(&run_dir)?;
+        Ok(Self { run_dir })
     }
 
     pub fn write_prompt(&self, prompt: &str) -> Result<(), AppError> {
@@ -181,6 +202,31 @@ impl OutputManager {
         Ok(())
     }
 
+    pub fn write_batch_info(
+        &self,
+        runs: u32,
+        concurrency: u32,
+        mode: &ExecutionMode,
+        agents: &[String],
+        iterations: u32,
+    ) -> Result<(), AppError> {
+        let mut root = toml::map::Map::new();
+        root.insert("runs".into(), Value::Integer(runs as i64));
+        root.insert("concurrency".into(), Value::Integer(concurrency as i64));
+        root.insert("mode".into(), Value::String(mode.as_str().to_string()));
+        root.insert(
+            "agents".into(),
+            Value::Array(agents.iter().cloned().map(Value::String).collect()),
+        );
+        root.insert("iterations".into(), Value::Integer(iterations as i64));
+        root.insert("timestamp".into(), Value::String(Utc::now().to_rfc3339()));
+
+        let content = toml::to_string_pretty(&Value::Table(root))
+            .map_err(|e| AppError::Config(format!("Failed to serialize batch info: {e}")))?;
+        std::fs::write(self.run_dir.join("batch.toml"), content)?;
+        Ok(())
+    }
+
     pub fn append_error(&self, error: &str) -> Result<(), AppError> {
         use std::io::Write;
         let path = self.run_dir.join("_errors.log");
@@ -277,6 +323,51 @@ mod tests {
             .expect("find")
             .expect("some");
         assert_eq!(found, p2);
+    }
+
+    #[test]
+    fn find_latest_session_run_skips_batch_roots() {
+        let base = tempdir().expect("tempdir");
+        let batch_root = base.path().join("20260201_000000_222_alpha");
+        let single_root = base.path().join("20260101_000000_111_alpha");
+        std::fs::create_dir_all(&batch_root).expect("mkdir");
+        std::fs::create_dir_all(&single_root).expect("mkdir");
+        std::fs::write(batch_root.join("batch.toml"), "runs = 2").expect("write batch");
+
+        let found = OutputManager::find_latest_session_run(base.path(), "alpha")
+            .expect("find")
+            .expect("some");
+        assert_eq!(found, single_root);
+    }
+
+    #[test]
+    fn new_run_subdir_creates_child_directory() {
+        let base = tempdir().expect("tempdir");
+        let mgr = OutputManager::new_batch_parent(base.path(), Some("batch")).expect("batch");
+        let child = mgr.new_run_subdir(3).expect("run subdir");
+        assert_eq!(child.run_dir(), &mgr.run_dir().join("run_3"));
+        assert!(child.run_dir().exists());
+    }
+
+    #[test]
+    fn write_batch_info_writes_expected_fields() {
+        let base = tempdir().expect("tempdir");
+        let mgr = OutputManager::new_batch_parent(base.path(), Some("batch")).expect("batch");
+        mgr.write_batch_info(
+            5,
+            3,
+            &ExecutionMode::Relay,
+            &["Claude".into(), "OpenAI".into()],
+            2,
+        )
+        .expect("batch info");
+
+        let content = std::fs::read_to_string(mgr.run_dir().join("batch.toml")).expect("read");
+        let value = content.parse::<Value>().expect("toml");
+        assert_eq!(value["runs"].as_integer(), Some(5));
+        assert_eq!(value["concurrency"].as_integer(), Some(3));
+        assert_eq!(value["mode"].as_str(), Some("relay"));
+        assert_eq!(value["iterations"].as_integer(), Some(2));
     }
 
     #[test]

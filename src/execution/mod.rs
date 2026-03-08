@@ -1,3 +1,4 @@
+pub mod multi;
 pub mod pipeline;
 pub mod relay;
 pub mod solo;
@@ -129,6 +130,33 @@ pub enum ProgressEvent {
         reason: String,
     },
     AllDone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    Done,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub enum BatchProgressEvent {
+    RunQueued {
+        run_id: u32,
+    },
+    RunStarted {
+        run_id: u32,
+    },
+    RunEvent {
+        run_id: u32,
+        event: ProgressEvent,
+    },
+    RunFinished {
+        run_id: u32,
+        outcome: RunOutcome,
+        error: Option<String>,
+    },
+    AllRunsDone,
 }
 
 pub async fn wait_for_cancel(cancel: &Arc<AtomicBool>) {

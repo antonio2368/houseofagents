@@ -1,14 +1,16 @@
 use crate::app::{
-    App, ConsolidationPhase, EditField, EditPopupSection, HomeSection, PipelineDialogMode,
-    PipelineEditField, PipelineFocus, PromptFocus, Screen,
+    App, BatchRunGroup, ConsolidationPhase, ConsolidationTarget, EditField, EditPopupSection,
+    HomeSection, PipelineDialogMode, PipelineEditField, PipelineFocus, PromptFocus, RunState,
+    RunStatus, RunStepStatus, Screen,
 };
 use crate::config::{AgentConfig, ProviderConfig};
 use crate::event::{Event, EventHandler};
+use crate::execution::multi::run_multi;
 use crate::execution::pipeline::{self as pipeline_mod, BlockId};
 use crate::execution::relay::run_relay;
 use crate::execution::solo::run_solo;
 use crate::execution::swarm::run_swarm;
-use crate::execution::{ExecutionMode, ProgressEvent};
+use crate::execution::{BatchProgressEvent, ExecutionMode, ProgressEvent, RunOutcome};
 use crate::output::OutputManager;
 use crate::provider::{self, ProviderKind};
 
@@ -17,11 +19,12 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use std::collections::HashMap;
 use std::io::{self, stdout};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -64,6 +67,15 @@ pub async fn run(app: &mut App) -> anyhow::Result<()> {
                 }
             } => {
                 handle_progress(app, progress);
+            }
+            Some(progress) = async {
+                if let Some(ref mut rx) = app.batch_progress_rx {
+                    rx.recv().await
+                } else {
+                    std::future::pending::<Option<BatchProgressEvent>>().await
+                }
+            } => {
+                handle_batch_progress(app, progress);
             }
             Some(result) = async {
                 if let Some(ref mut rx) = app.model_picker_rx {
@@ -237,6 +249,8 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
                 app.pipeline_focus = PipelineFocus::InitialPrompt;
                 app.pipeline_prompt_cursor = app.pipeline_def.initial_prompt.len();
                 app.pipeline_iterations_buf = app.pipeline_def.iterations.to_string();
+                app.pipeline_runs_buf = app.pipeline_runs.to_string();
+                app.pipeline_concurrency_buf = app.pipeline_concurrency.to_string();
             } else if app.selected_agents.is_empty() {
                 app.error_modal = Some("Select at least one agent".into());
             } else {
@@ -244,6 +258,8 @@ fn handle_home_key(app: &mut App, key: KeyEvent) {
                 app.prompt_focus = PromptFocus::Text;
                 app.prompt_cursor = app.prompt_text.len();
                 app.iterations_buf = app.iterations.to_string();
+                app.runs_buf = app.runs.to_string();
+                app.concurrency_buf = app.concurrency.to_string();
                 app.resume_previous = false;
                 app.forward_prompt = false;
             }
@@ -283,18 +299,30 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             sync_iterations_buf(app);
+            sync_runs_buf(app);
+            sync_concurrency_buf(app);
             app.screen = Screen::Home;
         }
         KeyCode::Tab => {
             app.prompt_focus = match (&app.prompt_focus, app.selected_mode) {
                 (PromptFocus::Text, _) => PromptFocus::SessionName,
-                (PromptFocus::SessionName, ExecutionMode::Solo) => PromptFocus::Text,
                 (PromptFocus::SessionName, _) => {
                     app.iterations_buf = app.iterations.to_string();
                     PromptFocus::Iterations
                 }
                 (PromptFocus::Iterations, _) => {
                     sync_iterations_buf(app);
+                    app.runs_buf = app.runs.to_string();
+                    PromptFocus::Runs
+                }
+                (PromptFocus::Runs, _) => {
+                    sync_runs_buf(app);
+                    app.concurrency_buf = app.concurrency.to_string();
+                    PromptFocus::Concurrency
+                }
+                (PromptFocus::Concurrency, ExecutionMode::Solo) => PromptFocus::Text,
+                (PromptFocus::Concurrency, _) => {
+                    sync_concurrency_buf(app);
                     PromptFocus::Resume
                 }
                 (PromptFocus::Resume, ExecutionMode::Relay) => PromptFocus::ForwardPrompt,
@@ -304,7 +332,7 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::BackTab => {
             app.prompt_focus = match (&app.prompt_focus, app.selected_mode) {
-                (PromptFocus::Text, ExecutionMode::Solo) => PromptFocus::SessionName,
+                (PromptFocus::Text, ExecutionMode::Solo) => PromptFocus::Concurrency,
                 (PromptFocus::Text, ExecutionMode::Relay) => PromptFocus::ForwardPrompt,
                 (PromptFocus::Text, _) => PromptFocus::Resume,
                 (PromptFocus::SessionName, _) => PromptFocus::Text,
@@ -312,15 +340,30 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                     sync_iterations_buf(app);
                     PromptFocus::SessionName
                 }
-                (PromptFocus::Resume, _) => {
+                (PromptFocus::Runs, _) => {
+                    sync_runs_buf(app);
                     app.iterations_buf = app.iterations.to_string();
                     PromptFocus::Iterations
+                }
+                (PromptFocus::Concurrency, _) => {
+                    sync_concurrency_buf(app);
+                    app.runs_buf = app.runs.to_string();
+                    PromptFocus::Runs
+                }
+                (PromptFocus::Resume, _) => {
+                    app.concurrency_buf = app.concurrency.to_string();
+                    PromptFocus::Concurrency
                 }
                 (PromptFocus::ForwardPrompt, _) => PromptFocus::Resume,
             };
         }
         KeyCode::Char(' ') if app.prompt_focus == PromptFocus::Resume => {
-            app.resume_previous = !app.resume_previous;
+            if !resume_allowed_in_prompt(app) {
+                app.resume_previous = false;
+                app.error_modal = Some("Resume is only supported for single-run execution".into());
+            } else {
+                app.resume_previous = !app.resume_previous;
+            }
         }
         KeyCode::Char(' ') if app.prompt_focus == PromptFocus::ForwardPrompt => {
             app.forward_prompt = !app.forward_prompt;
@@ -329,6 +372,8 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
             if key.code == KeyCode::F(5) || app.prompt_focus != PromptFocus::Text =>
         {
             sync_iterations_buf(app);
+            sync_runs_buf(app);
+            sync_concurrency_buf(app);
             if app.prompt_text.trim().is_empty()
                 && !(app.resume_previous
                     && matches!(
@@ -386,6 +431,56 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                     _ => {}
                 }
             }
+            PromptFocus::Runs => match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.runs_buf.push(c);
+                    sync_runs_buf(app);
+                    enforce_prompt_resume_constraints(app);
+                }
+                KeyCode::Backspace => {
+                    app.runs_buf.pop();
+                    if app.runs_buf.is_empty() {
+                        app.runs = 1;
+                    } else {
+                        sync_runs_buf(app);
+                    }
+                    enforce_prompt_resume_constraints(app);
+                }
+                KeyCode::Up | KeyCode::Char('+') => {
+                    app.runs = (app.runs + 1).min(99);
+                    app.runs_buf = app.runs.to_string();
+                    enforce_prompt_resume_constraints(app);
+                }
+                KeyCode::Down | KeyCode::Char('-') => {
+                    app.runs = app.runs.saturating_sub(1).max(1);
+                    app.runs_buf = app.runs.to_string();
+                    enforce_prompt_resume_constraints(app);
+                }
+                _ => {}
+            },
+            PromptFocus::Concurrency => match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.concurrency_buf.push(c);
+                    sync_concurrency_buf(app);
+                }
+                KeyCode::Backspace => {
+                    app.concurrency_buf.pop();
+                    if app.concurrency_buf.is_empty() {
+                        app.concurrency = 0;
+                    } else {
+                        sync_concurrency_buf(app);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('+') => {
+                    app.concurrency = (app.concurrency + 1).min(99);
+                    app.concurrency_buf = app.concurrency.to_string();
+                }
+                KeyCode::Down | KeyCode::Char('-') => {
+                    app.concurrency = app.concurrency.saturating_sub(1);
+                    app.concurrency_buf = app.concurrency.to_string();
+                }
+                _ => {}
+            },
             PromptFocus::Resume | PromptFocus::ForwardPrompt => {}
         },
     }
@@ -702,6 +797,22 @@ fn handle_pipeline_paste(app: &mut App, text: &str) {
                     app.pipeline_iterations_buf = v.to_string();
                 }
             }
+            PipelineFocus::Runs => {
+                for ch in text.chars() {
+                    if ch.is_ascii_digit() {
+                        app.pipeline_runs_buf.push(ch);
+                    }
+                }
+                sync_pipeline_runs_buf(app);
+            }
+            PipelineFocus::Concurrency => {
+                for ch in text.chars() {
+                    if ch.is_ascii_digit() {
+                        app.pipeline_concurrency_buf.push(ch);
+                    }
+                }
+                sync_pipeline_concurrency_buf(app);
+            }
             PipelineFocus::Builder => {}
         }
     }
@@ -771,13 +882,18 @@ fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
     // Normal pipeline keys
     match key.code {
         KeyCode::Esc => {
+            sync_pipeline_iterations_buf(app);
+            sync_pipeline_runs_buf(app);
+            sync_pipeline_concurrency_buf(app);
             app.screen = Screen::Home;
         }
         KeyCode::Tab => {
             app.pipeline_focus = match app.pipeline_focus {
                 PipelineFocus::InitialPrompt => PipelineFocus::SessionName,
                 PipelineFocus::SessionName => PipelineFocus::Iterations,
-                PipelineFocus::Iterations => PipelineFocus::Builder,
+                PipelineFocus::Iterations => PipelineFocus::Runs,
+                PipelineFocus::Runs => PipelineFocus::Concurrency,
+                PipelineFocus::Concurrency => PipelineFocus::Builder,
                 PipelineFocus::Builder => PipelineFocus::InitialPrompt,
             };
         }
@@ -786,7 +902,9 @@ fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
                 PipelineFocus::InitialPrompt => PipelineFocus::Builder,
                 PipelineFocus::SessionName => PipelineFocus::InitialPrompt,
                 PipelineFocus::Iterations => PipelineFocus::SessionName,
-                PipelineFocus::Builder => PipelineFocus::Iterations,
+                PipelineFocus::Runs => PipelineFocus::Iterations,
+                PipelineFocus::Concurrency => PipelineFocus::Runs,
+                PipelineFocus::Builder => PipelineFocus::Concurrency,
             };
         }
         KeyCode::Char('?') if !ctrl => {
@@ -840,25 +958,70 @@ fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
             PipelineFocus::Iterations => match key.code {
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     app.pipeline_iterations_buf.push(c);
-                    let v: u32 = app
-                        .pipeline_iterations_buf
-                        .parse()
-                        .unwrap_or(1)
-                        .clamp(1, 99);
-                    app.pipeline_iterations_buf = v.to_string();
+                    sync_pipeline_iterations_buf(app);
                 }
                 KeyCode::Backspace => {
                     app.pipeline_iterations_buf.pop();
+                    if app.pipeline_iterations_buf.is_empty() {
+                        app.pipeline_def.iterations = 1;
+                    } else {
+                        sync_pipeline_iterations_buf(app);
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('+') => {
-                    let v: u32 = app.pipeline_iterations_buf.parse().unwrap_or(1);
-                    let v = (v + 1).min(99);
-                    app.pipeline_iterations_buf = v.to_string();
+                    app.pipeline_def.iterations = (app.pipeline_def.iterations + 1).min(99);
+                    app.pipeline_iterations_buf = app.pipeline_def.iterations.to_string();
                 }
                 KeyCode::Down | KeyCode::Char('-') => {
-                    let v: u32 = app.pipeline_iterations_buf.parse().unwrap_or(1);
-                    let v = v.saturating_sub(1).max(1);
-                    app.pipeline_iterations_buf = v.to_string();
+                    app.pipeline_def.iterations =
+                        app.pipeline_def.iterations.saturating_sub(1).max(1);
+                    app.pipeline_iterations_buf = app.pipeline_def.iterations.to_string();
+                }
+                _ => {}
+            },
+            PipelineFocus::Runs => match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.pipeline_runs_buf.push(c);
+                    sync_pipeline_runs_buf(app);
+                }
+                KeyCode::Backspace => {
+                    app.pipeline_runs_buf.pop();
+                    if app.pipeline_runs_buf.is_empty() {
+                        app.pipeline_runs = 1;
+                    } else {
+                        sync_pipeline_runs_buf(app);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('+') => {
+                    app.pipeline_runs = (app.pipeline_runs + 1).min(99);
+                    app.pipeline_runs_buf = app.pipeline_runs.to_string();
+                }
+                KeyCode::Down | KeyCode::Char('-') => {
+                    app.pipeline_runs = app.pipeline_runs.saturating_sub(1).max(1);
+                    app.pipeline_runs_buf = app.pipeline_runs.to_string();
+                }
+                _ => {}
+            },
+            PipelineFocus::Concurrency => match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.pipeline_concurrency_buf.push(c);
+                    sync_pipeline_concurrency_buf(app);
+                }
+                KeyCode::Backspace => {
+                    app.pipeline_concurrency_buf.pop();
+                    if app.pipeline_concurrency_buf.is_empty() {
+                        app.pipeline_concurrency = 0;
+                    } else {
+                        sync_pipeline_concurrency_buf(app);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('+') => {
+                    app.pipeline_concurrency = (app.pipeline_concurrency + 1).min(99);
+                    app.pipeline_concurrency_buf = app.pipeline_concurrency.to_string();
+                }
+                KeyCode::Down | KeyCode::Char('-') => {
+                    app.pipeline_concurrency = app.pipeline_concurrency.saturating_sub(1);
+                    app.pipeline_concurrency_buf = app.pipeline_concurrency.to_string();
                 }
                 _ => {}
             },
@@ -1342,6 +1505,10 @@ fn handle_pipeline_remove_conn_key(app: &mut App, key: KeyEvent) {
 }
 
 fn start_pipeline_execution(app: &mut App) {
+    sync_pipeline_iterations_buf(app);
+    sync_pipeline_runs_buf(app);
+    sync_pipeline_concurrency_buf(app);
+
     // Validate
     if app.pipeline_def.blocks.is_empty() {
         app.error_modal = Some("Add at least one block before running".into());
@@ -1390,12 +1557,7 @@ fn start_pipeline_execution(app: &mut App) {
     }
 
     // Set running state
-    app.screen = Screen::Running;
-    app.progress_events.clear();
-    app.is_running = true;
-    app.run_error = None;
-    app.consolidation_active = false;
-    app.diagnostic_running = false;
+    reset_running_state(app);
 
     // Copy prompt/session for running screen display
     app.prompt_text = app.pipeline_def.initial_prompt.clone();
@@ -1439,6 +1601,14 @@ fn start_pipeline_execution(app: &mut App) {
             return;
         }
     };
+
+    let runs = app.pipeline_runs.max(1);
+    let concurrency = effective_concurrency(runs, app.pipeline_concurrency);
+
+    if runs > 1 {
+        start_multi_pipeline_execution(app, client, iterations, runs, concurrency, agent_configs);
+        return;
+    }
 
     // Output — use session name (not pipeline filename) for output dir
     let session_name = if app.pipeline_session_name.trim().is_empty() {
@@ -1567,6 +1737,14 @@ fn handle_running_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
+        KeyCode::Up | KeyCode::Char('k') if app.multi_run_total > 1 => {
+            app.multi_run_cursor = app.multi_run_cursor.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.multi_run_total > 1 => {
+            if app.multi_run_cursor + 1 < app.multi_run_states.len() {
+                app.multi_run_cursor += 1;
+            }
+        }
         KeyCode::Esc if app.is_running => {
             app.cancel_flag.store(true, Ordering::Relaxed);
         }
@@ -1592,6 +1770,11 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
     match app.consolidation_phase {
         ConsolidationPhase::Confirm => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
+                app.consolidation_target = if app.multi_run_total > 1 {
+                    ConsolidationTarget::BatchPerRun
+                } else {
+                    ConsolidationTarget::SingleRun
+                };
                 app.consolidation_phase = if app.config.agents.len() <= 1 {
                     ConsolidationPhase::Prompt
                 } else {
@@ -1599,8 +1782,14 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
                 };
             }
             KeyCode::Char('n') | KeyCode::Esc => {
-                app.consolidation_active = false;
-                maybe_start_diagnostics(app);
+                if app.multi_run_total > 1 {
+                    app.consolidation_target = ConsolidationTarget::BatchCrossRun;
+                    app.consolidation_phase = ConsolidationPhase::CrossRunConfirm;
+                    app.consolidation_prompt.clear();
+                } else {
+                    app.consolidation_active = false;
+                    maybe_start_diagnostics(app);
+                }
             }
             KeyCode::Char('q') => app.should_quit = true,
             _ => {}
@@ -1617,10 +1806,20 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
                 }
             }
             KeyCode::Enter => {
-                app.consolidation_phase = ConsolidationPhase::Prompt;
+                app.consolidation_phase =
+                    if app.consolidation_target == ConsolidationTarget::BatchCrossRun {
+                        ConsolidationPhase::CrossRunPrompt
+                    } else {
+                        ConsolidationPhase::Prompt
+                    };
             }
             KeyCode::Esc => {
-                app.consolidation_phase = ConsolidationPhase::Confirm;
+                app.consolidation_phase =
+                    if app.consolidation_target == ConsolidationTarget::BatchCrossRun {
+                        ConsolidationPhase::CrossRunConfirm
+                    } else {
+                        ConsolidationPhase::Confirm
+                    };
             }
             KeyCode::Char('q') => app.should_quit = true,
             _ => {}
@@ -1640,6 +1839,37 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
             }
             _ => {}
         },
+        ConsolidationPhase::CrossRunConfirm => match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                app.consolidation_target = ConsolidationTarget::BatchCrossRun;
+                app.consolidation_phase = if app.config.agents.len() <= 1 {
+                    ConsolidationPhase::CrossRunPrompt
+                } else {
+                    ConsolidationPhase::Provider
+                };
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                app.consolidation_active = false;
+                maybe_start_diagnostics(app);
+            }
+            KeyCode::Char('q') => app.should_quit = true,
+            _ => {}
+        },
+        ConsolidationPhase::CrossRunPrompt => match key.code {
+            KeyCode::Enter => start_consolidation(app),
+            KeyCode::Backspace => {
+                app.consolidation_prompt.pop();
+            }
+            KeyCode::Char(c) => app.consolidation_prompt.push(c),
+            KeyCode::Esc => {
+                app.consolidation_phase = if app.config.agents.len() <= 1 {
+                    ConsolidationPhase::CrossRunConfirm
+                } else {
+                    ConsolidationPhase::Provider
+                };
+            }
+            _ => {}
+        },
     }
 }
 
@@ -1651,12 +1881,30 @@ fn handle_results_key(app: &mut App, key: KeyEvent) {
             update_preview(app);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.result_cursor < app.result_files.len().saturating_sub(1) {
+            if has_batch_result_tree(app) {
+                let max = batch_result_visible_len(app).saturating_sub(1);
+                if app.result_cursor < max {
+                    app.result_cursor += 1;
+                }
+            } else if app.result_cursor < app.result_files.len().saturating_sub(1) {
                 app.result_cursor += 1;
             }
             update_preview(app);
         }
-        KeyCode::Enter | KeyCode::Esc => reset_to_home(app),
+        KeyCode::Enter | KeyCode::Char('l') if has_batch_result_tree(app) => {
+            if let Some(BatchResultEntry::RunHeader(run_id)) =
+                batch_result_entry_at(app, app.result_cursor)
+            {
+                if !app.batch_result_expanded.insert(run_id) {
+                    app.batch_result_expanded.remove(&run_id);
+                }
+                update_preview(app);
+            } else {
+                reset_to_home(app);
+            }
+        }
+        KeyCode::Esc => reset_to_home(app),
+        KeyCode::Enter => reset_to_home(app),
         _ => {}
     }
 }
@@ -1672,16 +1920,34 @@ fn reset_to_home(app: &mut App) {
     app.result_preview.clear();
     app.iterations = 1;
     app.iterations_buf = "1".into();
+    app.runs = 1;
+    app.runs_buf = "1".into();
+    app.concurrency = 0;
+    app.concurrency_buf = "0".into();
     app.resume_previous = false;
     app.forward_prompt = false;
     app.consolidation_active = false;
     app.consolidation_phase = ConsolidationPhase::Confirm;
+    app.consolidation_target = ConsolidationTarget::SingleRun;
     app.consolidation_provider_cursor = 0;
     app.consolidation_prompt.clear();
     app.consolidation_running = false;
     app.consolidation_rx = None;
     app.diagnostic_running = false;
     app.diagnostic_rx = None;
+    app.batch_stage1_done = false;
+    app.batch_progress_rx = None;
+    app.multi_run_total = 0;
+    app.multi_run_concurrency = 0;
+    app.multi_run_cursor = 0;
+    app.multi_run_states.clear();
+    app.multi_run_step_labels.clear();
+    app.batch_result_runs.clear();
+    app.batch_result_root_files.clear();
+    app.batch_result_expanded.clear();
+    app.progress_rx = None;
+    app.run_dir = None;
+    app.cancel_flag = Arc::new(AtomicBool::new(false));
 
     // Pipeline state
     app.pipeline_def = pipeline_mod::PipelineDefinition::default();
@@ -1692,6 +1958,10 @@ fn reset_to_home(app: &mut App) {
     app.pipeline_prompt_cursor = 0;
     app.pipeline_session_name.clear();
     app.pipeline_iterations_buf = "1".into();
+    app.pipeline_runs = 1;
+    app.pipeline_runs_buf = "1".into();
+    app.pipeline_concurrency = 0;
+    app.pipeline_concurrency_buf = "0".into();
     app.pipeline_connecting_from = None;
     app.pipeline_removing_conn = false;
     app.pipeline_conn_cursor = 0;
@@ -2390,6 +2660,20 @@ fn empty_provider_config() -> ProviderConfig {
     }
 }
 
+fn resume_allowed_in_prompt(app: &App) -> bool {
+    !(app.runs > 1
+        && matches!(
+            app.selected_mode,
+            ExecutionMode::Relay | ExecutionMode::Swarm
+        ))
+}
+
+fn enforce_prompt_resume_constraints(app: &mut App) {
+    if !resume_allowed_in_prompt(app) {
+        app.resume_previous = false;
+    }
+}
+
 fn sync_iterations_buf(app: &mut App) {
     if app.iterations_buf.is_empty() {
         app.iterations = 1;
@@ -2399,48 +2683,531 @@ fn sync_iterations_buf(app: &mut App) {
     app.iterations_buf = app.iterations.to_string();
 }
 
-fn start_execution(app: &mut App) {
+fn sync_runs_buf(app: &mut App) {
+    if app.runs_buf.is_empty() {
+        app.runs = 1;
+    } else {
+        app.runs = app.runs_buf.parse().unwrap_or(1).clamp(1, 99);
+    }
+    app.runs_buf = app.runs.to_string();
+}
+
+fn sync_concurrency_buf(app: &mut App) {
+    if app.concurrency_buf.is_empty() {
+        app.concurrency = 0;
+    } else {
+        app.concurrency = app.concurrency_buf.parse().unwrap_or(0).min(99);
+    }
+    app.concurrency_buf = app.concurrency.to_string();
+}
+
+fn sync_pipeline_iterations_buf(app: &mut App) {
+    if app.pipeline_iterations_buf.is_empty() {
+        app.pipeline_def.iterations = 1;
+    } else {
+        app.pipeline_def.iterations = app
+            .pipeline_iterations_buf
+            .parse()
+            .unwrap_or(1)
+            .clamp(1, 99);
+    }
+    app.pipeline_iterations_buf = app.pipeline_def.iterations.to_string();
+}
+
+fn sync_pipeline_runs_buf(app: &mut App) {
+    if app.pipeline_runs_buf.is_empty() {
+        app.pipeline_runs = 1;
+    } else {
+        app.pipeline_runs = app.pipeline_runs_buf.parse().unwrap_or(1).clamp(1, 99);
+    }
+    app.pipeline_runs_buf = app.pipeline_runs.to_string();
+}
+
+fn sync_pipeline_concurrency_buf(app: &mut App) {
+    if app.pipeline_concurrency_buf.is_empty() {
+        app.pipeline_concurrency = 0;
+    } else {
+        app.pipeline_concurrency = app.pipeline_concurrency_buf.parse().unwrap_or(0).min(99);
+    }
+    app.pipeline_concurrency_buf = app.pipeline_concurrency.to_string();
+}
+
+fn effective_concurrency(runs: u32, concurrency: u32) -> u32 {
+    match concurrency {
+        0 => runs.max(1),
+        value => value.min(runs).max(1),
+    }
+}
+
+fn reset_running_state(app: &mut App) {
     app.screen = Screen::Running;
     app.progress_events.clear();
     app.is_running = true;
     app.run_error = None;
     app.consolidation_active = false;
     app.consolidation_phase = ConsolidationPhase::Confirm;
+    app.consolidation_target = ConsolidationTarget::SingleRun;
     app.consolidation_provider_cursor = 0;
     app.consolidation_prompt.clear();
     app.consolidation_running = false;
     app.consolidation_rx = None;
     app.diagnostic_running = false;
     app.diagnostic_rx = None;
+    app.batch_stage1_done = false;
+    app.result_files.clear();
+    app.result_preview.clear();
+    app.batch_result_runs.clear();
+    app.batch_result_root_files.clear();
+    app.batch_result_expanded.clear();
+    app.result_cursor = 0;
+    app.batch_progress_rx = None;
+    app.multi_run_total = 0;
+    app.multi_run_concurrency = 0;
+    app.multi_run_cursor = 0;
+    app.multi_run_states.clear();
+    app.multi_run_step_labels.clear();
+}
 
-    let config = app.config.clone();
-    let http_timeout_secs = app.effective_http_timeout_seconds().max(1);
-    let cli_timeout_secs = app.effective_cli_timeout_seconds().max(1);
-    let has_any_cli = app.selected_agents.iter().any(|name| {
-        app.effective_agent_config(name)
-            .map(|c| c.use_cli)
-            .unwrap_or(false)
-    });
+fn build_run_prompt(base_prompt: &str, has_any_cli: bool, diagnostics_enabled: bool) -> String {
     let mut prompt = if has_any_cli {
         let cwd = std::env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
         if cwd.is_empty() {
-            app.prompt_text.clone()
+            base_prompt.to_string()
         } else {
             format!(
-                "Working directory: {}\nYou have access to the data and files in this directory for context.\n\n{}",
-                cwd, app.prompt_text
+                "Working directory: {cwd}\nYou have access to the data and files in this directory for context.\n\n{base_prompt}"
             )
         }
     } else {
-        app.prompt_text.clone()
+        base_prompt.to_string()
     };
-    if app.config.diagnostic_provider.is_some() {
+    if diagnostics_enabled {
         prompt.push_str(
             "\n\nWrite any encountered issues (for example permission, tool, or environment issues) to an explicit \"Errors\" section of your report.",
         );
     }
+    prompt
+}
+
+fn resolve_selected_agent_configs(
+    app: &App,
+    agent_names: &[String],
+) -> Result<Vec<AgentConfig>, String> {
+    let mut resolved = Vec::with_capacity(agent_names.len());
+    for name in agent_names {
+        let agent_config = app
+            .effective_agent_config(name)
+            .cloned()
+            .ok_or_else(|| format!("{name} is not configured"))?;
+        validate_agent_runtime(app, name, &agent_config)?;
+        resolved.push(agent_config);
+    }
+    Ok(resolved)
+}
+
+fn pipeline_step_labels(def: &pipeline_mod::PipelineDefinition) -> Vec<String> {
+    def.blocks
+        .iter()
+        .map(|block| {
+            if block.name.trim().is_empty() {
+                format!("Block {} ({})", block.id, block.agent)
+            } else {
+                format!("{} ({})", block.name, block.agent)
+            }
+        })
+        .collect()
+}
+
+fn start_multi_execution(
+    app: &mut App,
+    config: crate::config::AppConfig,
+    client: reqwest::Client,
+    prompt: String,
+    agent_names: Vec<String>,
+    mode: ExecutionMode,
+    iterations: u32,
+    forward_prompt_flag: bool,
+    cli_timeout_secs: u64,
+    runs: u32,
+    concurrency: u32,
+) {
+    let resolved_agents = match resolve_selected_agent_configs(app, &agent_names) {
+        Ok(resolved) => resolved,
+        Err(message) => {
+            app.error_modal = Some(message);
+            app.screen = Screen::Prompt;
+            app.is_running = false;
+            return;
+        }
+    };
+
+    let output_dir = config.resolved_output_dir();
+    let session_name = if app.session_name.trim().is_empty() {
+        None
+    } else {
+        Some(app.session_name.trim().to_string())
+    };
+    let batch_root = match OutputManager::new_batch_parent(&output_dir, session_name.as_deref()) {
+        Ok(output) => output,
+        Err(e) => {
+            app.error_modal = Some(format!("Failed to create batch output dir: {e}"));
+            app.screen = Screen::Prompt;
+            app.is_running = false;
+            return;
+        }
+    };
+
+    if let Err(e) = batch_root.write_batch_info(runs, concurrency, &mode, &agent_names, iterations)
+    {
+        app.error_modal = Some(format!("Failed to write batch metadata: {e}"));
+        app.screen = Screen::Prompt;
+        app.is_running = false;
+        return;
+    }
+
+    app.run_dir = Some(batch_root.run_dir().clone());
+    app.iterations = iterations;
+    app.runs = runs;
+    app.concurrency = concurrency;
+    app.init_multi_run_state(runs, concurrency, agent_names.clone());
+
+    let (batch_tx, batch_rx) = mpsc::unbounded_channel();
+    app.batch_progress_rx = Some(batch_rx);
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.cancel_flag = cancel.clone();
+
+    let batch_root_dir = batch_root.run_dir().clone();
+    let default_max_tokens = config.default_max_tokens;
+    let max_history_messages = config.max_history_messages;
+
+    tokio::spawn(async move {
+        run_multi(
+            runs,
+            concurrency,
+            batch_tx,
+            cancel,
+            move |run_id, progress_tx, cancel| {
+                let client = client.clone();
+                let prompt = prompt.clone();
+                let resolved_agents = resolved_agents.clone();
+                let batch_root_dir = batch_root_dir.clone();
+                let session_name = session_name.clone();
+                async move {
+                    let parent = match OutputManager::from_existing(batch_root_dir.clone()) {
+                        Ok(parent) => parent,
+                        Err(e) => {
+                            return (
+                                RunOutcome::Failed,
+                                Some(format!("Failed to open batch root: {e}")),
+                            );
+                        }
+                    };
+                    let output = match parent.new_run_subdir(run_id) {
+                        Ok(output) => output,
+                        Err(e) => {
+                            return (
+                                RunOutcome::Failed,
+                                Some(format!("Failed to create run_{run_id} output dir: {e}")),
+                            );
+                        }
+                    };
+
+                    if let Err(e) = output.write_prompt(&prompt) {
+                        let _ = output.append_error(&format!("Failed to write prompt: {e}"));
+                        return (
+                            RunOutcome::Failed,
+                            Some(format!("Failed to write prompt: {e}")),
+                        );
+                    }
+
+                    let run_models = resolved_agents
+                        .iter()
+                        .map(|cfg| {
+                            (
+                                cfg.name.clone(),
+                                if cfg.model.trim().is_empty() {
+                                    "(default)".to_string()
+                                } else {
+                                    cfg.model.clone()
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let agent_info = resolved_agents
+                        .iter()
+                        .map(|cfg| (cfg.name.clone(), cfg.provider.config_key().to_string()))
+                        .collect::<Vec<_>>();
+
+                    if let Err(e) = output.write_session_info(
+                        &mode,
+                        &agent_info,
+                        iterations,
+                        session_name.as_deref(),
+                        &run_models,
+                    ) {
+                        let _ = output.append_error(&format!("Failed to write session info: {e}"));
+                        return (
+                            RunOutcome::Failed,
+                            Some(format!("Failed to write session info: {e}")),
+                        );
+                    }
+
+                    let mut agents: Vec<(String, Box<dyn provider::Provider>)> = Vec::new();
+                    let mut use_cli_by_agent = HashMap::new();
+                    for agent_config in &resolved_agents {
+                        use_cli_by_agent.insert(agent_config.name.clone(), agent_config.use_cli);
+                        let pconfig = agent_config.to_provider_config();
+                        agents.push((
+                            agent_config.name.clone(),
+                            provider::create_provider(
+                                agent_config.provider,
+                                &pconfig,
+                                client.clone(),
+                                default_max_tokens,
+                                max_history_messages,
+                                cli_timeout_secs,
+                            ),
+                        ));
+                    }
+
+                    let result = match mode {
+                        ExecutionMode::Solo => {
+                            run_solo(&prompt, agents, &output, progress_tx, cancel.clone()).await
+                        }
+                        ExecutionMode::Relay => {
+                            run_relay(
+                                &prompt,
+                                agents,
+                                iterations,
+                                1,
+                                None,
+                                forward_prompt_flag,
+                                use_cli_by_agent,
+                                &output,
+                                progress_tx,
+                                cancel.clone(),
+                            )
+                            .await
+                        }
+                        ExecutionMode::Swarm => {
+                            run_swarm(
+                                &prompt,
+                                agents,
+                                iterations,
+                                1,
+                                HashMap::new(),
+                                use_cli_by_agent,
+                                &output,
+                                progress_tx,
+                                cancel.clone(),
+                            )
+                            .await
+                        }
+                        ExecutionMode::Pipeline => {
+                            unreachable!("pipeline uses dedicated batch path")
+                        }
+                    };
+
+                    if cancel.load(Ordering::Relaxed) {
+                        return (RunOutcome::Cancelled, None);
+                    }
+
+                    match result {
+                        Ok(()) => (RunOutcome::Done, None),
+                        Err(e) => {
+                            let err = e.to_string();
+                            let _ = output.append_error(&err);
+                            (RunOutcome::Failed, Some(err))
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    });
+}
+
+fn start_multi_pipeline_execution(
+    app: &mut App,
+    client: reqwest::Client,
+    iterations: u32,
+    runs: u32,
+    concurrency: u32,
+    agent_configs: HashMap<String, (ProviderKind, ProviderConfig, bool)>,
+) {
+    let output_dir = app.config.resolved_output_dir();
+    let session_name = if app.pipeline_session_name.trim().is_empty() {
+        None
+    } else {
+        Some(app.pipeline_session_name.trim().to_string())
+    };
+    let batch_root = match OutputManager::new_batch_parent(&output_dir, session_name.as_deref()) {
+        Ok(output) => output,
+        Err(e) => {
+            app.error_modal = Some(format!("Cannot create batch output dir: {e}"));
+            app.screen = Screen::Pipeline;
+            app.is_running = false;
+            return;
+        }
+    };
+
+    let step_labels = pipeline_step_labels(&app.pipeline_def);
+    if let Err(e) = batch_root.write_batch_info(
+        runs,
+        concurrency,
+        &ExecutionMode::Pipeline,
+        &step_labels,
+        iterations,
+    ) {
+        app.error_modal = Some(format!("Failed to write batch metadata: {e}"));
+        app.screen = Screen::Pipeline;
+        app.is_running = false;
+        return;
+    }
+
+    app.run_dir = Some(batch_root.run_dir().clone());
+    app.init_multi_run_state(runs, concurrency, step_labels);
+
+    let config = app.config.clone();
+    let cli_timeout = app.effective_cli_timeout_seconds();
+    let pipeline_def = app.pipeline_def.clone();
+    let pipeline_source = app
+        .pipeline_save_path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(str::to_string);
+
+    let (batch_tx, batch_rx) = mpsc::unbounded_channel();
+    app.batch_progress_rx = Some(batch_rx);
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.cancel_flag = cancel.clone();
+
+    let batch_root_dir = batch_root.run_dir().clone();
+
+    tokio::spawn(async move {
+        run_multi(
+            runs,
+            concurrency,
+            batch_tx,
+            cancel,
+            move |run_id, progress_tx, cancel| {
+                let client = client.clone();
+                let config = config.clone();
+                let pipeline_def = pipeline_def.clone();
+                let agent_configs = agent_configs.clone();
+                let batch_root_dir = batch_root_dir.clone();
+                let pipeline_source = pipeline_source.clone();
+                async move {
+                    let parent = match OutputManager::from_existing(batch_root_dir.clone()) {
+                        Ok(parent) => parent,
+                        Err(e) => {
+                            return (
+                                RunOutcome::Failed,
+                                Some(format!("Failed to open batch root: {e}")),
+                            );
+                        }
+                    };
+                    let output = match parent.new_run_subdir(run_id) {
+                        Ok(output) => output,
+                        Err(e) => {
+                            return (
+                                RunOutcome::Failed,
+                                Some(format!("Failed to create run_{run_id} output dir: {e}")),
+                            );
+                        }
+                    };
+
+                    if let Err(e) = output.write_prompt(&pipeline_def.initial_prompt) {
+                        let _ = output.append_error(&format!("Failed to write prompt: {e}"));
+                        return (
+                            RunOutcome::Failed,
+                            Some(format!("Failed to write prompt: {e}")),
+                        );
+                    }
+                    if let Err(e) = output.write_pipeline_session_info(
+                        pipeline_def.blocks.len(),
+                        pipeline_def.connections.len(),
+                        iterations,
+                        pipeline_source.as_deref(),
+                    ) {
+                        let _ = output.append_error(&format!("Failed to write session info: {e}"));
+                        return (
+                            RunOutcome::Failed,
+                            Some(format!("Failed to write session info: {e}")),
+                        );
+                    }
+                    match toml::to_string_pretty(&pipeline_def) {
+                        Ok(toml_str) => {
+                            if let Err(e) =
+                                std::fs::write(output.run_dir().join("pipeline.toml"), toml_str)
+                            {
+                                let _ = output
+                                    .append_error(&format!("Failed to write pipeline.toml: {e}"));
+                                return (
+                                    RunOutcome::Failed,
+                                    Some(format!("Failed to write pipeline.toml: {e}")),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            let err = format!("Failed to serialize pipeline: {e}");
+                            let _ = output.append_error(&err);
+                            return (RunOutcome::Failed, Some(err));
+                        }
+                    }
+
+                    let result = pipeline_mod::run_pipeline(
+                        &pipeline_def,
+                        &config,
+                        agent_configs,
+                        client,
+                        cli_timeout,
+                        &output,
+                        progress_tx,
+                        cancel.clone(),
+                    )
+                    .await;
+
+                    if cancel.load(Ordering::Relaxed) {
+                        return (RunOutcome::Cancelled, None);
+                    }
+
+                    match result {
+                        Ok(()) => (RunOutcome::Done, None),
+                        Err(e) => {
+                            let err = format!("Pipeline failed: {e}");
+                            let _ = output.append_error(&err);
+                            (RunOutcome::Failed, Some(err))
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    });
+}
+
+fn start_execution(app: &mut App) {
+    reset_running_state(app);
+
+    let config = app.config.clone();
+    let http_timeout_secs = app.effective_http_timeout_seconds().max(1);
+    let cli_timeout_secs = app.effective_cli_timeout_seconds().max(1);
+    let runs = app.runs.max(1);
+    let concurrency = effective_concurrency(runs, app.concurrency);
+    let has_any_cli = app.selected_agents.iter().any(|name| {
+        app.effective_agent_config(name)
+            .map(|c| c.use_cli)
+            .unwrap_or(false)
+    });
+    let prompt = build_run_prompt(
+        &app.prompt_text,
+        has_any_cli,
+        app.config.diagnostic_provider.is_some(),
+    );
     let agent_names = app.selected_agents.clone();
     let mode = app.selected_mode;
     let forward_prompt_flag = app.forward_prompt;
@@ -2462,6 +3229,29 @@ fn start_execution(app: &mut App) {
             return;
         }
     };
+
+    if runs > 1 {
+        if app.resume_previous && matches!(mode, ExecutionMode::Relay | ExecutionMode::Swarm) {
+            app.error_modal = Some("Resume is only supported for single-run execution".into());
+            app.screen = Screen::Prompt;
+            app.is_running = false;
+            return;
+        }
+        start_multi_execution(
+            app,
+            config,
+            client,
+            prompt,
+            agent_names,
+            mode,
+            iterations,
+            forward_prompt_flag,
+            cli_timeout_secs,
+            runs,
+            concurrency,
+        );
+        return;
+    }
 
     let mut agents: Vec<(String, Box<dyn provider::Provider>)> = Vec::new();
     let mut use_cli_by_agent: std::collections::HashMap<String, bool> =
@@ -2770,9 +3560,193 @@ fn handle_progress(app: &mut App, event: ProgressEvent) {
     }
 }
 
+fn handle_batch_progress(app: &mut App, event: BatchProgressEvent) {
+    match event {
+        BatchProgressEvent::RunQueued { run_id } => {
+            if let Some(state) = multi_run_state_mut(app, run_id) {
+                state.status = RunStatus::Queued;
+            }
+        }
+        BatchProgressEvent::RunStarted { run_id } => {
+            if let Some(state) = multi_run_state_mut(app, run_id) {
+                state.status = RunStatus::Running;
+                for step in &mut state.steps {
+                    if step.status == RunStepStatus::Queued {
+                        step.status = RunStepStatus::Pending;
+                    }
+                }
+                state.push_log("run started".into());
+            }
+        }
+        BatchProgressEvent::RunEvent { run_id, event } => {
+            update_multi_run_state(app, run_id, &event);
+            if matches!(
+                event,
+                ProgressEvent::AgentError { .. } | ProgressEvent::BlockError { .. }
+            ) {
+                app.progress_events.push(event);
+            }
+        }
+        BatchProgressEvent::RunFinished {
+            run_id,
+            outcome,
+            error,
+        } => {
+            if let Some(state) = multi_run_state_mut(app, run_id) {
+                match outcome {
+                    RunOutcome::Done => {
+                        if state.status != RunStatus::Failed {
+                            state.status = RunStatus::Done;
+                        }
+                    }
+                    RunOutcome::Failed => {
+                        state.status = RunStatus::Failed;
+                        if let Some(ref message) = error {
+                            state.error = Some(message.clone());
+                            state.push_log(format!("error: {message}"));
+                        }
+                    }
+                    RunOutcome::Cancelled => {
+                        state.status = RunStatus::Cancelled;
+                        state.push_log("cancelled".into());
+                    }
+                }
+            }
+        }
+        BatchProgressEvent::AllRunsDone => {
+            app.is_running = false;
+            app.batch_progress_rx = None;
+            if should_offer_consolidation(app) {
+                app.consolidation_active = true;
+                app.consolidation_phase = ConsolidationPhase::Confirm;
+                app.consolidation_target = ConsolidationTarget::BatchPerRun;
+                app.consolidation_provider_cursor = 0;
+                app.consolidation_prompt.clear();
+                app.consolidation_running = false;
+                app.consolidation_rx = None;
+            } else {
+                maybe_start_diagnostics(app);
+            }
+        }
+    }
+}
+
+fn multi_run_state_mut(app: &mut App, run_id: u32) -> Option<&mut RunState> {
+    let index = run_id.checked_sub(1)? as usize;
+    if app
+        .multi_run_states
+        .get(index)
+        .is_some_and(|state| state.run_id == run_id)
+    {
+        return app.multi_run_states.get_mut(index);
+    }
+
+    app.multi_run_states
+        .iter_mut()
+        .find(|state| state.run_id == run_id)
+}
+
+fn update_multi_run_state(app: &mut App, run_id: u32, event: &ProgressEvent) {
+    let Some(state) = multi_run_state_mut(app, run_id) else {
+        return;
+    };
+
+    match event {
+        ProgressEvent::AgentStarted { agent, .. } => {
+            state.status = RunStatus::Running;
+            update_step_status(state, agent, RunStepStatus::Running);
+            state.push_log(format!("{agent}: started"));
+        }
+        ProgressEvent::AgentLog { agent, message, .. } => {
+            state.push_log(format!("{agent}: {message}"));
+        }
+        ProgressEvent::AgentFinished { agent, .. } => {
+            update_step_status(state, agent, RunStepStatus::Done);
+            state.push_log(format!("{agent}: finished"));
+        }
+        ProgressEvent::AgentError { agent, error, .. } => {
+            state.status = RunStatus::Failed;
+            state.error = Some(error.clone());
+            update_step_status(state, agent, RunStepStatus::Error);
+            state.push_log(format!("{agent}: {error}"));
+        }
+        ProgressEvent::IterationComplete { iteration } => {
+            state.push_log(format!("iteration {iteration} complete"));
+        }
+        ProgressEvent::BlockStarted {
+            block_id,
+            agent_name,
+            label,
+            ..
+        } => {
+            let step = format_block_step_label(*block_id, label, agent_name);
+            state.status = RunStatus::Running;
+            update_step_status(state, &step, RunStepStatus::Running);
+            state.push_log(format!("{step}: started"));
+        }
+        ProgressEvent::BlockLog {
+            block_id,
+            agent_name,
+            message,
+            ..
+        } => {
+            let step = format_block_step_label(*block_id, "", agent_name);
+            state.push_log(format!("{step}: {message}"));
+        }
+        ProgressEvent::BlockFinished {
+            block_id,
+            agent_name,
+            label,
+            ..
+        } => {
+            let step = format_block_step_label(*block_id, label, agent_name);
+            update_step_status(state, &step, RunStepStatus::Done);
+            state.push_log(format!("{step}: finished"));
+        }
+        ProgressEvent::BlockError {
+            block_id,
+            agent_name,
+            label,
+            error,
+            ..
+        }
+        | ProgressEvent::BlockSkipped {
+            block_id,
+            agent_name,
+            label,
+            reason: error,
+            ..
+        } => {
+            let step = format_block_step_label(*block_id, label, agent_name);
+            state.status = RunStatus::Failed;
+            state.error = Some(error.clone());
+            update_step_status(state, &step, RunStepStatus::Error);
+            state.push_log(format!("{step}: {error}"));
+        }
+        ProgressEvent::AllDone => {}
+    }
+}
+
+fn update_step_status(state: &mut RunState, label: &str, status: RunStepStatus) {
+    if let Some(step) = state.steps.iter_mut().find(|step| step.label == label) {
+        step.status = status;
+    }
+}
+
+fn format_block_step_label(block_id: u32, label: &str, agent_name: &str) -> String {
+    if label.trim().is_empty() {
+        format!("Block {block_id} ({agent_name})")
+    } else {
+        format!("{label} ({agent_name})")
+    }
+}
+
 fn should_offer_consolidation(app: &App) -> bool {
     if app.cancel_flag.load(Ordering::Relaxed) {
         return false;
+    }
+    if app.multi_run_total > 1 {
+        return !successful_run_ids(app).is_empty();
     }
     if app.selected_agents.len() <= 1 {
         return false;
@@ -2787,12 +3761,152 @@ fn should_offer_consolidation(app: &App) -> bool {
     let Some(run_dir) = app.run_dir.as_ref() else {
         return false;
     };
-    let agent_keys: Vec<String> = app
-        .selected_agents
+    discover_final_outputs(run_dir, app.selected_mode, &app.selected_agents).len() > 1
+}
+
+fn successful_run_ids(app: &App) -> Vec<u32> {
+    app.multi_run_states
+        .iter()
+        .filter(|state| state.status == RunStatus::Done)
+        .map(|state| state.run_id)
+        .collect()
+}
+
+fn discover_final_outputs(
+    run_dir: &std::path::Path,
+    mode: ExecutionMode,
+    selected_agents: &[String],
+) -> Vec<(String, std::path::PathBuf)> {
+    if mode == ExecutionMode::Pipeline {
+        let Some(last_iteration) = find_last_iteration(run_dir, &[]) else {
+            return Vec::new();
+        };
+        let mut files = std::fs::read_dir(run_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_str()?.to_string();
+                if parse_pipeline_iteration_filename(&name) == Some(last_iteration) {
+                    Some((name, path))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        return files;
+    }
+
+    let agent_keys = selected_agents
         .iter()
         .map(|n| App::agent_file_key(n))
-        .collect();
-    find_last_iteration(run_dir, &agent_keys).is_some()
+        .collect::<Vec<_>>();
+    let Some(last_iteration) = find_last_iteration(run_dir, &agent_keys) else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+    for name in selected_agents {
+        let file_key = App::agent_file_key(name);
+        let path = run_dir.join(format!("{file_key}_iter{last_iteration}.md"));
+        if path.exists() {
+            files.push((name.clone(), path));
+        }
+    }
+    files
+}
+
+async fn discover_final_outputs_async(
+    run_dir: &std::path::Path,
+    mode: ExecutionMode,
+    selected_agents: &[String],
+) -> Vec<(String, std::path::PathBuf)> {
+    if mode == ExecutionMode::Pipeline {
+        let Some(last_iteration) = find_last_iteration_async(run_dir, &[]).await else {
+            return Vec::new();
+        };
+
+        let mut files = Vec::new();
+        let mut entries = match tokio::fs::read_dir(run_dir).await {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+
+        loop {
+            match entries.next_entry().await {
+                Ok(Some(entry)) => {
+                    let path = entry.path();
+                    let Some(name) = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(str::to_string)
+                    else {
+                        continue;
+                    };
+                    if parse_pipeline_iteration_filename(&name) == Some(last_iteration) {
+                        files.push((name, path));
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        return files;
+    }
+
+    let agent_keys = selected_agents
+        .iter()
+        .map(|n| App::agent_file_key(n))
+        .collect::<Vec<_>>();
+    let Some(last_iteration) = find_last_iteration_async(run_dir, &agent_keys).await else {
+        return Vec::new();
+    };
+
+    let mut files = Vec::new();
+    for name in selected_agents {
+        let file_key = App::agent_file_key(name);
+        let path = run_dir.join(format!("{file_key}_iter{last_iteration}.md"));
+        if tokio::fs::metadata(&path).await.is_ok() {
+            files.push((name.clone(), path));
+        }
+    }
+    files
+}
+
+async fn find_last_iteration_async(
+    run_dir: &std::path::Path,
+    agent_keys: &[String],
+) -> Option<u32> {
+    let mut max_iter: Option<u32> = None;
+    let mut entries = tokio::fs::read_dir(run_dir).await.ok()?;
+
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if agent_keys.is_empty() {
+                    // Pipeline mode: only match known block output filename patterns
+                    if let Some(iter) = parse_pipeline_iteration_filename(&name) {
+                        max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
+                    }
+                } else {
+                    for key in agent_keys {
+                        if let Some(iter) = parse_agent_iteration_filename(&name, key) {
+                            max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    max_iter
 }
 
 fn find_last_iteration(run_dir: &std::path::Path, agent_keys: &[String]) -> Option<u32> {
@@ -2973,108 +4087,110 @@ fn parse_iteration_from_filename(name: &str) -> Option<u32> {
     iter_str.parse::<u32>().ok()
 }
 
+fn selected_consolidation_agent(app: &App) -> Result<(String, AgentConfig), String> {
+    let agent_name = app
+        .config
+        .agents
+        .get(app.consolidation_provider_cursor)
+        .map(|a| a.name.clone())
+        .ok_or_else(|| "Select an agent for consolidation".to_string())?;
+    let agent_config = app
+        .effective_agent_config(&agent_name)
+        .cloned()
+        .ok_or_else(|| format!("{agent_name} is not configured"))?;
+    validate_agent_runtime(app, &agent_name, &agent_config)?;
+    Ok((agent_name, agent_config))
+}
+
+async fn build_file_consolidation_prompt(
+    files: &[(String, std::path::PathBuf)],
+    additional: &str,
+    use_cli: bool,
+) -> Result<String, String> {
+    let mut prompt = String::from("Consolidate these outputs into one final markdown answer.\n\n");
+
+    if use_cli {
+        prompt.push_str("Files to read:\n");
+        for (label, path) in files {
+            prompt.push_str(&format!("- {label}: {}\n", path.display()));
+        }
+        prompt.push_str("\nRead each file before writing.\n");
+    } else {
+        prompt.push_str("Input reports:\n");
+        for (label, path) in files {
+            let content = tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+            prompt.push_str(&format!("\n--- {label} ---\n{content}\n"));
+        }
+    }
+
+    prompt.push_str(
+        "\nInstructions:\n- Resolve disagreements and keep the strongest points.\n- Return one high-quality markdown response.\n- Do not write files and do not ask for filesystem permissions.\n- The application will save your response to disk.\n",
+    );
+    if !additional.is_empty() {
+        prompt.push_str("\nAdditional instructions from user:\n");
+        prompt.push_str(additional);
+        prompt.push('\n');
+    }
+    Ok(prompt)
+}
+
+fn build_cross_run_consolidation_prompt(
+    runs: &[(u32, String)],
+    mode: ExecutionMode,
+    agents: &[String],
+    additional: &str,
+) -> String {
+    let mut prompt = format!(
+        "You are reviewing {} independent runs of the same task.\nEach run executed in {} mode with agents: {}.\n",
+        runs.len(),
+        mode,
+        if agents.is_empty() {
+            "(pipeline blocks)".to_string()
+        } else {
+            agents.join(", ")
+        }
+    );
+
+    for (run_id, content) in runs {
+        prompt.push_str(&format!("\n--- Run {run_id} ---\n{content}\n"));
+    }
+
+    if !additional.is_empty() {
+        prompt.push_str("\nAdditional instructions from user:\n");
+        prompt.push_str(additional);
+        prompt.push('\n');
+    }
+
+    prompt.push_str(
+        "\nSynthesize these results. Identify consensus, highlight disagreements, and produce a final consolidated answer.\n",
+    );
+    prompt
+}
+
+const CROSS_RUN_MAX_INPUT_BYTES: u64 = 200 * 1024;
+
 fn start_consolidation(app: &mut App) {
     if app.consolidation_running {
         return;
     }
 
     let run_dir = match app.run_dir.clone() {
-        Some(p) => p,
+        Some(path) => path,
         None => {
             app.error_modal = Some("No run directory found for consolidation".into());
             return;
         }
     };
 
-    let agent_keys: Vec<String> = app
-        .selected_agents
-        .iter()
-        .map(|n| App::agent_file_key(n))
-        .collect();
-    let last_iteration = match find_last_iteration(&run_dir, &agent_keys) {
-        Some(i) => i,
-        None => {
-            app.error_modal = Some("No iteration outputs found to consolidate".into());
+    let (agent_name, agent_config) = match selected_consolidation_agent(app) {
+        Ok(result) => result,
+        Err(message) => {
+            app.error_modal = Some(message);
             return;
         }
     };
-
-    let agent_name = match app
-        .config
-        .agents
-        .get(app.consolidation_provider_cursor)
-        .map(|a| a.name.clone())
-    {
-        Some(n) => n,
-        None => {
-            app.error_modal = Some("Select an agent for consolidation".into());
-            return;
-        }
-    };
-
-    let agent_config = match app.effective_agent_config(&agent_name).cloned() {
-        Some(cfg) => cfg,
-        None => {
-            app.error_modal = Some(format!("{agent_name} is not configured"));
-            return;
-        }
-    };
-
-    if let Err(message) = validate_agent_runtime(app, &agent_name, &agent_config) {
-        app.error_modal = Some(message);
-        return;
-    }
-
-    let mut file_lines = Vec::new();
-    if app.selected_mode == ExecutionMode::Pipeline {
-        // Scan run dir for block output files from the target iteration
-        if let Ok(entries) = std::fs::read_dir(&run_dir) {
-            let mut paths: Vec<(String, std::path::PathBuf)> = entries
-                .flatten()
-                .filter_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if parse_pipeline_iteration_filename(&name) == Some(last_iteration) {
-                        Some((name, entry.path()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            paths.sort_by(|a, b| a.0.cmp(&b.0));
-            for (name, path) in paths {
-                file_lines.push(format!("- {name}: {}", path.display()));
-            }
-        }
-    } else {
-        for name in &app.selected_agents {
-            let file_key = App::agent_file_key(name);
-            let path = run_dir.join(format!("{file_key}_iter{last_iteration}.md"));
-            if path.exists() {
-                file_lines.push(format!("- {name}: {}", path.display()));
-            }
-        }
-    }
-    if file_lines.is_empty() {
-        app.error_modal = Some("No final iteration files found to consolidate".into());
-        return;
-    }
-
-    let additional = app.consolidation_prompt.trim().to_string();
-    let mut prompt = String::from(
-        "Consolidate the final iteration outputs into one final answer.\n\nFiles to read:\n",
-    );
-    for line in file_lines {
-        prompt.push_str(&line);
-        prompt.push('\n');
-    }
-    prompt.push_str(
-        "\nInstructions:\n- Read each file before writing.\n- Resolve disagreements and keep the strongest points.\n- Return a single high-quality markdown response.\n- Do not write files and do not ask for filesystem permissions.\n- The application will save your response to disk.\n",
-    );
-    if !additional.is_empty() {
-        prompt.push_str("\nAdditional instructions from user:\n");
-        prompt.push_str(&additional);
-        prompt.push('\n');
-    }
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(
@@ -3089,45 +4205,201 @@ fn start_consolidation(app: &mut App) {
         }
     };
 
-    let pconfig = agent_config.to_provider_config();
     let provider_kind = agent_config.provider;
+    let provider_config = agent_config.to_provider_config();
     let provider = provider::create_provider(
         provider_kind,
-        &pconfig,
+        &provider_config,
         client,
         app.config.default_max_tokens,
         app.config.max_history_messages,
         app.effective_cli_timeout_seconds().max(1),
     );
+    let additional = app.consolidation_prompt.trim().to_string();
 
     app.progress_events.push(ProgressEvent::AgentStarted {
         agent: agent_name.clone(),
         kind: provider_kind,
-        iteration: last_iteration + 1,
+        iteration: 0,
     });
     app.progress_events.push(ProgressEvent::AgentLog {
         agent: agent_name.clone(),
         kind: provider_kind,
-        iteration: last_iteration + 1,
+        iteration: 0,
         message: "consolidating reports".into(),
     });
 
-    let file_key = App::agent_file_key(&agent_name);
-    let output_path = run_dir.join(format!("consolidated_{file_key}.md"));
     let (tx, rx) = mpsc::unbounded_channel();
     app.consolidation_rx = Some(rx);
     app.consolidation_running = true;
     app.consolidation_active = false;
     app.is_running = true;
 
+    let mode = app.selected_mode;
+    let selected_agents = app.selected_agents.clone();
+    let successful_runs = successful_run_ids(app);
+    let target = app.consolidation_target;
+    let batch_stage1_done = app.batch_stage1_done;
+
     tokio::spawn(async move {
         let mut provider = provider;
-        let result = match provider.send(&prompt).await {
-            Ok(resp) => match tokio::fs::write(&output_path, &resp.content).await {
-                Ok(()) => Ok(output_path.display().to_string()),
-                Err(e) => Err(format!("Failed to write consolidation output: {e}")),
-            },
-            Err(e) => Err(e.to_string()),
+        let result: Result<String, String> = match target {
+            ConsolidationTarget::SingleRun => {
+                let files = discover_final_outputs_async(&run_dir, mode, &selected_agents).await;
+                if files.is_empty() {
+                    Err("No iteration outputs found to consolidate".to_string())
+                } else {
+                    match build_file_consolidation_prompt(&files, &additional, agent_config.use_cli)
+                        .await
+                    {
+                        Ok(prompt) => {
+                            let file_key = App::agent_file_key(&agent_name);
+                            let output_path = run_dir.join(format!("consolidated_{file_key}.md"));
+                            match provider.send(&prompt).await {
+                                Ok(resp) => tokio::fs::write(&output_path, &resp.content)
+                                    .await
+                                    .map(|_| output_path.display().to_string())
+                                    .map_err(|e| {
+                                        format!("Failed to write consolidation output: {e}")
+                                    }),
+                                Err(e) => Err(e.to_string()),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+            ConsolidationTarget::BatchPerRun => {
+                if successful_runs.is_empty() {
+                    Err("No successful runs available for consolidation".to_string())
+                } else {
+                    let mut result = Ok("Per-run consolidation completed".to_string());
+                    for run_id in successful_runs {
+                        let run_path = run_dir.join(format!("run_{run_id}"));
+                        let files =
+                            discover_final_outputs_async(&run_path, mode, &selected_agents).await;
+                        if files.len() <= 1 {
+                            continue;
+                        }
+                        let prompt = match build_file_consolidation_prompt(
+                            &files,
+                            &additional,
+                            agent_config.use_cli,
+                        )
+                        .await
+                        {
+                            Ok(prompt) => prompt,
+                            Err(e) => {
+                                result = Err(e);
+                                break;
+                            }
+                        };
+                        let response = match provider.send(&prompt).await {
+                            Ok(response) => response,
+                            Err(e) => {
+                                result = Err(e.to_string());
+                                break;
+                            }
+                        };
+                        if let Err(e) =
+                            tokio::fs::write(run_path.join("consolidation.md"), response.content)
+                                .await
+                        {
+                            result = Err(format!("Failed to write per-run consolidation: {e}"));
+                            break;
+                        }
+                    }
+                    result
+                }
+            }
+            ConsolidationTarget::BatchCrossRun => {
+                if successful_runs.is_empty() {
+                    Err("No successful runs available for cross-run consolidation".to_string())
+                } else {
+                    let mut run_inputs = Vec::new();
+                    let mut total_raw_bytes = 0u64;
+                    let mut input_error = None;
+
+                    for run_id in successful_runs {
+                        let run_path = run_dir.join(format!("run_{run_id}"));
+                        if batch_stage1_done {
+                            let path = run_path.join("consolidation.md");
+                            match tokio::fs::metadata(&path).await {
+                                Ok(_) => match tokio::fs::read_to_string(&path).await {
+                                    Ok(content) => {
+                                        total_raw_bytes =
+                                            total_raw_bytes.saturating_add(content.len() as u64);
+                                        if total_raw_bytes > CROSS_RUN_MAX_INPUT_BYTES {
+                                            input_error = Some(
+                                                "Combined cross-run input is too large. Reduce runs or shorten per-run outputs.".to_string(),
+                                            );
+                                            break;
+                                        }
+                                        run_inputs.push((run_id, content));
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        input_error =
+                                            Some(format!("Failed to read {}: {e}", path.display()));
+                                        break;
+                                    }
+                                },
+                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                                Err(e) => {
+                                    input_error =
+                                        Some(format!("Failed to check {}: {e}", path.display()));
+                                    break;
+                                }
+                            }
+                        }
+
+                        let files =
+                            discover_final_outputs_async(&run_path, mode, &selected_agents).await;
+                        for (_, path) in &files {
+                            total_raw_bytes += tokio::fs::metadata(path)
+                                .await
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                        }
+                        if !batch_stage1_done && total_raw_bytes > CROSS_RUN_MAX_INPUT_BYTES {
+                            input_error = Some(
+                                "Combined output too large. Run per-run consolidation first."
+                                    .to_string(),
+                            );
+                            break;
+                        }
+
+                        match build_file_consolidation_prompt(&files, "", false).await {
+                            Ok(prompt) => run_inputs.push((run_id, prompt)),
+                            Err(e) => {
+                                input_error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(error) = input_error {
+                        Err(error)
+                    } else {
+                        let prompt = build_cross_run_consolidation_prompt(
+                            &run_inputs,
+                            mode,
+                            &selected_agents,
+                            &additional,
+                        );
+                        let output_path = run_dir.join("cross_run_consolidation.md");
+                        match provider.send(&prompt).await {
+                            Ok(resp) => tokio::fs::write(&output_path, &resp.content)
+                                .await
+                                .map(|_| output_path.display().to_string())
+                                .map_err(|e| {
+                                    format!("Failed to write cross-run consolidation: {e}")
+                                }),
+                            Err(e) => Err(e.to_string()),
+                        }
+                    }
+                }
+            }
         };
         let _ = tx.send(result);
     });
@@ -3148,47 +4420,44 @@ fn handle_consolidation_result(app: &mut App, result: Result<String, String>) {
         .effective_agent_config(&agent_name)
         .map(|a| a.provider)
         .unwrap_or(ProviderKind::Anthropic);
-    let agent_keys: Vec<String> = app
-        .selected_agents
-        .iter()
-        .map(|n| App::agent_file_key(n))
-        .collect();
-    let iteration = app
-        .run_dir
-        .as_deref()
-        .and_then(|d| find_last_iteration(d, &agent_keys))
-        .unwrap_or(1)
-        + 1;
 
     match result {
         Ok(path) => {
             app.progress_events.push(ProgressEvent::AgentFinished {
                 agent: agent_name.clone(),
                 kind,
-                iteration,
+                iteration: 0,
             });
             app.progress_events.push(ProgressEvent::AgentLog {
                 agent: agent_name,
                 kind,
-                iteration,
+                iteration: 0,
                 message: format!("Consolidation saved to {path}"),
             });
-            app.consolidation_active = false;
-            app.error_modal = Some("Consolidation completed".into());
+
+            if app.consolidation_target == ConsolidationTarget::BatchPerRun {
+                app.batch_stage1_done = true;
+                app.consolidation_active = true;
+                app.consolidation_phase = ConsolidationPhase::CrossRunConfirm;
+                app.consolidation_target = ConsolidationTarget::BatchCrossRun;
+                app.consolidation_prompt.clear();
+            } else {
+                app.consolidation_active = false;
+                maybe_start_diagnostics(app);
+            }
         }
         Err(e) => {
             app.progress_events.push(ProgressEvent::AgentError {
                 agent: agent_name,
                 kind,
-                iteration,
+                iteration: 0,
                 error: e.clone(),
                 details: Some(e),
             });
             app.consolidation_active = false;
+            maybe_start_diagnostics(app);
         }
     }
-
-    maybe_start_diagnostics(app);
 }
 
 fn maybe_start_diagnostics(app: &mut App) {
@@ -3316,28 +4585,37 @@ fn handle_diagnostic_result(app: &mut App, result: Result<String, String>) {
 }
 
 fn collect_report_files(run_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(run_dir)
-        .ok()
-        .into_iter()
-        .flat_map(|it| it.flatten())
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_file() {
-                return None;
-            }
-            let name = path.file_name()?.to_str()?.to_string();
-            let is_md = path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("md"))
-                .unwrap_or(false);
-            if is_md && name != "prompt.md" && name != "errors.md" {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut files = Vec::new();
+    let mut dirs = vec![run_dir.to_path_buf()];
+    if OutputManager::is_batch_root(run_dir) {
+        dirs.extend(batch_run_directories(run_dir));
+    }
+
+    for dir in dirs {
+        let mut dir_files = std::fs::read_dir(dir)
+            .ok()
+            .into_iter()
+            .flat_map(|it| it.flatten())
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_file() {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?.to_string();
+                let is_md = path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("md"))
+                    .unwrap_or(false);
+                if is_md && name != "prompt.md" && name != "errors.md" {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        files.append(&mut dir_files);
+    }
     files.sort();
     files
 }
@@ -3345,25 +4623,47 @@ fn collect_report_files(run_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn collect_application_errors(app: &App, run_dir: &std::path::Path) -> Vec<String> {
     let mut errors = Vec::new();
     for event in &app.progress_events {
-        if let ProgressEvent::AgentError {
-            agent,
-            iteration,
-            error,
-            details,
-            ..
-        } = event
-        {
-            let body = details.as_deref().unwrap_or(error);
-            errors.push(format!("[{agent} iter {iteration}] {body}"));
+        match event {
+            ProgressEvent::AgentError {
+                agent,
+                iteration,
+                error,
+                details,
+                ..
+            } => {
+                let body = details.as_deref().unwrap_or(error);
+                errors.push(format!("[{agent} iter {iteration}] {body}"));
+            }
+            ProgressEvent::BlockError {
+                block_id,
+                agent_name,
+                iteration,
+                error,
+                details,
+                ..
+            } => {
+                let body = details.as_deref().unwrap_or(error);
+                errors.push(format!(
+                    "[block {block_id} {agent_name} iter {iteration}] {body}"
+                ));
+            }
+            _ => {}
         }
     }
 
-    let log_path = run_dir.join("_errors.log");
-    if let Ok(content) = std::fs::read_to_string(&log_path) {
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                errors.push(trimmed.to_string());
+    let mut dirs = vec![run_dir.to_path_buf()];
+    if OutputManager::is_batch_root(run_dir) {
+        dirs.extend(batch_run_directories(run_dir));
+    }
+
+    for dir in dirs {
+        let log_path = dir.join("_errors.log");
+        if let Ok(content) = std::fs::read_to_string(&log_path) {
+            for line in content.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    errors.push(trimmed.to_string());
+                }
             }
         }
     }
@@ -3456,27 +4756,147 @@ fn build_diagnostic_prompt(
 
 fn load_results(app: &mut App) {
     if let Some(ref run_dir) = app.run_dir {
-        let mut files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(run_dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_file() {
-                    files.push(entry.path());
+        if OutputManager::is_batch_root(run_dir) {
+            let mut root_files = Vec::new();
+            let mut run_groups = Vec::new();
+
+            if let Ok(entries) = std::fs::read_dir(run_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        root_files.push(path);
+                    } else if path.is_dir() {
+                        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                            continue;
+                        };
+                        let Some(run_id) = name
+                            .strip_prefix("run_")
+                            .and_then(|n| n.parse::<u32>().ok())
+                        else {
+                            continue;
+                        };
+                        let mut files = std::fs::read_dir(&path)
+                            .ok()
+                            .into_iter()
+                            .flat_map(|entries| entries.flatten())
+                            .filter_map(|entry| {
+                                let path = entry.path();
+                                if path.is_file() { Some(path) } else { None }
+                            })
+                            .collect::<Vec<_>>();
+                        files.sort();
+                        run_groups.push(BatchRunGroup { run_id, files });
+                    }
                 }
             }
+
+            root_files.sort();
+            run_groups.sort_by_key(|group| group.run_id);
+            app.result_files.clear();
+            app.batch_result_runs = run_groups;
+            app.batch_result_root_files = root_files;
+            app.batch_result_expanded = app
+                .batch_result_runs
+                .iter()
+                .map(|group| group.run_id)
+                .collect();
+        } else {
+            let mut files = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(run_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_file() {
+                        files.push(entry.path());
+                    }
+                }
+            }
+            files.sort();
+            app.result_files = files;
+            app.batch_result_runs.clear();
+            app.batch_result_root_files.clear();
+            app.batch_result_expanded.clear();
         }
-        files.sort();
-        app.result_files = files;
     }
     app.result_cursor = 0;
     update_preview(app);
 }
 
 fn update_preview(app: &mut App) {
-    if let Some(path) = app.result_files.get(app.result_cursor) {
-        app.result_preview =
-            std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {e}"));
+    let preview = if has_batch_result_tree(app) {
+        match batch_result_entry_at(app, app.result_cursor) {
+            Some(BatchResultEntry::File(path)) => {
+                std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {e}"))
+            }
+            _ => String::new(),
+        }
+    } else if let Some(path) = app.result_files.get(app.result_cursor) {
+        std::fs::read_to_string(path).unwrap_or_else(|e| format!("Error: {e}"))
     } else {
-        app.result_preview = String::new();
+        String::new()
+    };
+    app.result_preview = preview;
+}
+
+fn batch_run_directories(run_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut dirs = std::fs::read_dir(run_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?;
+            if name.starts_with("run_") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    dirs.sort();
+    dirs
+}
+
+fn has_batch_result_tree(app: &App) -> bool {
+    !app.batch_result_runs.is_empty() || !app.batch_result_root_files.is_empty()
+}
+
+enum BatchResultEntry<'a> {
+    RunHeader(u32),
+    File(&'a std::path::PathBuf),
+}
+
+fn batch_result_visible_len(app: &App) -> usize {
+    let mut len = app.batch_result_root_files.len();
+    for group in &app.batch_result_runs {
+        len += 1;
+        if app.batch_result_expanded.contains(&group.run_id) {
+            len += group.files.len();
+        }
+    }
+    len
+}
+
+fn batch_result_entry_at(app: &App, mut index: usize) -> Option<BatchResultEntry<'_>> {
+    for group in &app.batch_result_runs {
+        if index == 0 {
+            return Some(BatchResultEntry::RunHeader(group.run_id));
+        }
+        index -= 1;
+
+        if app.batch_result_expanded.contains(&group.run_id) {
+            if index < group.files.len() {
+                return Some(BatchResultEntry::File(&group.files[index]));
+            }
+            index = index.saturating_sub(group.files.len());
+        }
+    }
+
+    if index < app.batch_result_root_files.len() {
+        Some(BatchResultEntry::File(&app.batch_result_root_files[index]))
+    } else {
+        None
     }
 }
 
@@ -3725,6 +5145,17 @@ mod tests {
         assert_eq!(find_last_iteration(dir.path(), &[]), Some(3));
     }
 
+    #[tokio::test]
+    async fn find_last_iteration_async_matches_sync_for_pipeline_files() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Analyzer_b1_Claude_iter2.md"), "test").unwrap();
+        fs::write(dir.path().join("Reviewer_b2_Gemini_iter5.md"), "test").unwrap();
+
+        let sync = find_last_iteration(dir.path(), &[]);
+        let async_found = find_last_iteration_async(dir.path(), &[]).await;
+        assert_eq!(async_found, sync);
+    }
+
     #[test]
     fn find_last_iteration_multiple_files() {
         let dir = tempdir().unwrap();
@@ -3737,6 +5168,22 @@ mod tests {
             .map(|n| App::agent_file_key(n))
             .collect();
         assert_eq!(find_last_iteration(dir.path(), &keys), Some(3));
+    }
+
+    #[tokio::test]
+    async fn find_last_iteration_async_matches_sync_for_agent_files() {
+        let dir = tempdir().unwrap();
+        write_agent_iter(dir.path(), "Claude", 1);
+        write_agent_iter(dir.path(), "OpenAI", 4);
+        write_agent_iter(dir.path(), "Gemini", 2);
+
+        let keys: Vec<String> = ["Claude", "OpenAI", "Gemini"]
+            .iter()
+            .map(|n| App::agent_file_key(n))
+            .collect();
+        let sync = find_last_iteration(dir.path(), &keys);
+        let async_found = find_last_iteration_async(dir.path(), &keys).await;
+        assert_eq!(async_found, sync);
     }
 
     #[test]
@@ -4231,6 +5678,75 @@ mod tests {
     }
 
     #[test]
+    fn enforce_prompt_resume_constraints_disables_resume_in_multi_run_relay() {
+        let mut app = test_app();
+        app.selected_mode = ExecutionMode::Relay;
+        app.runs = 3;
+        app.resume_previous = true;
+
+        enforce_prompt_resume_constraints(&mut app);
+
+        assert!(!app.resume_previous);
+    }
+
+    #[test]
+    fn handle_prompt_resume_toggle_shows_error_when_disallowed() {
+        let mut app = test_app();
+        app.selected_mode = ExecutionMode::Swarm;
+        app.prompt_focus = PromptFocus::Resume;
+        app.runs = 2;
+        app.resume_previous = false;
+
+        handle_prompt_key(&mut app, key(KeyCode::Char(' ')));
+
+        assert!(!app.resume_previous);
+        assert_eq!(
+            app.error_modal,
+            Some("Resume is only supported for single-run execution".to_string())
+        );
+    }
+
+    #[test]
+    fn batch_result_entry_helpers_respect_expansion_state() {
+        let mut app = test_app();
+        app.batch_result_runs = vec![
+            BatchRunGroup {
+                run_id: 1,
+                files: vec![PathBuf::from("run1/a.md"), PathBuf::from("run1/b.md")],
+            },
+            BatchRunGroup {
+                run_id: 2,
+                files: vec![PathBuf::from("run2/c.md")],
+            },
+        ];
+        app.batch_result_root_files = vec![PathBuf::from("root.md")];
+        app.batch_result_expanded.insert(1);
+
+        assert_eq!(batch_result_visible_len(&app), 5);
+        assert!(matches!(
+            batch_result_entry_at(&app, 0),
+            Some(BatchResultEntry::RunHeader(1))
+        ));
+        assert!(matches!(
+            batch_result_entry_at(&app, 1),
+            Some(BatchResultEntry::File(path)) if path.ends_with("run1/a.md")
+        ));
+        assert!(matches!(
+            batch_result_entry_at(&app, 2),
+            Some(BatchResultEntry::File(path)) if path.ends_with("run1/b.md")
+        ));
+        assert!(matches!(
+            batch_result_entry_at(&app, 3),
+            Some(BatchResultEntry::RunHeader(2))
+        ));
+        assert!(matches!(
+            batch_result_entry_at(&app, 4),
+            Some(BatchResultEntry::File(path)) if path.ends_with("root.md")
+        ));
+        assert!(batch_result_entry_at(&app, 5).is_none());
+    }
+
+    #[test]
     fn prompt_focus_cycle_solo_tab_and_backtab() {
         let mut app = test_app();
         app.selected_mode = ExecutionMode::Solo;
@@ -4239,8 +5755,20 @@ mod tests {
         handle_prompt_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.prompt_focus, PromptFocus::SessionName);
         handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Iterations);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Runs);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Concurrency);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.prompt_focus, PromptFocus::Text);
 
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Concurrency);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Runs);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Iterations);
         handle_prompt_key(&mut app, key(KeyCode::BackTab));
         assert_eq!(app.prompt_focus, PromptFocus::SessionName);
         handle_prompt_key(&mut app, key(KeyCode::BackTab));
@@ -4258,12 +5786,20 @@ mod tests {
         handle_prompt_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.prompt_focus, PromptFocus::Iterations);
         handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Runs);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Concurrency);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.prompt_focus, PromptFocus::Resume);
         handle_prompt_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.prompt_focus, PromptFocus::Text);
 
         handle_prompt_key(&mut app, key(KeyCode::BackTab));
         assert_eq!(app.prompt_focus, PromptFocus::Resume);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Concurrency);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Runs);
         handle_prompt_key(&mut app, key(KeyCode::BackTab));
         assert_eq!(app.prompt_focus, PromptFocus::Iterations);
         handle_prompt_key(&mut app, key(KeyCode::BackTab));
@@ -4283,6 +5819,10 @@ mod tests {
         handle_prompt_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.prompt_focus, PromptFocus::Iterations);
         handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Runs);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
+        assert_eq!(app.prompt_focus, PromptFocus::Concurrency);
+        handle_prompt_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.prompt_focus, PromptFocus::Resume);
         handle_prompt_key(&mut app, key(KeyCode::Tab));
         assert_eq!(app.prompt_focus, PromptFocus::ForwardPrompt);
@@ -4293,6 +5833,10 @@ mod tests {
         assert_eq!(app.prompt_focus, PromptFocus::ForwardPrompt);
         handle_prompt_key(&mut app, key(KeyCode::BackTab));
         assert_eq!(app.prompt_focus, PromptFocus::Resume);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Concurrency);
+        handle_prompt_key(&mut app, key(KeyCode::BackTab));
+        assert_eq!(app.prompt_focus, PromptFocus::Runs);
         handle_prompt_key(&mut app, key(KeyCode::BackTab));
         assert_eq!(app.prompt_focus, PromptFocus::Iterations);
         handle_prompt_key(&mut app, key(KeyCode::BackTab));

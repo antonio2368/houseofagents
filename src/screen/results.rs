@@ -1,10 +1,10 @@
 use crate::app::App;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
-use ratatui::Frame;
 use std::path::{Path, PathBuf};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -45,28 +45,60 @@ pub fn draw(f: &mut Frame, app: &App) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(chunks[1]);
 
+    let batch_items = has_batch_results(app).then(|| visible_batch_items(app));
+
     // File list
-    let items: Vec<ListItem> = app
-        .result_files
-        .iter()
-        .enumerate()
-        .map(|(i, path)| {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
+    let items: Vec<ListItem> = if let Some(items) = batch_items.as_ref() {
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let style = if i == app.result_cursor {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
 
-            let style = if i == app.result_cursor {
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
+                let label = match item {
+                    VisibleBatchItem::RunHeader { run_id, expanded } => {
+                        format!("{} Run {run_id}", if *expanded { "▾" } else { "▸" })
+                    }
+                    VisibleBatchItem::File { depth, path } => {
+                        let name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        format!("{}{}", "  ".repeat(*depth), name)
+                    }
+                };
 
-            ListItem::new(name).style(style)
-        })
-        .collect();
+                ListItem::new(label).style(style)
+            })
+            .collect()
+    } else {
+        app.result_files
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let style = if i == app.result_cursor {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                ListItem::new(name).style(style)
+            })
+            .collect()
+    };
 
     let list = List::new(items).block(
         Block::default()
@@ -77,20 +109,34 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(list, main_chunks[0]);
 
     // Preview pane
-    let preview = Paragraph::new(render_preview(&app.result_preview, selected_file(app)))
+    let selected = selected_file_ref(app, batch_items.as_deref());
+    let preview = Paragraph::new(render_preview(&app.result_preview, selected))
         .wrap(Wrap { trim: false })
         .block(Block::default().title(" Preview ").borders(Borders::ALL));
     f.render_widget(preview, main_chunks[1]);
 
     // Help bar
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("j/k", Style::default().fg(Color::Yellow)),
-        Span::raw(": navigate  "),
-        Span::styled("Enter", Style::default().fg(Color::Yellow)),
-        Span::raw(": new run  "),
-        Span::styled("q", Style::default().fg(Color::Yellow)),
-        Span::raw(": quit"),
-    ]))
+    let help = Paragraph::new(Line::from(if batch_items.is_some() {
+        vec![
+            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::raw(": navigate  "),
+            Span::styled("Enter/l", Style::default().fg(Color::Yellow)),
+            Span::raw(": expand/collapse  "),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(": new run  "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(": quit"),
+        ]
+    } else {
+        vec![
+            Span::styled("j/k", Style::default().fg(Color::Yellow)),
+            Span::raw(": navigate  "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(": new run  "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(": quit"),
+        ]
+    }))
     .block(Block::default().borders(Borders::TOP));
     f.render_widget(help, chunks[2]);
 }
@@ -106,8 +152,47 @@ fn absolute_path(path: &Path) -> PathBuf {
     }
 }
 
-fn selected_file(app: &App) -> Option<&PathBuf> {
-    app.result_files.get(app.result_cursor)
+fn selected_file_ref<'a>(
+    app: &'a App,
+    batch_items: Option<&'a [VisibleBatchItem<'a>]>,
+) -> Option<&'a PathBuf> {
+    if let Some(items) = batch_items {
+        match items.get(app.result_cursor) {
+            Some(VisibleBatchItem::File { path, .. }) => Some(*path),
+            _ => None,
+        }
+    } else {
+        app.result_files.get(app.result_cursor)
+    }
+}
+
+fn has_batch_results(app: &App) -> bool {
+    !app.batch_result_runs.is_empty() || !app.batch_result_root_files.is_empty()
+}
+
+enum VisibleBatchItem<'a> {
+    RunHeader { run_id: u32, expanded: bool },
+    File { depth: usize, path: &'a PathBuf },
+}
+
+fn visible_batch_items(app: &App) -> Vec<VisibleBatchItem<'_>> {
+    let mut items = Vec::new();
+    for run in &app.batch_result_runs {
+        let expanded = app.batch_result_expanded.contains(&run.run_id);
+        items.push(VisibleBatchItem::RunHeader {
+            run_id: run.run_id,
+            expanded,
+        });
+        if expanded {
+            for path in &run.files {
+                items.push(VisibleBatchItem::File { depth: 1, path });
+            }
+        }
+    }
+    for path in &app.batch_result_root_files {
+        items.push(VisibleBatchItem::File { depth: 0, path });
+    }
+    items
 }
 
 fn render_preview(content: &str, selected_file: Option<&PathBuf>) -> Text<'static> {
@@ -331,13 +416,16 @@ mod tests {
     #[test]
     fn selected_file_returns_none_when_out_of_bounds() {
         let app = app_with_files(vec![PathBuf::from("a.md")], 5);
-        assert!(selected_file(&app).is_none());
+        assert!(selected_file_ref(&app, None).is_none());
     }
 
     #[test]
     fn selected_file_returns_current_file() {
         let app = app_with_files(vec![PathBuf::from("a.md"), PathBuf::from("b.md")], 1);
-        assert_eq!(selected_file(&app), Some(&PathBuf::from("b.md")));
+        assert_eq!(
+            selected_file_ref(&app, None).map(|path| path.as_path()),
+            Some(Path::new("b.md"))
+        );
     }
 
     #[test]

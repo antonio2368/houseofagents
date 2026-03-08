@@ -1,5 +1,5 @@
 use super::centered_rect;
-use crate::app::{App, ConsolidationPhase};
+use crate::app::{App, ConsolidationPhase, RunStatus, RunStepStatus};
 use crate::execution::{ExecutionMode, ProgressEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -11,6 +11,14 @@ use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn draw(f: &mut Frame, app: &App) {
+    if app.multi_run_total > 1 {
+        draw_multi_run(f, app);
+        if app.consolidation_active {
+            draw_consolidation_modal(f, app);
+        }
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -140,6 +148,8 @@ pub fn draw(f: &mut Frame, app: &App) {
                     "Type extra prompt  Enter: run  Esc: back"
                 }
             }
+            ConsolidationPhase::CrossRunConfirm => "Consolidate across runs? y/n",
+            ConsolidationPhase::CrossRunPrompt => "Type extra prompt  Enter: run  Esc: back",
         }
     } else {
         "Enter: view results  q: quit"
@@ -150,6 +160,148 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.consolidation_active {
         draw_consolidation_modal(f, app);
     }
+}
+
+fn draw_multi_run(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(8),
+            Constraint::Length(10),
+            Constraint::Length(3),
+        ])
+        .split(f.area());
+
+    let out_dir = app
+        .run_dir
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let title = Paragraph::new(vec![
+        Line::from(Span::styled(
+            format!(
+                "Running — {} mode ({} runs, concurrency {})",
+                app.selected_mode, app.multi_run_total, app.multi_run_concurrency
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("Output: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(out_dir, Style::default().fg(Color::DarkGray)),
+        ]),
+    ])
+    .block(Block::default().borders(Borders::BOTTOM));
+    f.render_widget(title, chunks[0]);
+
+    let completed = app
+        .multi_run_states
+        .iter()
+        .filter(|state| {
+            matches!(
+                state.status,
+                RunStatus::Done | RunStatus::Failed | RunStatus::Cancelled
+            )
+        })
+        .count();
+    let total = app.multi_run_states.len();
+    let ratio = if total > 0 {
+        completed as f64 / total as f64
+    } else {
+        0.0
+    };
+    let gauge = Gauge::default()
+        .block(Block::default().title(" Progress ").borders(Borders::ALL))
+        .gauge_style(Style::default().fg(Color::Cyan))
+        .ratio(ratio)
+        .label(format!("{completed}/{total}"));
+    f.render_widget(gauge, chunks[1]);
+
+    let items = app
+        .multi_run_states
+        .iter()
+        .enumerate()
+        .map(|(idx, state)| {
+            let mut spans = vec![Span::styled(
+                format!("Run {:>2}  ", state.run_id),
+                if idx == app.multi_run_cursor {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                },
+            )];
+
+            for step in &state.steps {
+                let (symbol, color) = step_symbol(step.status);
+                spans.push(Span::styled(symbol.to_string(), Style::default().fg(color)));
+                spans.push(Span::raw(" "));
+                spans.push(Span::raw(step.label.as_str()));
+                spans.push(Span::raw("  "));
+            }
+
+            spans.push(Span::styled(
+                run_status_label(state.status),
+                Style::default().fg(run_status_color(state.status)),
+            ));
+
+            ListItem::new(Line::from(spans))
+        })
+        .collect::<Vec<_>>();
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Runs ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    let mut list_state = ListState::default();
+    if !app.multi_run_states.is_empty() {
+        list_state.select(Some(
+            app.multi_run_cursor.min(app.multi_run_states.len() - 1),
+        ));
+    }
+    f.render_stateful_widget(list, chunks[2], &mut list_state);
+
+    let detail_lines = if let Some(state) = app.multi_run_states.get(app.multi_run_cursor) {
+        if state.recent_logs.is_empty() {
+            vec![Line::from("No logs yet.")]
+        } else {
+            state
+                .recent_logs
+                .iter()
+                .map(|line| Line::from(line.clone()))
+                .collect::<Vec<_>>()
+        }
+    } else {
+        vec![Line::from("No run selected.")]
+    };
+    let detail = Paragraph::new(detail_lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(" Selected Run Logs ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+    f.render_widget(detail, chunks[3]);
+
+    let help_text = if app.diagnostic_running {
+        "Analyzing reports for errors..."
+    } else if app.consolidation_running {
+        "Consolidating reports..."
+    } else if app.is_running {
+        "j/k: select run  Esc: cancel batch"
+    } else if app.consolidation_active {
+        "Enter consolidation choice"
+    } else {
+        "j/k: select run  Enter: view results  q: quit"
+    };
+    let help = Paragraph::new(help_text).block(Block::default().borders(Borders::TOP));
+    f.render_widget(help, chunks[4]);
 }
 
 fn draw_consolidation_modal(f: &mut Frame, app: &App) {
@@ -171,7 +323,11 @@ fn draw_consolidation_modal(f: &mut Frame, app: &App) {
     } else {
         match app.consolidation_phase {
             ConsolidationPhase::Confirm => vec![
-                Line::from("Consolidate last-iteration outputs now?"),
+                Line::from(if app.multi_run_total > 1 {
+                    "Consolidate each successful run individually?"
+                } else {
+                    "Consolidate last-iteration outputs now?"
+                }),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled("y", Style::default().fg(Color::Green)),
@@ -207,11 +363,61 @@ fn draw_consolidation_modal(f: &mut Frame, app: &App) {
                 Line::from(""),
                 Line::from("Press Enter to run consolidation."),
             ],
+            ConsolidationPhase::CrossRunConfirm => vec![
+                Line::from("Consolidate across successful runs?"),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("y", Style::default().fg(Color::Green)),
+                    Span::raw(": yes  "),
+                    Span::styled("n", Style::default().fg(Color::Red)),
+                    Span::raw(": no"),
+                ]),
+            ],
+            ConsolidationPhase::CrossRunPrompt => vec![
+                Line::from("Additional cross-run prompt to append (optional):"),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("{}_ ", app.consolidation_prompt),
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from("Press Enter to run cross-run consolidation."),
+            ],
         }
     };
 
     let p = Paragraph::new(content).wrap(Wrap { trim: false });
     f.render_widget(p, inner);
+}
+
+fn step_symbol(status: RunStepStatus) -> (char, Color) {
+    match status {
+        RunStepStatus::Queued => ('·', Color::DarkGray),
+        RunStepStatus::Pending => ('-', Color::Gray),
+        RunStepStatus::Running => (spinner_frame(), Color::Yellow),
+        RunStepStatus::Done => ('✓', Color::Green),
+        RunStepStatus::Error => ('✗', Color::Red),
+    }
+}
+
+fn run_status_label(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Done => "done",
+        RunStatus::Failed => "error",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
+fn run_status_color(status: RunStatus) -> Color {
+    match status {
+        RunStatus::Queued => Color::DarkGray,
+        RunStatus::Running => Color::Yellow,
+        RunStatus::Done => Color::Green,
+        RunStatus::Failed => Color::Red,
+        RunStatus::Cancelled => Color::Gray,
+    }
 }
 
 fn build_event_items(app: &App) -> Vec<ListItem<'_>> {

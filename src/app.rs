@@ -1,12 +1,12 @@
 use crate::config::{AgentConfig, AppConfig};
 use crate::execution::pipeline::{BlockId, PipelineDefinition};
-use crate::execution::{ExecutionMode, ProgressEvent};
+use crate::execution::{BatchProgressEvent, ExecutionMode, ProgressEvent};
 use crate::output::OutputManager;
 use crate::provider::ProviderKind;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +42,10 @@ pub struct App {
     pub session_name: String,
     pub iterations: u32,
     pub iterations_buf: String,
+    pub runs: u32,
+    pub runs_buf: String,
+    pub concurrency: u32,
+    pub concurrency_buf: String,
     pub resume_previous: bool,
     pub forward_prompt: bool,
     pub prompt_focus: PromptFocus,
@@ -56,17 +60,27 @@ pub struct App {
     pub run_error: Option<String>,
     pub consolidation_active: bool,
     pub consolidation_phase: ConsolidationPhase,
+    pub consolidation_target: ConsolidationTarget,
     pub consolidation_provider_cursor: usize,
     pub consolidation_prompt: String,
     pub consolidation_running: bool,
     pub consolidation_rx: Option<mpsc::UnboundedReceiver<Result<String, String>>>,
     pub diagnostic_running: bool,
     pub diagnostic_rx: Option<mpsc::UnboundedReceiver<Result<String, String>>>,
+    pub batch_stage1_done: bool,
+    pub multi_run_total: u32,
+    pub multi_run_concurrency: u32,
+    pub multi_run_cursor: usize,
+    pub multi_run_states: Vec<RunState>,
+    pub multi_run_step_labels: Vec<String>,
 
     // Results screen state
     pub result_files: Vec<PathBuf>,
     pub result_cursor: usize,
     pub result_preview: String,
+    pub batch_result_runs: Vec<BatchRunGroup>,
+    pub batch_result_root_files: Vec<PathBuf>,
+    pub batch_result_expanded: HashSet<u32>,
 
     // Edit popup
     pub show_edit_popup: bool,
@@ -102,6 +116,7 @@ pub struct App {
 
     // Execution channel state (not part of UI state)
     pub progress_rx: Option<mpsc::UnboundedReceiver<ProgressEvent>>,
+    pub batch_progress_rx: Option<mpsc::UnboundedReceiver<BatchProgressEvent>>,
     pub cancel_flag: Arc<AtomicBool>,
     pub run_dir: Option<PathBuf>,
 
@@ -116,6 +131,10 @@ pub struct App {
     pub pipeline_prompt_cursor: usize,
     pub pipeline_session_name: String,
     pub pipeline_iterations_buf: String,
+    pub pipeline_runs: u32,
+    pub pipeline_runs_buf: String,
+    pub pipeline_concurrency: u32,
+    pub pipeline_concurrency_buf: String,
 
     // Pipeline connect mode
     pub pipeline_connecting_from: Option<BlockId>,
@@ -156,6 +175,8 @@ pub enum PromptFocus {
     Text,
     SessionName,
     Iterations,
+    Runs,
+    Concurrency,
     Resume,
     ForwardPrompt,
 }
@@ -182,6 +203,15 @@ pub enum ConsolidationPhase {
     Confirm,
     Provider,
     Prompt,
+    CrossRunConfirm,
+    CrossRunPrompt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidationTarget {
+    SingleRun,
+    BatchPerRun,
+    BatchCrossRun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,7 +219,48 @@ pub enum PipelineFocus {
     InitialPrompt,
     SessionName,
     Iterations,
+    Runs,
+    Concurrency,
     Builder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStepStatus {
+    Queued,
+    Pending,
+    Running,
+    Done,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunStepState {
+    pub label: String,
+    pub status: RunStepStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct RunState {
+    pub run_id: u32,
+    pub status: RunStatus,
+    pub steps: Vec<RunStepState>,
+    pub recent_logs: VecDeque<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchRunGroup {
+    pub run_id: u32,
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,6 +324,10 @@ impl App {
             session_name: String::new(),
             iterations: 1,
             iterations_buf: "1".into(),
+            runs: 1,
+            runs_buf: "1".into(),
+            concurrency: 0,
+            concurrency_buf: "0".into(),
             resume_previous: false,
             forward_prompt: false,
             prompt_focus: PromptFocus::Text,
@@ -263,15 +338,25 @@ impl App {
             run_error: None,
             consolidation_active: false,
             consolidation_phase: ConsolidationPhase::Confirm,
+            consolidation_target: ConsolidationTarget::SingleRun,
             consolidation_provider_cursor: 0,
             consolidation_prompt: String::new(),
             consolidation_running: false,
             consolidation_rx: None,
             diagnostic_running: false,
             diagnostic_rx: None,
+            batch_stage1_done: false,
+            multi_run_total: 0,
+            multi_run_concurrency: 0,
+            multi_run_cursor: 0,
+            multi_run_states: Vec::new(),
+            multi_run_step_labels: Vec::new(),
             result_files: Vec::new(),
             result_cursor: 0,
             result_preview: String::new(),
+            batch_result_runs: Vec::new(),
+            batch_result_root_files: Vec::new(),
+            batch_result_expanded: HashSet::new(),
             show_edit_popup: false,
             edit_popup_section: EditPopupSection::Providers,
             edit_popup_cursor: 0,
@@ -293,6 +378,7 @@ impl App {
             help_popup_scroll: 0,
             error_modal: None,
             progress_rx: None,
+            batch_progress_rx: None,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             run_dir: None,
             pipeline_def: PipelineDefinition::default(),
@@ -303,6 +389,10 @@ impl App {
             pipeline_prompt_cursor: 0,
             pipeline_session_name: String::new(),
             pipeline_iterations_buf: "1".into(),
+            pipeline_runs: 1,
+            pipeline_runs_buf: "1".into(),
+            pipeline_concurrency: 0,
+            pipeline_concurrency_buf: "0".into(),
             pipeline_connecting_from: None,
             pipeline_removing_conn: false,
             pipeline_conn_cursor: 0,
@@ -395,6 +485,42 @@ impl App {
                 self.order_grabbed = Some(grabbed + 1);
             }
             self.order_cursor += 1;
+        }
+    }
+
+    pub fn init_multi_run_state(&mut self, runs: u32, concurrency: u32, step_labels: Vec<String>) {
+        self.multi_run_total = runs;
+        self.multi_run_concurrency = concurrency;
+        self.multi_run_cursor = 0;
+        self.multi_run_states = (1..=runs)
+            .map(|run_id| RunState::new(run_id, &step_labels))
+            .collect();
+        self.multi_run_step_labels = step_labels;
+    }
+}
+
+impl RunState {
+    pub fn new(run_id: u32, step_labels: &[String]) -> Self {
+        Self {
+            run_id,
+            status: RunStatus::Queued,
+            steps: step_labels
+                .iter()
+                .cloned()
+                .map(|label| RunStepState {
+                    label,
+                    status: RunStepStatus::Queued,
+                })
+                .collect(),
+            recent_logs: VecDeque::new(),
+            error: None,
+        }
+    }
+
+    pub fn push_log(&mut self, line: String) {
+        self.recent_logs.push_back(line);
+        while self.recent_logs.len() > 20 {
+            self.recent_logs.pop_front();
         }
     }
 }

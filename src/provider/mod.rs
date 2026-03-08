@@ -288,25 +288,15 @@ mod tests {
 
     #[test]
     fn validate_effort_config_rejects_anthropic_max_in_api_mode() {
-        let err = validate_effort_config(
-            ProviderKind::Anthropic,
-            false,
-            None,
-            Some("max"),
-        )
-        .expect_err("should reject api mode");
+        let err = validate_effort_config(ProviderKind::Anthropic, false, None, Some("max"))
+            .expect_err("should reject api mode");
         assert!(err.contains("requires CLI mode"));
     }
 
     #[test]
     fn validate_effort_config_allows_anthropic_max_in_cli_mode() {
-        validate_effort_config(
-            ProviderKind::Anthropic,
-            true,
-            None,
-            Some("max"),
-        )
-        .expect("cli mode should be allowed through to the provider");
+        validate_effort_config(ProviderKind::Anthropic, true, None, Some("max"))
+            .expect("cli mode should be allowed through to the provider");
     }
 
     #[test]
