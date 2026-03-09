@@ -5,8 +5,8 @@ use crate::output::OutputManager;
 use crate::provider::ProviderKind;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,9 +209,9 @@ pub enum ConsolidationPhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConsolidationTarget {
-    SingleRun,
-    BatchPerRun,
-    BatchCrossRun,
+    Single,
+    PerRun,
+    AcrossRuns,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,7 +338,7 @@ impl App {
             run_error: None,
             consolidation_active: false,
             consolidation_phase: ConsolidationPhase::Confirm,
-            consolidation_target: ConsolidationTarget::SingleRun,
+            consolidation_target: ConsolidationTarget::Single,
             consolidation_provider_cursor: 0,
             consolidation_prompt: String::new(),
             consolidation_running: false,

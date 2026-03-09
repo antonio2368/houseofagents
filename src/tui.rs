@@ -3,7 +3,7 @@ use crate::app::{
     HomeSection, PipelineDialogMode, PipelineEditField, PipelineFocus, PromptFocus, RunState,
     RunStatus, RunStepStatus, Screen,
 };
-use crate::config::{AgentConfig, ProviderConfig};
+use crate::config::{AgentConfig, AppConfig, ProviderConfig};
 use crate::event::{Event, EventHandler};
 use crate::execution::multi::run_multi;
 use crate::execution::pipeline::{self as pipeline_mod, BlockId};
@@ -19,12 +19,12 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use std::collections::HashMap;
 use std::io::{self, stdout};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -1771,9 +1771,9 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
         ConsolidationPhase::Confirm => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 app.consolidation_target = if app.multi_run_total > 1 {
-                    ConsolidationTarget::BatchPerRun
+                    ConsolidationTarget::PerRun
                 } else {
-                    ConsolidationTarget::SingleRun
+                    ConsolidationTarget::Single
                 };
                 app.consolidation_phase = if app.config.agents.len() <= 1 {
                     ConsolidationPhase::Prompt
@@ -1783,7 +1783,7 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 if app.multi_run_total > 1 {
-                    app.consolidation_target = ConsolidationTarget::BatchCrossRun;
+                    app.consolidation_target = ConsolidationTarget::AcrossRuns;
                     app.consolidation_phase = ConsolidationPhase::CrossRunConfirm;
                     app.consolidation_prompt.clear();
                 } else {
@@ -1807,7 +1807,7 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Enter => {
                 app.consolidation_phase =
-                    if app.consolidation_target == ConsolidationTarget::BatchCrossRun {
+                    if app.consolidation_target == ConsolidationTarget::AcrossRuns {
                         ConsolidationPhase::CrossRunPrompt
                     } else {
                         ConsolidationPhase::Prompt
@@ -1815,7 +1815,7 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
             }
             KeyCode::Esc => {
                 app.consolidation_phase =
-                    if app.consolidation_target == ConsolidationTarget::BatchCrossRun {
+                    if app.consolidation_target == ConsolidationTarget::AcrossRuns {
                         ConsolidationPhase::CrossRunConfirm
                     } else {
                         ConsolidationPhase::Confirm
@@ -1841,7 +1841,7 @@ fn handle_consolidation_key(app: &mut App, key: KeyEvent) {
         },
         ConsolidationPhase::CrossRunConfirm => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                app.consolidation_target = ConsolidationTarget::BatchCrossRun;
+                app.consolidation_target = ConsolidationTarget::AcrossRuns;
                 app.consolidation_phase = if app.config.agents.len() <= 1 {
                     ConsolidationPhase::CrossRunPrompt
                 } else {
@@ -1928,7 +1928,7 @@ fn reset_to_home(app: &mut App) {
     app.forward_prompt = false;
     app.consolidation_active = false;
     app.consolidation_phase = ConsolidationPhase::Confirm;
-    app.consolidation_target = ConsolidationTarget::SingleRun;
+    app.consolidation_target = ConsolidationTarget::Single;
     app.consolidation_provider_cursor = 0;
     app.consolidation_prompt.clear();
     app.consolidation_running = false;
@@ -2746,7 +2746,7 @@ fn reset_running_state(app: &mut App) {
     app.run_error = None;
     app.consolidation_active = false;
     app.consolidation_phase = ConsolidationPhase::Confirm;
-    app.consolidation_target = ConsolidationTarget::SingleRun;
+    app.consolidation_target = ConsolidationTarget::Single;
     app.consolidation_provider_cursor = 0;
     app.consolidation_prompt.clear();
     app.consolidation_running = false;
@@ -2820,19 +2820,33 @@ fn pipeline_step_labels(def: &pipeline_mod::PipelineDefinition) -> Vec<String> {
         .collect()
 }
 
-fn start_multi_execution(
-    app: &mut App,
-    config: crate::config::AppConfig,
+struct MultiExecutionParams {
+    config: AppConfig,
     client: reqwest::Client,
     prompt: String,
     agent_names: Vec<String>,
     mode: ExecutionMode,
     iterations: u32,
-    forward_prompt_flag: bool,
+    forward_prompt: bool,
     cli_timeout_secs: u64,
     runs: u32,
     concurrency: u32,
-) {
+}
+
+fn start_multi_execution(app: &mut App, params: MultiExecutionParams) {
+    let MultiExecutionParams {
+        config,
+        client,
+        prompt,
+        agent_names,
+        mode,
+        iterations,
+        forward_prompt,
+        cli_timeout_secs,
+        runs,
+        concurrency,
+    } = params;
+
     let resolved_agents = match resolve_selected_agent_configs(app, &agent_names) {
         Ok(resolved) => resolved,
         Err(message) => {
@@ -2983,7 +2997,7 @@ fn start_multi_execution(
                                 iterations,
                                 1,
                                 None,
-                                forward_prompt_flag,
+                                forward_prompt,
                                 use_cli_by_agent,
                                 &output,
                                 progress_tx,
@@ -3239,16 +3253,18 @@ fn start_execution(app: &mut App) {
         }
         start_multi_execution(
             app,
-            config,
-            client,
-            prompt,
-            agent_names,
-            mode,
-            iterations,
-            forward_prompt_flag,
-            cli_timeout_secs,
-            runs,
-            concurrency,
+            MultiExecutionParams {
+                config,
+                client,
+                prompt,
+                agent_names,
+                mode,
+                iterations,
+                forward_prompt: forward_prompt_flag,
+                cli_timeout_secs,
+                runs,
+                concurrency,
+            },
         );
         return;
     }
@@ -3258,6 +3274,7 @@ fn start_execution(app: &mut App) {
         std::collections::HashMap::new();
     let mut run_models: Vec<(String, String)> = Vec::new();
     let mut agent_info: Vec<(String, String)> = Vec::new();
+    let mut fallback_agent_kind = None;
     for name in &agent_names {
         let agent_config = match app.effective_agent_config(name).cloned() {
             Some(cfg) => cfg,
@@ -3276,6 +3293,7 @@ fn start_execution(app: &mut App) {
             return;
         }
 
+        fallback_agent_kind.get_or_insert(agent_config.provider);
         run_models.push((
             name.clone(),
             if agent_config.model.trim().is_empty() {
@@ -3458,6 +3476,7 @@ fn start_execution(app: &mut App) {
 
     app.progress_rx = Some(rx);
     app.cancel_flag = cancel.clone();
+    let fallback_agent_kind = fallback_agent_kind.unwrap_or(ProviderKind::Anthropic);
 
     tokio::spawn(async move {
         let result = match mode {
@@ -3496,18 +3515,32 @@ fn start_execution(app: &mut App) {
                 return;
             }
         };
-        if let Err(e) = result {
-            let err_str = e.to_string();
-            let _ = tx.send(ProgressEvent::AgentError {
-                agent: agent_names.first().cloned().unwrap_or_default(),
-                kind: ProviderKind::Anthropic,
-                iteration: 0,
-                error: err_str.clone(),
-                details: Some(err_str),
-            });
-            let _ = tx.send(ProgressEvent::AllDone);
-        }
+        handle_execution_task_result(
+            &tx,
+            result,
+            agent_names.first().cloned().unwrap_or_default(),
+            fallback_agent_kind,
+        );
     });
+}
+
+fn handle_execution_task_result(
+    tx: &mpsc::UnboundedSender<ProgressEvent>,
+    result: Result<(), crate::error::AppError>,
+    agent_name: String,
+    kind: ProviderKind,
+) {
+    if let Err(e) = result {
+        let err_str = e.to_string();
+        let _ = tx.send(ProgressEvent::AgentError {
+            agent: agent_name,
+            kind,
+            iteration: 0,
+            error: err_str.clone(),
+            details: Some(err_str),
+        });
+        let _ = tx.send(ProgressEvent::AllDone);
+    }
 }
 
 fn validate_agent_runtime(
@@ -3619,7 +3652,7 @@ fn handle_batch_progress(app: &mut App, event: BatchProgressEvent) {
             if should_offer_consolidation(app) {
                 app.consolidation_active = true;
                 app.consolidation_phase = ConsolidationPhase::Confirm;
-                app.consolidation_target = ConsolidationTarget::BatchPerRun;
+                app.consolidation_target = ConsolidationTarget::PerRun;
                 app.consolidation_provider_cursor = 0;
                 app.consolidation_prompt.clear();
                 app.consolidation_running = false;
@@ -4244,7 +4277,7 @@ fn start_consolidation(app: &mut App) {
     tokio::spawn(async move {
         let mut provider = provider;
         let result: Result<String, String> = match target {
-            ConsolidationTarget::SingleRun => {
+            ConsolidationTarget::Single => {
                 let files = discover_final_outputs_async(&run_dir, mode, &selected_agents).await;
                 if files.is_empty() {
                     Err("No iteration outputs found to consolidate".to_string())
@@ -4269,7 +4302,7 @@ fn start_consolidation(app: &mut App) {
                     }
                 }
             }
-            ConsolidationTarget::BatchPerRun => {
+            ConsolidationTarget::PerRun => {
                 if successful_runs.is_empty() {
                     Err("No successful runs available for consolidation".to_string())
                 } else {
@@ -4312,7 +4345,7 @@ fn start_consolidation(app: &mut App) {
                     result
                 }
             }
-            ConsolidationTarget::BatchCrossRun => {
+            ConsolidationTarget::AcrossRuns => {
                 if successful_runs.is_empty() {
                     Err("No successful runs available for cross-run consolidation".to_string())
                 } else {
@@ -4435,11 +4468,11 @@ fn handle_consolidation_result(app: &mut App, result: Result<String, String>) {
                 message: format!("Consolidation saved to {path}"),
             });
 
-            if app.consolidation_target == ConsolidationTarget::BatchPerRun {
+            if app.consolidation_target == ConsolidationTarget::PerRun {
                 app.batch_stage1_done = true;
                 app.consolidation_active = true;
                 app.consolidation_phase = ConsolidationPhase::CrossRunConfirm;
-                app.consolidation_target = ConsolidationTarget::BatchCrossRun;
+                app.consolidation_target = ConsolidationTarget::AcrossRuns;
                 app.consolidation_prompt.clear();
             } else {
                 app.consolidation_active = false;
@@ -4781,7 +4814,11 @@ fn load_results(app: &mut App) {
                             .flat_map(|entries| entries.flatten())
                             .filter_map(|entry| {
                                 let path = entry.path();
-                                if path.is_file() { Some(path) } else { None }
+                                if path.is_file() {
+                                    Some(path)
+                                } else {
+                                    None
+                                }
                             })
                             .collect::<Vec<_>>();
                         files.sort();
@@ -4904,12 +4941,14 @@ fn batch_result_entry_at(app: &App, mut index: usize) -> Option<BatchResultEntry
 mod tests {
     use super::*;
     use crate::config::AppConfig;
+    use crate::error::AppError;
     use crate::execution::ProgressEvent;
     use crossterm::event::KeyEvent;
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+    use tokio::sync::mpsc;
 
     fn test_config() -> AppConfig {
         AppConfig {
@@ -5039,6 +5078,33 @@ mod tests {
 
         validate_agent_runtime(&app, &agent.name, &agent)
             .expect("cli mode should be allowed through to the provider");
+    }
+
+    #[test]
+    fn handle_execution_task_result_uses_selected_provider_kind() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_execution_task_result(
+            &tx,
+            Err(AppError::Config("boom".to_string())),
+            "OpenAI".to_string(),
+            ProviderKind::OpenAI,
+        );
+
+        match rx.try_recv().expect("agent error event") {
+            ProgressEvent::AgentError {
+                agent, kind, error, ..
+            } => {
+                assert_eq!(agent, "OpenAI");
+                assert_eq!(kind, ProviderKind::OpenAI);
+                assert!(error.contains("Config error: boom"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv().expect("all done"),
+            ProgressEvent::AllDone
+        ));
     }
 
     #[test]

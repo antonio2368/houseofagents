@@ -283,6 +283,8 @@ impl AppConfig {
         const TEMPLATE: &str = r#"# House of Agents config
 output_dir = "~/houseofagents-output"
 default_max_tokens = 4096
+# For values 4+, providers keep the first exchange plus the newest messages.
+# For values 1-3, providers keep only the most recent messages up to the cap.
 max_history_messages = 50
 http_timeout_seconds = 120
 model_fetch_timeout_seconds = 30

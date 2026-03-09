@@ -82,9 +82,18 @@ pub trait Provider: Send + Sync {
     async fn send(&mut self, message: &str) -> Result<CompletionResponse, AppError>;
 }
 
-/// Prune message history keeping the first message (initial prompt) and most recent messages.
+/// Prune message history, preserving the first exchange only when the cap is large enough.
 pub fn prune_history(history: &mut Vec<Message>, max_messages: usize) {
-    if max_messages < 4 || history.len() <= max_messages {
+    if history.len() <= max_messages {
+        return;
+    }
+    if max_messages < 4 {
+        if max_messages == 0 {
+            history.clear();
+        } else {
+            let drain_end = history.len().saturating_sub(max_messages);
+            history.drain(..drain_end);
+        }
         return;
     }
     // Keep first 2 messages (initial user prompt + first response) and last (max-2) messages
@@ -300,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_history_noop_when_below_min_threshold() {
+    fn prune_history_small_limit_keeps_most_recent_messages() {
         let mut history = vec![
             Message {
                 role: Role::User,
@@ -324,7 +333,8 @@ mod tests {
             },
         ];
         prune_history(&mut history, 3);
-        assert_eq!(history.len(), 5);
+        let contents: Vec<String> = history.into_iter().map(|m| m.content).collect();
+        assert_eq!(contents, vec!["u2", "a2", "u3"]);
     }
 
     #[test]
@@ -363,6 +373,60 @@ mod tests {
         prune_history(&mut history, 6);
         let contents: Vec<String> = history.into_iter().map(|m| m.content).collect();
         assert_eq!(contents, vec!["m0", "m1", "m6", "m7", "m8", "m9"]);
+    }
+
+    #[test]
+    fn prune_history_limit_one_keeps_last_message() {
+        let mut history: Vec<Message> = (0..5)
+            .map(|i| Message {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: format!("m{i}"),
+            })
+            .collect();
+
+        prune_history(&mut history, 1);
+        let contents: Vec<String> = history.into_iter().map(|m| m.content).collect();
+        assert_eq!(contents, vec!["m4"]);
+    }
+
+    #[test]
+    fn prune_history_limit_two_keeps_last_two_messages() {
+        let mut history: Vec<Message> = (0..5)
+            .map(|i| Message {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: format!("m{i}"),
+            })
+            .collect();
+
+        prune_history(&mut history, 2);
+        let contents: Vec<String> = history.into_iter().map(|m| m.content).collect();
+        assert_eq!(contents, vec!["m3", "m4"]);
+    }
+
+    #[test]
+    fn prune_history_limit_three_keeps_last_three_messages() {
+        let mut history: Vec<Message> = (0..6)
+            .map(|i| Message {
+                role: if i % 2 == 0 {
+                    Role::User
+                } else {
+                    Role::Assistant
+                },
+                content: format!("m{i}"),
+            })
+            .collect();
+
+        prune_history(&mut history, 3);
+        let contents: Vec<String> = history.into_iter().map(|m| m.content).collect();
+        assert_eq!(contents, vec!["m3", "m4", "m5"]);
     }
 
     #[test]

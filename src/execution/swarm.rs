@@ -35,7 +35,7 @@ pub async fn run_swarm(
         let messages: Vec<String> = agents
             .iter()
             .map(|(name, _p)| {
-                if iteration == 1 {
+                if last_round_outputs.is_empty() {
                     prompt.to_string()
                 } else if use_cli_by_agent.get(name).copied().unwrap_or(false) {
                     build_swarm_file_message(&last_round_outputs, output.run_dir(), iteration - 1)
@@ -411,6 +411,63 @@ mod tests {
 
         assert!(recv_a.lock().expect("lock")[1].contains("Files:"));
         assert!(recv_b.lock().expect("lock")[1].contains("iter1.md"));
+    }
+
+    #[tokio::test]
+    async fn run_swarm_resume_uses_prior_outputs_when_starting_after_iteration_one() {
+        let dir = tempdir().expect("tempdir");
+        let out = OutputManager::new(dir.path(), None).expect("out");
+        let recv_a = Arc::new(Mutex::new(Vec::new()));
+        let recv_b = Arc::new(Mutex::new(Vec::new()));
+        let agents = vec![
+            named(
+                "Claude",
+                ProviderKind::Anthropic,
+                Box::new(MockProvider::with_responses(
+                    ProviderKind::Anthropic,
+                    vec![ok_response("a3")],
+                    recv_a.clone(),
+                )),
+            ),
+            named(
+                "OpenAI",
+                ProviderKind::OpenAI,
+                Box::new(MockProvider::with_responses(
+                    ProviderKind::OpenAI,
+                    vec![ok_response("o3")],
+                    recv_b.clone(),
+                )),
+            ),
+        ];
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let initial_outputs = HashMap::from([
+            ("Claude".to_string(), "a2".to_string()),
+            ("OpenAI".to_string(), "o2".to_string()),
+        ]);
+
+        run_swarm(
+            "prompt",
+            agents,
+            1,
+            3,
+            initial_outputs,
+            HashMap::new(),
+            &out,
+            tx,
+            cancel,
+        )
+        .await
+        .expect("run");
+
+        let a_msgs = recv_a.lock().expect("lock");
+        let b_msgs = recv_b.lock().expect("lock");
+        assert_eq!(a_msgs.len(), 1);
+        assert_eq!(b_msgs.len(), 1);
+        assert!(a_msgs[0].contains("previous round"));
+        assert!(b_msgs[0].contains("previous round"));
+        assert!(!a_msgs[0].contains("prompt"));
+        assert!(!b_msgs[0].contains("prompt"));
     }
 
     #[tokio::test]

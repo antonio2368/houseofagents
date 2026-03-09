@@ -112,6 +112,8 @@ The starter config lives at `~/.config/houseofagents/config.toml`:
 ```toml
 output_dir = "~/houseofagents-output"
 default_max_tokens = 4096
+# For values 4+, providers keep the first exchange plus the newest messages.
+# For values 1-3, providers keep only the most recent messages up to the cap.
 max_history_messages = 50
 http_timeout_seconds = 120
 model_fetch_timeout_seconds = 30
@@ -158,7 +160,7 @@ extra_cli_args = ""
 |-------|-------------|
 | `output_dir` | Base directory for run output folders |
 | `default_max_tokens` | Token budget sent to providers |
-| `max_history_messages` | Max chat history kept per provider session |
+| `max_history_messages` | Max chat history kept per provider session. Values `4+` preserve the first exchange plus newer messages; values `1-3` keep only the most recent messages. |
 | `http_timeout_seconds` | Timeout for API calls (`use_cli = false`) |
 | `model_fetch_timeout_seconds` | Timeout for model list fetch in config editor |
 | `cli_timeout_seconds` | Timeout for CLI calls (`use_cli = true`) |

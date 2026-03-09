@@ -4,6 +4,8 @@ use super::{
 use crate::error::AppError;
 use async_trait::async_trait;
 
+const GEMINI_API_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
 pub struct GeminiProvider {
     api_key: String,
     model: String,
@@ -33,6 +35,33 @@ impl GeminiProvider {
             history: Vec::new(),
         }
     }
+}
+
+fn build_generate_content_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::Request, AppError> {
+    Ok(client
+        .post(format!("{base_url}/models/{model}:generateContent"))
+        .header("content-type", "application/json")
+        .header("x-goog-api-key", api_key)
+        .json(body)
+        .build()?)
+}
+
+fn build_list_models_request(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+) -> Result<reqwest::Request, String> {
+    client
+        .get(format!("{base_url}/models?pageSize=1000"))
+        .header("x-goog-api-key", api_key)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 fn extract_content(resp_body: &serde_json::Value) -> Result<String, AppError> {
@@ -114,18 +143,15 @@ impl Provider for GeminiProvider {
             "generationConfig": gen_config,
         });
 
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model, self.api_key
-        );
+        let request = build_generate_content_request(
+            &self.client,
+            GEMINI_API_BASE_URL,
+            &self.api_key,
+            &self.model,
+            &body,
+        )?;
 
-        let resp = self
-            .client
-            .post(&url)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let resp = self.client.execute(request).await?;
 
         let status = resp.status();
         let resp_text = resp.text().await?;
@@ -159,12 +185,8 @@ impl Provider for GeminiProvider {
 }
 
 pub async fn list_models(api_key: &str, client: &reqwest::Client) -> Result<Vec<String>, String> {
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models?key={}&pageSize=1000",
-        api_key
-    );
-
-    let resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let request = build_list_models_request(client, GEMINI_API_BASE_URL, api_key)?;
+    let resp = client.execute(request).await.map_err(|e| e.to_string())?;
     let status = resp.status();
 
     if !status.is_success() {
@@ -194,7 +216,7 @@ pub async fn list_models(api_key: &str, client: &reqwest::Client) -> Result<Vec<
 
 #[cfg(test)]
 mod tests {
-    use super::extract_content;
+    use super::{build_generate_content_request, build_list_models_request, extract_content};
     use serde_json::json;
 
     #[test]
@@ -256,5 +278,53 @@ mod tests {
         assert!(err
             .to_string()
             .contains("No text content found in response"));
+    }
+
+    #[test]
+    fn build_generate_content_request_uses_header_auth() {
+        let client = reqwest::Client::new();
+        let body = json!({ "contents": [] });
+        let request = build_generate_content_request(
+            &client,
+            "https://example.com/v1beta",
+            "secret",
+            "gemini-2.5-pro",
+            &body,
+        )
+        .expect("request");
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://example.com/v1beta/models/gemini-2.5-pro:generateContent"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("secret")
+        );
+        assert!(request.url().query().is_none());
+    }
+
+    #[test]
+    fn build_list_models_request_uses_header_auth() {
+        let client = reqwest::Client::new();
+        let request = build_list_models_request(&client, "https://example.com/v1beta", "secret")
+            .expect("request");
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://example.com/v1beta/models?pageSize=1000"
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("secret")
+        );
+        assert!(request.url().query().is_some());
+        assert!(!request.url().as_str().contains("key=secret"));
     }
 }
