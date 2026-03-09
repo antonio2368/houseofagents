@@ -1,8 +1,8 @@
 use crate::execution::{BatchProgressEvent, ProgressEvent, RunOutcome};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 

@@ -10,8 +10,10 @@ use crate::execution::pipeline::{self as pipeline_mod, BlockId};
 use crate::execution::relay::run_relay;
 use crate::execution::solo::run_solo;
 use crate::execution::swarm::run_swarm;
-use crate::execution::{BatchProgressEvent, ExecutionMode, ProgressEvent, RunOutcome};
-use crate::output::OutputManager;
+use crate::execution::{
+    BatchProgressEvent, ExecutionMode, ProgressEvent, PromptRuntimeContext, RunOutcome,
+};
+use crate::output::{AgentSessionInfo, OutputManager};
 use crate::provider::{self, ProviderKind};
 
 use crossterm::event::{
@@ -1664,6 +1666,10 @@ fn start_pipeline_execution(app: &mut App) {
     let pipeline_def = app.pipeline_def.clone();
     let config = app.config.clone();
     let cli_timeout = app.effective_cli_timeout_seconds();
+    let prompt_context = PromptRuntimeContext::new(
+        pipeline_def.initial_prompt.clone(),
+        app.config.diagnostic_provider.is_some(),
+    );
 
     tokio::spawn(async move {
         let result = pipeline_mod::run_pipeline(
@@ -1672,6 +1678,7 @@ fn start_pipeline_execution(app: &mut App) {
             agent_configs,
             client,
             cli_timeout,
+            &prompt_context,
             &output,
             progress_tx.clone(),
             cancel,
@@ -2768,29 +2775,6 @@ fn reset_running_state(app: &mut App) {
     app.multi_run_step_labels.clear();
 }
 
-fn build_run_prompt(base_prompt: &str, has_any_cli: bool, diagnostics_enabled: bool) -> String {
-    let mut prompt = if has_any_cli {
-        let cwd = std::env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        if cwd.is_empty() {
-            base_prompt.to_string()
-        } else {
-            format!(
-                "Working directory: {cwd}\nYou have access to the data and files in this directory for context.\n\n{base_prompt}"
-            )
-        }
-    } else {
-        base_prompt.to_string()
-    };
-    if diagnostics_enabled {
-        prompt.push_str(
-            "\n\nWrite any encountered issues (for example permission, tool, or environment issues) to an explicit \"Errors\" section of your report.",
-        );
-    }
-    prompt
-}
-
 fn resolve_selected_agent_configs(
     app: &App,
     agent_names: &[String],
@@ -2823,7 +2807,8 @@ fn pipeline_step_labels(def: &pipeline_mod::PipelineDefinition) -> Vec<String> {
 struct MultiExecutionParams {
     config: AppConfig,
     client: reqwest::Client,
-    prompt: String,
+    raw_prompt: String,
+    prompt_context: PromptRuntimeContext,
     agent_names: Vec<String>,
     mode: ExecutionMode,
     iterations: u32,
@@ -2837,7 +2822,8 @@ fn start_multi_execution(app: &mut App, params: MultiExecutionParams) {
     let MultiExecutionParams {
         config,
         client,
-        prompt,
+        raw_prompt,
+        prompt_context,
         agent_names,
         mode,
         iterations,
@@ -2904,7 +2890,8 @@ fn start_multi_execution(app: &mut App, params: MultiExecutionParams) {
             cancel,
             move |run_id, progress_tx, cancel| {
                 let client = client.clone();
-                let prompt = prompt.clone();
+                let raw_prompt = raw_prompt.clone();
+                let prompt_context = prompt_context.clone();
                 let resolved_agents = resolved_agents.clone();
                 let batch_root_dir = batch_root_dir.clone();
                 let session_name = session_name.clone();
@@ -2928,7 +2915,7 @@ fn start_multi_execution(app: &mut App, params: MultiExecutionParams) {
                         }
                     };
 
-                    if let Err(e) = output.write_prompt(&prompt) {
+                    if let Err(e) = output.write_prompt(&raw_prompt) {
                         let _ = output.append_error(&format!("Failed to write prompt: {e}"));
                         return (
                             RunOutcome::Failed,
@@ -2988,11 +2975,19 @@ fn start_multi_execution(app: &mut App, params: MultiExecutionParams) {
 
                     let result = match mode {
                         ExecutionMode::Solo => {
-                            run_solo(&prompt, agents, &output, progress_tx, cancel.clone()).await
+                            run_solo(
+                                &prompt_context,
+                                agents,
+                                use_cli_by_agent,
+                                &output,
+                                progress_tx,
+                                cancel.clone(),
+                            )
+                            .await
                         }
                         ExecutionMode::Relay => {
                             run_relay(
-                                &prompt,
+                                &prompt_context,
                                 agents,
                                 iterations,
                                 1,
@@ -3007,7 +3002,7 @@ fn start_multi_execution(app: &mut App, params: MultiExecutionParams) {
                         }
                         ExecutionMode::Swarm => {
                             run_swarm(
-                                &prompt,
+                                &prompt_context,
                                 agents,
                                 iterations,
                                 1,
@@ -3087,6 +3082,10 @@ fn start_multi_pipeline_execution(
     let config = app.config.clone();
     let cli_timeout = app.effective_cli_timeout_seconds();
     let pipeline_def = app.pipeline_def.clone();
+    let prompt_context = PromptRuntimeContext::new(
+        pipeline_def.initial_prompt.clone(),
+        app.config.diagnostic_provider.is_some(),
+    );
     let pipeline_source = app
         .pipeline_save_path
         .as_ref()
@@ -3111,6 +3110,7 @@ fn start_multi_pipeline_execution(
                 let client = client.clone();
                 let config = config.clone();
                 let pipeline_def = pipeline_def.clone();
+                let prompt_context = prompt_context.clone();
                 let agent_configs = agent_configs.clone();
                 let batch_root_dir = batch_root_dir.clone();
                 let pipeline_source = pipeline_source.clone();
@@ -3179,6 +3179,7 @@ fn start_multi_pipeline_execution(
                         agent_configs,
                         client,
                         cli_timeout,
+                        &prompt_context,
                         &output,
                         progress_tx,
                         cancel.clone(),
@@ -3212,16 +3213,9 @@ fn start_execution(app: &mut App) {
     let cli_timeout_secs = app.effective_cli_timeout_seconds().max(1);
     let runs = app.runs.max(1);
     let concurrency = effective_concurrency(runs, app.concurrency);
-    let has_any_cli = app.selected_agents.iter().any(|name| {
-        app.effective_agent_config(name)
-            .map(|c| c.use_cli)
-            .unwrap_or(false)
-    });
-    let prompt = build_run_prompt(
-        &app.prompt_text,
-        has_any_cli,
-        app.config.diagnostic_provider.is_some(),
-    );
+    let raw_prompt = app.prompt_text.clone();
+    let prompt_context =
+        PromptRuntimeContext::new(raw_prompt.clone(), app.config.diagnostic_provider.is_some());
     let agent_names = app.selected_agents.clone();
     let mode = app.selected_mode;
     let forward_prompt_flag = app.forward_prompt;
@@ -3256,7 +3250,8 @@ fn start_execution(app: &mut App) {
             MultiExecutionParams {
                 config,
                 client,
-                prompt,
+                raw_prompt,
+                prompt_context,
                 agent_names,
                 mode,
                 iterations,
@@ -3365,6 +3360,13 @@ fn start_execution(app: &mut App) {
             }
         };
 
+        if let Err(message) = validate_resume_run(&run_dir, mode, &agent_names) {
+            app.error_modal = Some(message);
+            app.screen = Screen::Prompt;
+            app.is_running = false;
+            return;
+        }
+
         let last_iteration = match find_last_complete_iteration_for_agents(&run_dir, &agent_names) {
             Some(i) if i >= 1 => i,
             _ => {
@@ -3443,7 +3445,7 @@ fn start_execution(app: &mut App) {
     };
 
     if !resumed_run {
-        if let Err(e) = output.write_prompt(&prompt) {
+        if let Err(e) = output.write_prompt(&raw_prompt) {
             app.error_modal = Some(format!("Failed to write prompt file: {e}"));
             app.screen = Screen::Prompt;
             app.is_running = false;
@@ -3480,10 +3482,20 @@ fn start_execution(app: &mut App) {
 
     tokio::spawn(async move {
         let result = match mode {
-            ExecutionMode::Solo => run_solo(&prompt, agents, &output, tx.clone(), cancel).await,
+            ExecutionMode::Solo => {
+                run_solo(
+                    &prompt_context,
+                    agents,
+                    use_cli_by_agent,
+                    &output,
+                    tx.clone(),
+                    cancel,
+                )
+                .await
+            }
             ExecutionMode::Relay => {
                 run_relay(
-                    &prompt,
+                    &prompt_context,
                     agents,
                     iterations,
                     start_iteration,
@@ -3498,7 +3510,7 @@ fn start_execution(app: &mut App) {
             }
             ExecutionMode::Swarm => {
                 run_swarm(
-                    &prompt,
+                    &prompt_context,
                     agents,
                     iterations,
                     start_iteration,
@@ -4026,40 +4038,55 @@ fn find_latest_compatible_run(
     None
 }
 
+fn session_matches_resume(
+    session: &AgentSessionInfo,
+    mode: ExecutionMode,
+    agents: &[String],
+) -> bool {
+    if session.mode != mode {
+        return false;
+    }
+
+    match mode {
+        ExecutionMode::Relay => session.agents == agents,
+        ExecutionMode::Swarm => {
+            if session.agents.len() != agents.len() {
+                return false;
+            }
+            let stored: std::collections::HashSet<&String> = session.agents.iter().collect();
+            let requested: std::collections::HashSet<&String> = agents.iter().collect();
+            stored == requested
+        }
+        ExecutionMode::Solo | ExecutionMode::Pipeline => session.agents == agents,
+    }
+}
+
+fn validate_resume_run(
+    run_dir: &std::path::Path,
+    mode: ExecutionMode,
+    agents: &[String],
+) -> Result<(), String> {
+    let session = OutputManager::read_agent_session_info(run_dir)
+        .map_err(|e| format!("Failed to read session metadata: {e}"))?;
+    if session_matches_resume(&session, mode, agents) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Previous run at {} does not exactly match the selected {} configuration",
+            run_dir.display(),
+            mode
+        ))
+    }
+}
+
 fn run_dir_matches_mode_and_agents(
     run_dir: &std::path::Path,
     mode: ExecutionMode,
     agents: &[String],
 ) -> bool {
-    let session_path = run_dir.join("session.toml");
-    let Ok(content) = std::fs::read_to_string(session_path) else {
-        return false;
-    };
-    let Ok(value) = content.parse::<toml::Value>() else {
-        return false;
-    };
-
-    let Some(stored_mode) = value.get("mode").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    if stored_mode != mode.as_str() {
-        return false;
-    }
-
-    let Some(stored_agents) = value.get("agents").and_then(|v| v.as_array()) else {
-        return false;
-    };
-    let stored: std::collections::HashSet<String> = stored_agents
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect();
-    for agent_name in agents {
-        if !stored.contains(agent_name) {
-            return false;
-        }
-    }
-
-    true
+    OutputManager::read_agent_session_info(run_dir)
+        .map(|session| session_matches_resume(&session, mode, agents))
+        .unwrap_or(false)
 }
 
 fn parse_agent_iteration_filename(name: &str, agent_key: &str) -> Option<u32> {
@@ -4204,6 +4231,150 @@ fn build_cross_run_consolidation_prompt(
 
 const CROSS_RUN_MAX_INPUT_BYTES: u64 = 200 * 1024;
 
+struct ConsolidationRequest {
+    run_dir: std::path::PathBuf,
+    target: ConsolidationTarget,
+    mode: ExecutionMode,
+    selected_agents: Vec<String>,
+    successful_runs: Vec<u32>,
+    batch_stage1_done: bool,
+    additional: String,
+    agent_name: String,
+    agent_use_cli: bool,
+}
+
+async fn run_consolidation_with_provider_factory<F>(
+    request: ConsolidationRequest,
+    provider_factory: F,
+) -> Result<String, String>
+where
+    F: Fn() -> Box<dyn provider::Provider>,
+{
+    match request.target {
+        ConsolidationTarget::Single => {
+            let files = discover_final_outputs_async(
+                &request.run_dir,
+                request.mode,
+                &request.selected_agents,
+            )
+            .await;
+            if files.is_empty() {
+                return Err("No iteration outputs found to consolidate".to_string());
+            }
+
+            let prompt =
+                build_file_consolidation_prompt(&files, &request.additional, request.agent_use_cli)
+                    .await?;
+            let file_key = App::agent_file_key(&request.agent_name);
+            let output_path = request.run_dir.join(format!("consolidated_{file_key}.md"));
+            let mut provider = provider_factory();
+            let response = provider.send(&prompt).await.map_err(|e| e.to_string())?;
+            tokio::fs::write(&output_path, &response.content)
+                .await
+                .map(|_| output_path.display().to_string())
+                .map_err(|e| format!("Failed to write consolidation output: {e}"))
+        }
+        ConsolidationTarget::PerRun => {
+            if request.successful_runs.is_empty() {
+                return Err("No successful runs available for consolidation".to_string());
+            }
+
+            for run_id in request.successful_runs {
+                let run_path = request.run_dir.join(format!("run_{run_id}"));
+                let files =
+                    discover_final_outputs_async(&run_path, request.mode, &request.selected_agents)
+                        .await;
+                if files.len() <= 1 {
+                    continue;
+                }
+
+                let prompt = build_file_consolidation_prompt(
+                    &files,
+                    &request.additional,
+                    request.agent_use_cli,
+                )
+                .await?;
+                let mut provider = provider_factory();
+                let response = provider.send(&prompt).await.map_err(|e| e.to_string())?;
+                tokio::fs::write(run_path.join("consolidation.md"), response.content)
+                    .await
+                    .map_err(|e| format!("Failed to write per-run consolidation: {e}"))?;
+            }
+
+            Ok("Per-run consolidation completed".to_string())
+        }
+        ConsolidationTarget::AcrossRuns => {
+            if request.successful_runs.is_empty() {
+                return Err("No successful runs available for cross-run consolidation".to_string());
+            }
+
+            let mut run_inputs = Vec::new();
+            let mut total_raw_bytes = 0u64;
+
+            for run_id in request.successful_runs {
+                let run_path = request.run_dir.join(format!("run_{run_id}"));
+                if request.batch_stage1_done {
+                    let path = run_path.join("consolidation.md");
+                    match tokio::fs::metadata(&path).await {
+                        Ok(_) => match tokio::fs::read_to_string(&path).await {
+                            Ok(content) => {
+                                total_raw_bytes =
+                                    total_raw_bytes.saturating_add(content.len() as u64);
+                                if total_raw_bytes > CROSS_RUN_MAX_INPUT_BYTES {
+                                    return Err(
+                                        "Combined cross-run input is too large. Reduce runs or shorten per-run outputs.".to_string(),
+                                    );
+                                }
+                                run_inputs.push((run_id, content));
+                                continue;
+                            }
+                            Err(e) => {
+                                return Err(format!("Failed to read {}: {e}", path.display()));
+                            }
+                        },
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            return Err(format!("Failed to check {}: {e}", path.display()));
+                        }
+                    }
+                }
+
+                let files =
+                    discover_final_outputs_async(&run_path, request.mode, &request.selected_agents)
+                        .await;
+                for (_, path) in &files {
+                    total_raw_bytes += tokio::fs::metadata(path)
+                        .await
+                        .map(|meta| meta.len())
+                        .unwrap_or(0);
+                }
+                if !request.batch_stage1_done && total_raw_bytes > CROSS_RUN_MAX_INPUT_BYTES {
+                    return Err(
+                        "Combined output too large. Run per-run consolidation first.".to_string(),
+                    );
+                }
+
+                let prompt = build_file_consolidation_prompt(&files, "", false).await?;
+                run_inputs.push((run_id, prompt));
+            }
+
+            let prompt = build_cross_run_consolidation_prompt(
+                &run_inputs,
+                request.mode,
+                &request.selected_agents,
+                &request.additional,
+            );
+            let output_path = request.run_dir.join("cross_run_consolidation.md");
+            let mut provider = provider_factory();
+            let response = provider.send(&prompt).await.map_err(|e| e.to_string())?;
+            tokio::fs::write(&output_path, &response.content)
+                .await
+                .map(|_| output_path.display().to_string())
+                .map_err(|e| format!("Failed to write cross-run consolidation: {e}"))
+        }
+    }
+}
+
 fn start_consolidation(app: &mut App) {
     if app.consolidation_running {
         return;
@@ -4240,14 +4411,6 @@ fn start_consolidation(app: &mut App) {
 
     let provider_kind = agent_config.provider;
     let provider_config = agent_config.to_provider_config();
-    let provider = provider::create_provider(
-        provider_kind,
-        &provider_config,
-        client,
-        app.config.default_max_tokens,
-        app.config.max_history_messages,
-        app.effective_cli_timeout_seconds().max(1),
-    );
     let additional = app.consolidation_prompt.trim().to_string();
 
     app.progress_events.push(ProgressEvent::AgentStarted {
@@ -4273,167 +4436,35 @@ fn start_consolidation(app: &mut App) {
     let successful_runs = successful_run_ids(app);
     let target = app.consolidation_target;
     let batch_stage1_done = app.batch_stage1_done;
+    let default_max_tokens = app.config.default_max_tokens;
+    let max_history_messages = app.config.max_history_messages;
+    let cli_timeout = app.effective_cli_timeout_seconds().max(1);
 
     tokio::spawn(async move {
-        let mut provider = provider;
-        let result: Result<String, String> = match target {
-            ConsolidationTarget::Single => {
-                let files = discover_final_outputs_async(&run_dir, mode, &selected_agents).await;
-                if files.is_empty() {
-                    Err("No iteration outputs found to consolidate".to_string())
-                } else {
-                    match build_file_consolidation_prompt(&files, &additional, agent_config.use_cli)
-                        .await
-                    {
-                        Ok(prompt) => {
-                            let file_key = App::agent_file_key(&agent_name);
-                            let output_path = run_dir.join(format!("consolidated_{file_key}.md"));
-                            match provider.send(&prompt).await {
-                                Ok(resp) => tokio::fs::write(&output_path, &resp.content)
-                                    .await
-                                    .map(|_| output_path.display().to_string())
-                                    .map_err(|e| {
-                                        format!("Failed to write consolidation output: {e}")
-                                    }),
-                                Err(e) => Err(e.to_string()),
-                            }
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            }
-            ConsolidationTarget::PerRun => {
-                if successful_runs.is_empty() {
-                    Err("No successful runs available for consolidation".to_string())
-                } else {
-                    let mut result = Ok("Per-run consolidation completed".to_string());
-                    for run_id in successful_runs {
-                        let run_path = run_dir.join(format!("run_{run_id}"));
-                        let files =
-                            discover_final_outputs_async(&run_path, mode, &selected_agents).await;
-                        if files.len() <= 1 {
-                            continue;
-                        }
-                        let prompt = match build_file_consolidation_prompt(
-                            &files,
-                            &additional,
-                            agent_config.use_cli,
-                        )
-                        .await
-                        {
-                            Ok(prompt) => prompt,
-                            Err(e) => {
-                                result = Err(e);
-                                break;
-                            }
-                        };
-                        let response = match provider.send(&prompt).await {
-                            Ok(response) => response,
-                            Err(e) => {
-                                result = Err(e.to_string());
-                                break;
-                            }
-                        };
-                        if let Err(e) =
-                            tokio::fs::write(run_path.join("consolidation.md"), response.content)
-                                .await
-                        {
-                            result = Err(format!("Failed to write per-run consolidation: {e}"));
-                            break;
-                        }
-                    }
-                    result
-                }
-            }
-            ConsolidationTarget::AcrossRuns => {
-                if successful_runs.is_empty() {
-                    Err("No successful runs available for cross-run consolidation".to_string())
-                } else {
-                    let mut run_inputs = Vec::new();
-                    let mut total_raw_bytes = 0u64;
-                    let mut input_error = None;
-
-                    for run_id in successful_runs {
-                        let run_path = run_dir.join(format!("run_{run_id}"));
-                        if batch_stage1_done {
-                            let path = run_path.join("consolidation.md");
-                            match tokio::fs::metadata(&path).await {
-                                Ok(_) => match tokio::fs::read_to_string(&path).await {
-                                    Ok(content) => {
-                                        total_raw_bytes =
-                                            total_raw_bytes.saturating_add(content.len() as u64);
-                                        if total_raw_bytes > CROSS_RUN_MAX_INPUT_BYTES {
-                                            input_error = Some(
-                                                "Combined cross-run input is too large. Reduce runs or shorten per-run outputs.".to_string(),
-                                            );
-                                            break;
-                                        }
-                                        run_inputs.push((run_id, content));
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        input_error =
-                                            Some(format!("Failed to read {}: {e}", path.display()));
-                                        break;
-                                    }
-                                },
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => {
-                                    input_error =
-                                        Some(format!("Failed to check {}: {e}", path.display()));
-                                    break;
-                                }
-                            }
-                        }
-
-                        let files =
-                            discover_final_outputs_async(&run_path, mode, &selected_agents).await;
-                        for (_, path) in &files {
-                            total_raw_bytes += tokio::fs::metadata(path)
-                                .await
-                                .map(|m| m.len())
-                                .unwrap_or(0);
-                        }
-                        if !batch_stage1_done && total_raw_bytes > CROSS_RUN_MAX_INPUT_BYTES {
-                            input_error = Some(
-                                "Combined output too large. Run per-run consolidation first."
-                                    .to_string(),
-                            );
-                            break;
-                        }
-
-                        match build_file_consolidation_prompt(&files, "", false).await {
-                            Ok(prompt) => run_inputs.push((run_id, prompt)),
-                            Err(e) => {
-                                input_error = Some(e);
-                                break;
-                            }
-                        }
-                    }
-
-                    if let Some(error) = input_error {
-                        Err(error)
-                    } else {
-                        let prompt = build_cross_run_consolidation_prompt(
-                            &run_inputs,
-                            mode,
-                            &selected_agents,
-                            &additional,
-                        );
-                        let output_path = run_dir.join("cross_run_consolidation.md");
-                        match provider.send(&prompt).await {
-                            Ok(resp) => tokio::fs::write(&output_path, &resp.content)
-                                .await
-                                .map(|_| output_path.display().to_string())
-                                .map_err(|e| {
-                                    format!("Failed to write cross-run consolidation: {e}")
-                                }),
-                            Err(e) => Err(e.to_string()),
-                        }
-                    }
-                }
-            }
-        };
+        let result = run_consolidation_with_provider_factory(
+            ConsolidationRequest {
+                run_dir,
+                target,
+                mode,
+                selected_agents,
+                successful_runs,
+                batch_stage1_done,
+                additional,
+                agent_name,
+                agent_use_cli: agent_config.use_cli,
+            },
+            move || {
+                provider::create_provider(
+                    provider_kind,
+                    &provider_config,
+                    client.clone(),
+                    default_max_tokens,
+                    max_history_messages,
+                    cli_timeout,
+                )
+            },
+        )
+        .await;
         let _ = tx.send(result);
     });
 }
@@ -4943,6 +4974,7 @@ mod tests {
     use crate::config::AppConfig;
     use crate::error::AppError;
     use crate::execution::ProgressEvent;
+    use crate::provider::{CompletionResponse, Provider};
     use crossterm::event::KeyEvent;
     use std::collections::HashMap;
     use std::fs;
@@ -5014,6 +5046,26 @@ mod tests {
             use_cli,
             cli_print_mode: true,
             extra_cli_args: String::new(),
+        }
+    }
+
+    struct HistoryEchoProvider {
+        kind: ProviderKind,
+        calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for HistoryEchoProvider {
+        fn kind(&self) -> ProviderKind {
+            self.kind
+        }
+
+        async fn send(&mut self, _message: &str) -> Result<CompletionResponse, AppError> {
+            self.calls += 1;
+            Ok(CompletionResponse {
+                content: format!("call {}", self.calls),
+                debug_logs: Vec::new(),
+            })
         }
     }
 
@@ -5288,14 +5340,38 @@ mod tests {
     }
 
     #[test]
-    fn run_dir_matches_subset_agents() {
+    fn run_dir_matches_relay_requires_exact_agent_order() {
         let dir = tempdir().unwrap();
         write_session_toml(dir.path(), "relay", &["anthropic", "openai"]);
 
-        assert!(run_dir_matches_mode_and_agents(
+        assert!(!run_dir_matches_mode_and_agents(
             dir.path(),
             ExecutionMode::Relay,
             &["anthropic".to_string()]
+        ));
+    }
+
+    #[test]
+    fn run_dir_matches_relay_rejects_different_agent_order() {
+        let dir = tempdir().unwrap();
+        write_session_toml(dir.path(), "relay", &["anthropic", "openai"]);
+
+        assert!(!run_dir_matches_mode_and_agents(
+            dir.path(),
+            ExecutionMode::Relay,
+            &["openai".to_string(), "anthropic".to_string()]
+        ));
+    }
+
+    #[test]
+    fn run_dir_matches_swarm_accepts_different_agent_order_for_same_set() {
+        let dir = tempdir().unwrap();
+        write_session_toml(dir.path(), "swarm", &["anthropic", "openai"]);
+
+        assert!(run_dir_matches_mode_and_agents(
+            dir.path(),
+            ExecutionMode::Swarm,
+            &["openai".to_string(), "anthropic".to_string()]
         ));
     }
 
@@ -5423,6 +5499,20 @@ mod tests {
             ),
             Some(good)
         );
+    }
+
+    #[test]
+    fn validate_resume_run_rejects_named_session_with_wrong_relay_order() {
+        let dir = tempdir().unwrap();
+        write_session_toml(dir.path(), "relay", &["anthropic", "openai"]);
+
+        let err = validate_resume_run(
+            dir.path(),
+            ExecutionMode::Relay,
+            &["openai".to_string(), "anthropic".to_string()],
+        )
+        .expect_err("should reject");
+        assert!(err.contains("does not exactly match"));
     }
 
     #[test]
@@ -5583,6 +5673,51 @@ mod tests {
         let missing = PathBuf::from("/tmp/does-not-exist-for-houseofagents-tests.md");
         let prompt = build_diagnostic_prompt(&[missing], &[], false);
         assert!(prompt.contains("Failed to read file:"));
+    }
+
+    #[tokio::test]
+    async fn per_run_consolidation_recreates_provider_each_run() {
+        let dir = tempdir().unwrap();
+        let batch_root = OutputManager::new_batch_parent(dir.path(), Some("batch")).unwrap();
+        let run1 = batch_root.new_run_subdir(1).unwrap();
+        let run2 = batch_root.new_run_subdir(2).unwrap();
+
+        for run_dir in [run1.run_dir(), run2.run_dir()] {
+            fs::write(run_dir.join("Claude_iter1.md"), "claude").unwrap();
+            fs::write(run_dir.join("OpenAI_iter1.md"), "openai").unwrap();
+        }
+
+        let result = run_consolidation_with_provider_factory(
+            ConsolidationRequest {
+                run_dir: batch_root.run_dir().clone(),
+                target: ConsolidationTarget::PerRun,
+                mode: ExecutionMode::Solo,
+                selected_agents: vec!["Claude".to_string(), "OpenAI".to_string()],
+                successful_runs: vec![1, 2],
+                batch_stage1_done: false,
+                additional: String::new(),
+                agent_name: "Claude".to_string(),
+                agent_use_cli: false,
+            },
+            || {
+                Box::new(HistoryEchoProvider {
+                    kind: ProviderKind::Anthropic,
+                    calls: 0,
+                })
+            },
+        )
+        .await
+        .expect("consolidation");
+
+        assert_eq!(result, "Per-run consolidation completed");
+        assert_eq!(
+            fs::read_to_string(run1.run_dir().join("consolidation.md")).unwrap(),
+            "call 1"
+        );
+        assert_eq!(
+            fs::read_to_string(run2.run_dir().join("consolidation.md")).unwrap(),
+            "call 1"
+        );
     }
 
     #[test]

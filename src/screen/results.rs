@@ -1,10 +1,10 @@
 use crate::app::App;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::Frame;
 use std::path::{Path, PathBuf};
 
 pub fn draw(f: &mut Frame, app: &App) {

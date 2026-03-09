@@ -13,6 +13,11 @@ pub(crate) struct MockProvider {
     live_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
+pub(crate) struct PanicProvider {
+    kind: ProviderKind,
+    panic_message: &'static str,
+}
+
 impl MockProvider {
     pub(crate) fn with_responses(
         kind: ProviderKind,
@@ -47,6 +52,15 @@ impl MockProvider {
     }
 }
 
+impl PanicProvider {
+    pub(crate) fn new(kind: ProviderKind, panic_message: &'static str) -> Self {
+        Self {
+            kind,
+            panic_message,
+        }
+    }
+}
+
 #[async_trait]
 impl Provider for MockProvider {
     fn kind(&self) -> ProviderKind {
@@ -71,6 +85,17 @@ impl Provider for MockProvider {
                 debug_logs: Vec::new(),
             })
         })
+    }
+}
+
+#[async_trait]
+impl Provider for PanicProvider {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    async fn send(&mut self, _message: &str) -> Result<CompletionResponse, AppError> {
+        panic!("{}", self.panic_message);
     }
 }
 

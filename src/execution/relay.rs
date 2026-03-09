@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::execution::{truncate_chars, wait_for_cancel, ProgressEvent};
+use crate::execution::{truncate_chars, wait_for_cancel, ProgressEvent, PromptRuntimeContext};
 use crate::output::OutputManager;
 use crate::provider::Provider;
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_relay(
-    prompt: &str,
+    prompt_context: &PromptRuntimeContext,
     mut agents: Vec<(String, Box<dyn Provider>)>,
     iterations: u32,
     start_iteration: u32,
@@ -51,21 +51,21 @@ pub async fn run_relay(
                 message: "Sending request...".into(),
             });
 
+            let receiver_is_cli = use_cli_by_agent.get(name).copied().unwrap_or(false);
             let message = if !has_initial_last_output && offset == 0 && i == 0 {
-                prompt.to_string()
+                prompt_context.initial_prompt_for_agent(receiver_is_cli)
             } else {
                 let (ref prev_name, ref _prev_kind) = if i == 0 {
                     &agent_info[num_agents - 1]
                 } else {
                     &agent_info[i - 1]
                 };
-                let receiver_is_cli = use_cli_by_agent.get(name).copied().unwrap_or(false);
                 let task_prefix = if forward_prompt {
-                    format!("Original task: {}\n\n", prompt)
+                    format!("Original task: {}\n\n", prompt_context.raw_prompt())
                 } else {
                     String::new()
                 };
-                if receiver_is_cli {
+                let base_message = if receiver_is_cli {
                     let prev_iteration = if i == 0 { iteration - 1 } else { iteration };
                     let prev_file_key = OutputManager::sanitize_session_name(prev_name);
                     let prev_path = output
@@ -82,7 +82,8 @@ pub async fn run_relay(
                         "{}Here is the output from {} (the previous agent):\n\n---\n{}\n---\n\nPlease build upon and improve this work.",
                         task_prefix, prev_name, last_output
                     )
-                }
+                };
+                prompt_context.augment_prompt_for_agent(&base_message, receiver_is_cli)
             };
 
             // Use select! so cancel aborts the in-flight request
@@ -214,6 +215,10 @@ mod tests {
         (name.to_string(), provider)
     }
 
+    fn context(prompt: &str) -> PromptRuntimeContext {
+        PromptRuntimeContext::new(prompt, false)
+    }
+
     #[tokio::test]
     async fn run_relay_one_iteration_passes_previous_output_to_next_agent() {
         let dir = tempdir().expect("tempdir");
@@ -244,7 +249,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
-            "initial prompt",
+            &context("initial prompt"),
             agents,
             1,
             1,
@@ -302,9 +307,20 @@ mod tests {
         let mut use_cli = HashMap::new();
         use_cli.insert("OpenAI".to_string(), true);
 
-        run_relay("p", agents, 1, 1, None, false, use_cli, &out, tx, cancel)
-            .await
-            .expect("run");
+        run_relay(
+            &context("p"),
+            agents,
+            1,
+            1,
+            None,
+            false,
+            use_cli,
+            &out,
+            tx,
+            cancel,
+        )
+        .await
+        .expect("run");
 
         let b_msgs = recv_b.lock().expect("lock");
         assert!(b_msgs[0].contains("Read the previous agent output from file"));
@@ -329,7 +345,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
-            "ignored",
+            &context("ignored"),
             agents,
             1,
             2,
@@ -366,7 +382,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
-            "initial prompt",
+            &context("initial prompt"),
             agents,
             1,
             3,
@@ -399,7 +415,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
-            "p",
+            &context("p"),
             agents,
             2,
             1,
@@ -440,7 +456,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true));
 
         run_relay(
-            "p",
+            &context("p"),
             agents,
             1,
             1,
@@ -479,7 +495,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
-            "p",
+            &context("p"),
             agents,
             2,
             1,
@@ -534,7 +550,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_relay(
-            "write a poem",
+            &context("write a poem"),
             agents,
             1,
             1,
@@ -588,7 +604,7 @@ mod tests {
         use_cli.insert("OpenAI".to_string(), true);
 
         run_relay(
-            "write a poem",
+            &context("write a poem"),
             agents,
             1,
             1,

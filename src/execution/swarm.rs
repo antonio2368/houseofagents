@@ -1,5 +1,5 @@
 use crate::error::AppError;
-use crate::execution::{truncate_chars, wait_for_cancel, ProgressEvent};
+use crate::execution::{truncate_chars, wait_for_cancel, ProgressEvent, PromptRuntimeContext};
 use crate::output::OutputManager;
 use crate::provider::Provider;
 use std::collections::HashMap;
@@ -12,7 +12,7 @@ type SwarmWorkerResult = (usize, String, Box<dyn Provider>, Option<(String, Stri
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_swarm(
-    prompt: &str,
+    prompt_context: &PromptRuntimeContext,
     mut agents: Vec<(String, Box<dyn Provider>)>,
     iterations: u32,
     start_iteration: u32,
@@ -35,19 +35,25 @@ pub async fn run_swarm(
         let messages: Vec<String> = agents
             .iter()
             .map(|(name, _p)| {
-                if last_round_outputs.is_empty() {
-                    prompt.to_string()
-                } else if use_cli_by_agent.get(name).copied().unwrap_or(false) {
+                let is_cli = use_cli_by_agent.get(name).copied().unwrap_or(false);
+                let base_message = if last_round_outputs.is_empty() {
+                    prompt_context.raw_prompt().to_string()
+                } else if is_cli {
                     build_swarm_file_message(&last_round_outputs, output.run_dir(), iteration - 1)
                 } else {
                     build_swarm_message(&last_round_outputs)
-                }
+                };
+                prompt_context.augment_prompt_for_agent(&base_message, is_cli)
             })
             .collect();
 
         // Take ownership of agents for parallel execution
         let taken: Vec<(String, Box<dyn Provider>)> = std::mem::take(&mut agents);
-        let mut spawn_handles: Vec<JoinHandle<SwarmWorkerResult>> = Vec::new();
+        let mut spawn_handles: Vec<(
+            String,
+            crate::provider::ProviderKind,
+            JoinHandle<SwarmWorkerResult>,
+        )> = Vec::new();
 
         for (i, ((name, mut provider), message)) in
             taken.into_iter().zip(messages.into_iter()).enumerate()
@@ -71,7 +77,7 @@ pub async fn run_swarm(
             let run_dir = output.run_dir().clone();
             let iter = iteration;
 
-            spawn_handles.push(tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 if cancel_flag.load(Ordering::Relaxed) {
                     return (i, agent_name, provider, None);
                 }
@@ -163,19 +169,40 @@ pub async fn run_swarm(
                         (i, agent_name, provider, None)
                     }
                 }
-            }));
+            });
+            spawn_handles.push((name, kind, handle));
         }
 
         // Collect results and restore agents
         let mut round_outputs: HashMap<String, String> = HashMap::new();
         let mut restored: Vec<(usize, String, Box<dyn Provider>)> = Vec::new();
-        for handle in spawn_handles {
-            if let Ok((idx, name, provider, result)) = handle.await {
-                if let Some((_agent_name, content)) = result {
-                    round_outputs.insert(name.clone(), content);
+        let mut saw_panic = false;
+        for (agent_name, kind, handle) in spawn_handles {
+            match handle.await {
+                Ok((idx, name, provider, result)) => {
+                    if let Some((_agent_name, content)) = result {
+                        round_outputs.insert(name.clone(), content);
+                    }
+                    restored.push((idx, name, provider));
                 }
-                restored.push((idx, name, provider));
+                Err(join_error) => {
+                    saw_panic = true;
+                    let error = format!("Swarm worker panicked: {join_error}");
+                    let _ = progress_tx.send(ProgressEvent::AgentError {
+                        agent: agent_name.clone(),
+                        kind,
+                        iteration,
+                        error: error.clone(),
+                        details: Some(error.clone()),
+                    });
+                    let _ = output.append_error(&format!("{agent_name} iter{iteration}: {error}"));
+                }
             }
+        }
+
+        if saw_panic {
+            let _ = progress_tx.send(ProgressEvent::AllDone);
+            return Ok(());
         }
 
         restored.sort_by_key(|(idx, _, _)| *idx);
@@ -225,7 +252,9 @@ fn build_swarm_file_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::test_utils::{collect_progress_events, ok_response, MockProvider};
+    use crate::execution::test_utils::{
+        collect_progress_events, ok_response, MockProvider, PanicProvider,
+    };
     use crate::provider::ProviderKind;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
@@ -236,6 +265,10 @@ mod tests {
         provider: Box<dyn crate::provider::Provider>,
     ) -> (String, Box<dyn crate::provider::Provider>) {
         (name.to_string(), provider)
+    }
+
+    fn context(prompt: &str) -> PromptRuntimeContext {
+        PromptRuntimeContext::new(prompt, false)
     }
 
     #[test]
@@ -290,7 +323,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_swarm(
-            "prompt",
+            &context("prompt"),
             agents,
             1,
             1,
@@ -342,7 +375,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_swarm(
-            "prompt",
+            &context("prompt"),
             agents,
             2,
             1,
@@ -396,7 +429,7 @@ mod tests {
         use_cli.insert("OpenAI".to_string(), true);
 
         run_swarm(
-            "prompt",
+            &context("prompt"),
             agents,
             2,
             1,
@@ -447,7 +480,7 @@ mod tests {
         ]);
 
         run_swarm(
-            "prompt",
+            &context("prompt"),
             agents,
             1,
             3,
@@ -496,7 +529,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_swarm(
-            "prompt",
+            &context("prompt"),
             agents,
             1,
             1,
@@ -534,7 +567,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(true));
 
         run_swarm(
-            "prompt",
+            &context("prompt"),
             agents,
             1,
             1,
@@ -572,7 +605,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         run_swarm(
-            "prompt",
+            &context("prompt"),
             agents,
             1,
             1,
@@ -593,5 +626,60 @@ mod tests {
                 if error.contains("Failed to write output file")
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn run_swarm_panics_emit_agent_error_and_append_error_log() {
+        let dir = tempdir().expect("tempdir");
+        let out = OutputManager::new(dir.path(), Some("swarm-panic")).expect("out");
+        let recv = Arc::new(Mutex::new(Vec::new()));
+        let agents = vec![
+            named(
+                "Claude",
+                ProviderKind::Anthropic,
+                Box::new(PanicProvider::new(ProviderKind::Anthropic, "swarm panic")),
+            ),
+            named(
+                "OpenAI",
+                ProviderKind::OpenAI,
+                Box::new(MockProvider::ok(ProviderKind::OpenAI, "ok", recv)),
+            ),
+        ];
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        run_swarm(
+            &context("prompt"),
+            agents,
+            1,
+            1,
+            HashMap::new(),
+            HashMap::new(),
+            &out,
+            tx,
+            cancel,
+        )
+        .await
+        .expect("run");
+
+        let events = collect_progress_events(rx);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::AgentError {
+                    agent,
+                    kind: ProviderKind::Anthropic,
+                    error,
+                    ..
+                } if agent == "Claude" && error.contains("panicked")
+            )
+        }));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::AllDone)));
+
+        let log = std::fs::read_to_string(out.run_dir().join("_errors.log")).expect("log");
+        assert!(log.contains("Claude iter1"));
+        assert!(log.contains("swarm panic"));
     }
 }

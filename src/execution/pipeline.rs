@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::error::AppError;
-use crate::execution::{wait_for_cancel, ProgressEvent};
+use crate::execution::{wait_for_cancel, ProgressEvent, PromptRuntimeContext};
 use crate::output::OutputManager;
 use crate::provider::{self, ProviderKind};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,24 @@ use tokio::sync::{mpsc, Mutex};
 pub type BlockId = u32;
 #[allow(dead_code)]
 type ProviderPool = HashMap<(String, String), Arc<Mutex<Box<dyn provider::Provider>>>>;
+type PipelineAgentConfigs = HashMap<String, (ProviderKind, crate::config::ProviderConfig, bool)>;
+
+#[derive(Debug, Clone)]
+struct PipelineTaskMetadata {
+    block_id: BlockId,
+    agent_name: String,
+    label: String,
+    iteration: u32,
+}
+
+struct PipelineMessageContext<'a> {
+    def: &'a PipelineDefinition,
+    iteration: u32,
+    block_outputs: &'a HashMap<BlockId, String>,
+    previous_terminal_outputs: &'a str,
+    output: &'a OutputManager,
+    prompt_context: &'a PromptRuntimeContext,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineBlock {
@@ -310,13 +328,47 @@ pub fn list_pipeline_files() -> io::Result<Vec<PathBuf>> {
 pub async fn run_pipeline(
     def: &PipelineDefinition,
     config: &AppConfig,
-    agent_configs: HashMap<String, (ProviderKind, crate::config::ProviderConfig, bool)>,
+    agent_configs: PipelineAgentConfigs,
     client: reqwest::Client,
     cli_timeout_secs: u64,
+    prompt_context: &PromptRuntimeContext,
     output: &OutputManager,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
+    run_pipeline_with_provider_factory(
+        def,
+        agent_configs,
+        prompt_context,
+        output,
+        progress_tx,
+        cancel,
+        |kind, cfg| {
+            provider::create_provider(
+                kind,
+                cfg,
+                client.clone(),
+                config.default_max_tokens,
+                config.max_history_messages,
+                cli_timeout_secs,
+            )
+        },
+    )
+    .await
+}
+
+async fn run_pipeline_with_provider_factory<F>(
+    def: &PipelineDefinition,
+    agent_configs: PipelineAgentConfigs,
+    prompt_context: &PromptRuntimeContext,
+    output: &OutputManager,
+    progress_tx: mpsc::UnboundedSender<ProgressEvent>,
+    cancel: Arc<AtomicBool>,
+    provider_factory: F,
+) -> Result<(), AppError>
+where
+    F: Fn(ProviderKind, &crate::config::ProviderConfig) -> Box<dyn provider::Provider>,
+{
     let total_blocks = def.blocks.len();
     if total_blocks == 0 {
         let _ = progress_tx.send(ProgressEvent::AllDone);
@@ -334,14 +386,7 @@ pub async fn run_pipeline(
         let pool_key = (block.agent.clone(), session_key);
         if let std::collections::hash_map::Entry::Vacant(entry) = provider_pool.entry(pool_key) {
             if let Some((kind, cfg, _use_cli)) = agent_configs.get(&block.agent) {
-                let p = provider::create_provider(
-                    *kind,
-                    cfg,
-                    client.clone(),
-                    config.default_max_tokens,
-                    config.max_history_messages,
-                    cli_timeout_secs,
-                );
+                let p = provider_factory(*kind, cfg);
                 entry.insert(Arc::new(Mutex::new(p)));
             }
         }
@@ -381,6 +426,7 @@ pub async fn run_pipeline(
 
         let mut tasks: tokio::task::JoinSet<(BlockId, Result<String, String>)> =
             tokio::task::JoinSet::new();
+        let mut task_metadata: HashMap<tokio::task::Id, PipelineTaskMetadata> = HashMap::new();
 
         while completed < total_blocks {
             tokio::select! {
@@ -394,11 +440,7 @@ pub async fn run_pipeline(
                         None => { completed += 1; continue; }
                     };
                     let agent_name = block.agent.clone();
-                    let label = if block.name.trim().is_empty() {
-                        format!("Block {} ({})", block_id, agent_name)
-                    } else {
-                        block.name.clone()
-                    };
+                    let label = block_label(block);
 
                     // Check for failed upstream
                     let failed_upstream: Vec<BlockId> = upstream_of(def, block_id)
@@ -430,63 +472,22 @@ pub async fn run_pipeline(
                         continue;
                     }
 
-                    // Build message
-                    let is_root = upstream_of(def, block_id).is_empty();
-                    let use_cli = agent_configs.get(&agent_name).map(|(_, _, cli)| *cli).unwrap_or(false);
-
-                    let message = if is_root && iteration == 1 {
-                        if block.prompt.is_empty() {
-                            def.initial_prompt.clone()
-                        } else {
-                            format!("{}\n\n{}", block.prompt, def.initial_prompt)
-                        }
-                    } else if is_root {
-                        let base = if block.prompt.is_empty() {
-                            def.initial_prompt.clone()
-                        } else {
-                            block.prompt.clone()
-                        };
-                        format!("{base}\n\n--- Previous iteration outputs ---\n{previous_terminal_outputs}")
-                    } else {
-                        // Non-root: gather upstream outputs
-                        let upstream_ids = upstream_of(def, block_id);
-                        let mut upstream_content = String::new();
-                        for uid in &upstream_ids {
-                            if let Some(content) = block_outputs.get(uid) {
-                                if !upstream_content.is_empty() {
-                                    upstream_content.push_str("\n\n---\n\n");
-                                }
-                                upstream_content.push_str(content);
-                            }
-                        }
-                        let prefix = if block.prompt.is_empty() {
-                            String::new()
-                        } else {
-                            format!("{}\n\n", block.prompt)
-                        };
-                        if use_cli {
-                            // For CLI, reference file paths
-                            let mut file_refs = String::new();
-                            for uid in &upstream_ids {
-                                if let Some(ub) = def.blocks.iter().find(|b| b.id == *uid) {
-                                    let ub_name_key = if ub.name.trim().is_empty() {
-                                        format!("block{}", uid)
-                                    } else {
-                                        format!("{}_b{}", OutputManager::sanitize_session_name(&ub.name), uid)
-                                    };
-                                    let sanitized = OutputManager::sanitize_session_name(&ub.agent);
-                                    let fname = format!("{}_{}_iter{}.md", ub_name_key, sanitized, iteration);
-                                    let fpath = output.run_dir().join(&fname);
-                                    if fpath.exists() {
-                                        file_refs.push_str(&format!("- {}\n", fpath.display()));
-                                    }
-                                }
-                            }
-                            format!("{prefix}Read these upstream output files:\n{file_refs}\nRead each file before responding.")
-                        } else {
-                            format!("{prefix}--- Upstream outputs ---\n{upstream_content}")
-                        }
-                    };
+                    let use_cli = agent_configs
+                        .get(&agent_name)
+                        .map(|(_, _, cli)| *cli)
+                        .unwrap_or(false);
+                    let message = build_pipeline_block_message(
+                        block,
+                        use_cli,
+                        &PipelineMessageContext {
+                            def,
+                            iteration,
+                            block_outputs: &block_outputs,
+                            previous_terminal_outputs: &previous_terminal_outputs,
+                            output,
+                            prompt_context,
+                        },
+                    );
 
                     // Get provider from pool
                     let session_key = block
@@ -537,7 +538,9 @@ pub async fn run_pipeline(
                         format!("{}_b{}", OutputManager::sanitize_session_name(&block.name), block_id)
                     };
 
-                    tasks.spawn(async move {
+                    let task_agent_name = agent_name.clone();
+                    let task_label = label.clone();
+                    let task_handle = tasks.spawn(async move {
                         let mut guard = provider_arc.lock().await;
 
                         // Wire live-log channel
@@ -620,26 +623,71 @@ pub async fn run_pipeline(
                             }
                         }
                     });
+                    task_metadata.insert(
+                        task_handle.id(),
+                        PipelineTaskMetadata {
+                            block_id,
+                            agent_name: task_agent_name,
+                            label: task_label,
+                            iteration,
+                        },
+                    );
                 }
                 Some(result) = tasks.join_next() => {
                     completed += 1;
-                    if let Ok((block_id, outcome)) = result {
-                        match outcome {
-                            Ok(content) => {
-                                block_outputs.insert(block_id, content);
+                    match result {
+                        Ok((block_id, outcome)) => {
+                            match outcome {
+                                Ok(content) => {
+                                    block_outputs.insert(block_id, content);
+                                }
+                                Err(_) => {
+                                    failed_blocks.insert(block_id);
+                                }
                             }
-                            Err(_) => {
-                                failed_blocks.insert(block_id);
+                            // Signal downstream
+                            if let Some(children) = downstream.get(&block_id) {
+                                for &child in children {
+                                    let deg = current_in_degree.get_mut(&child).unwrap();
+                                    *deg -= 1;
+                                    if *deg == 0 {
+                                        let _ = ready_tx.send(child);
+                                    }
+                                }
                             }
                         }
-                        // Signal downstream
-                        if let Some(children) = downstream.get(&block_id) {
-                            for &child in children {
-                                let deg = current_in_degree.get_mut(&child).unwrap();
-                                *deg -= 1;
-                                if *deg == 0 {
-                                    let _ = ready_tx.send(child);
+                        Err(join_error) => {
+                            let error = format!("Pipeline worker panicked: {join_error}");
+                            if let Some(metadata) = task_metadata.get(&join_error.id()).cloned() {
+                                let _ = progress_tx.send(ProgressEvent::BlockError {
+                                    block_id: metadata.block_id,
+                                    agent_name: metadata.agent_name.clone(),
+                                    label: metadata.label.clone(),
+                                    iteration: metadata.iteration,
+                                    error: error.clone(),
+                                    details: Some(error.clone()),
+                                });
+                                let _ = output.append_error(&format!(
+                                    "block {} {} iter{}: {}",
+                                    metadata.block_id,
+                                    metadata.agent_name,
+                                    metadata.iteration,
+                                    error
+                                ));
+                                failed_blocks.insert(metadata.block_id);
+                                if let Some(children) = downstream.get(&metadata.block_id) {
+                                    for &child in children {
+                                        let deg = current_in_degree.get_mut(&child).unwrap();
+                                        *deg -= 1;
+                                        if *deg == 0 {
+                                            let _ = ready_tx.send(child);
+                                        }
+                                    }
                                 }
+                            } else {
+                                let _ = output.append_error(&format!(
+                                    "pipeline panic could not be attributed to a block: {error}"
+                                ));
                             }
                         }
                     }
@@ -667,6 +715,94 @@ pub async fn run_pipeline(
     Ok(())
 }
 
+fn block_label(block: &PipelineBlock) -> String {
+    if block.name.trim().is_empty() {
+        format!("Block {} ({})", block.id, block.agent)
+    } else {
+        block.name.clone()
+    }
+}
+
+fn build_pipeline_block_message(
+    block: &PipelineBlock,
+    use_cli: bool,
+    context: &PipelineMessageContext<'_>,
+) -> String {
+    let is_root = upstream_of(context.def, block.id).is_empty();
+    let base_message = if is_root && context.iteration == 1 {
+        if block.prompt.is_empty() {
+            context.def.initial_prompt.clone()
+        } else {
+            format!("{}\n\n{}", block.prompt, context.def.initial_prompt)
+        }
+    } else if is_root {
+        let base = if block.prompt.is_empty() {
+            context.def.initial_prompt.clone()
+        } else {
+            block.prompt.clone()
+        };
+        format!(
+            "{base}\n\n--- Previous iteration outputs ---\n{}",
+            context.previous_terminal_outputs
+        )
+    } else {
+        let upstream_ids = upstream_of(context.def, block.id);
+        let prefix = if block.prompt.is_empty() {
+            String::new()
+        } else {
+            format!("{}\n\n", block.prompt)
+        };
+        if use_cli {
+            let mut file_refs = String::new();
+            for uid in &upstream_ids {
+                if let Some(upstream_block) = context
+                    .def
+                    .blocks
+                    .iter()
+                    .find(|candidate| candidate.id == *uid)
+                {
+                    let upstream_name_key = if upstream_block.name.trim().is_empty() {
+                        format!("block{}", uid)
+                    } else {
+                        format!(
+                            "{}_b{}",
+                            OutputManager::sanitize_session_name(&upstream_block.name),
+                            uid
+                        )
+                    };
+                    let sanitized = OutputManager::sanitize_session_name(&upstream_block.agent);
+                    let filename = format!(
+                        "{}_{}_iter{}.md",
+                        upstream_name_key, sanitized, context.iteration
+                    );
+                    let path = context.output.run_dir().join(&filename);
+                    if path.exists() {
+                        file_refs.push_str(&format!("- {}\n", path.display()));
+                    }
+                }
+            }
+            format!(
+                "{prefix}Read these upstream output files:\n{file_refs}\nRead each file before responding."
+            )
+        } else {
+            let mut upstream_content = String::new();
+            for uid in &upstream_ids {
+                if let Some(content) = context.block_outputs.get(uid) {
+                    if !upstream_content.is_empty() {
+                        upstream_content.push_str("\n\n---\n\n");
+                    }
+                    upstream_content.push_str(content);
+                }
+            }
+            format!("{prefix}--- Upstream outputs ---\n{upstream_content}")
+        }
+    };
+
+    context
+        .prompt_context
+        .augment_prompt_for_agent(&base_message, use_cli)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -674,6 +810,14 @@ pub async fn run_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderConfig;
+    use crate::execution::test_utils::{collect_progress_events, PanicProvider};
+    use crate::output::OutputManager;
+    use crate::provider::ProviderKind;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     fn block(id: BlockId, col: u16, row: u16) -> PipelineBlock {
         PipelineBlock {
@@ -1031,5 +1175,115 @@ to = 1
         assert!(d.blocks.is_empty());
         assert!(d.connections.is_empty());
         assert!(d.initial_prompt.is_empty());
+    }
+
+    #[test]
+    fn build_pipeline_block_message_only_adds_cli_prefix_for_cli_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("pipeline-msg")).unwrap();
+        let def = PipelineDefinition {
+            initial_prompt: "base prompt".into(),
+            iterations: 1,
+            blocks: vec![PipelineBlock {
+                id: 1,
+                name: "Root".into(),
+                agent: "Claude".into(),
+                prompt: "block prompt".into(),
+                session_id: None,
+                position: (0, 0),
+            }],
+            connections: vec![],
+        };
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+
+        let block_outputs = HashMap::new();
+        let message_context = PipelineMessageContext {
+            def: &def,
+            iteration: 1,
+            block_outputs: &block_outputs,
+            previous_terminal_outputs: "",
+            output: &output,
+            prompt_context: &context,
+        };
+        let cli_message = build_pipeline_block_message(&def.blocks[0], true, &message_context);
+        let api_message = build_pipeline_block_message(&def.blocks[0], false, &message_context);
+
+        assert!(cli_message.contains("Working directory:"));
+        assert!(cli_message.ends_with("block prompt\n\nbase prompt"));
+        assert_eq!(api_message, "block prompt\n\nbase prompt");
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_panics_emit_block_error_and_append_error_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("pipeline-panic")).unwrap();
+        let def = PipelineDefinition {
+            initial_prompt: "base prompt".into(),
+            iterations: 1,
+            blocks: vec![PipelineBlock {
+                id: 1,
+                name: "Root".into(),
+                agent: "Claude".into(),
+                prompt: String::new(),
+                session_id: None,
+                position: (0, 0),
+            }],
+            connections: vec![],
+        };
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        run_pipeline_with_provider_factory(
+            &def,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            |_kind, _cfg| {
+                Box::new(PanicProvider::new(
+                    ProviderKind::Anthropic,
+                    "pipeline panic",
+                ))
+            },
+        )
+        .await
+        .expect("run");
+
+        let events = collect_progress_events(rx);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::BlockError {
+                    block_id,
+                    agent_name,
+                    error,
+                    ..
+                } if *block_id == 1 && agent_name == "Claude" && error.contains("panicked")
+            )
+        }));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ProgressEvent::AllDone)));
+
+        let log = std::fs::read_to_string(output.run_dir().join("_errors.log")).expect("log");
+        assert!(log.contains("block 1 Claude iter1"));
+        assert!(log.contains("pipeline panic"));
     }
 }

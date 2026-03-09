@@ -12,6 +12,68 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+const DIAGNOSTIC_SUFFIX: &str =
+    "Write any encountered issues (for example permission, tool, or environment issues) to an explicit \"Errors\" section of your report.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptRuntimeContext {
+    raw_prompt: String,
+    diagnostics_suffix: Option<&'static str>,
+    cli_working_directory_prefix: Option<String>,
+}
+
+impl PromptRuntimeContext {
+    pub fn new(raw_prompt: impl Into<String>, diagnostics_enabled: bool) -> Self {
+        let cli_working_directory_prefix = std::env::current_dir()
+            .ok()
+            .map(|cwd| cwd.display().to_string())
+            .filter(|cwd| !cwd.is_empty())
+            .map(|cwd| {
+                format!(
+                    "Working directory: {cwd}\nYou have access to the data and files in this directory for context."
+                )
+            });
+
+        Self {
+            raw_prompt: raw_prompt.into(),
+            diagnostics_suffix: diagnostics_enabled.then_some(DIAGNOSTIC_SUFFIX),
+            cli_working_directory_prefix,
+        }
+    }
+
+    pub fn raw_prompt(&self) -> &str {
+        &self.raw_prompt
+    }
+
+    pub fn initial_prompt_for_agent(&self, is_cli: bool) -> String {
+        self.augment_prompt_for_agent(&self.raw_prompt, is_cli)
+    }
+
+    pub fn augment_prompt_for_agent(&self, base_prompt: &str, is_cli: bool) -> String {
+        let mut prompt = String::new();
+
+        if is_cli {
+            if let Some(prefix) = &self.cli_working_directory_prefix {
+                prompt.push_str(prefix);
+                if !base_prompt.is_empty() || self.diagnostics_suffix.is_some() {
+                    prompt.push_str("\n\n");
+                }
+            }
+        }
+
+        prompt.push_str(base_prompt);
+
+        if let Some(suffix) = self.diagnostics_suffix {
+            if !prompt.is_empty() {
+                prompt.push_str("\n\n");
+            }
+            prompt.push_str(suffix);
+        }
+
+        prompt
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionMode {
     Relay,
@@ -229,6 +291,32 @@ mod tests {
     #[test]
     fn truncate_chars_zero_limit() {
         assert_eq!(truncate_chars("abc", 0), "...");
+    }
+
+    #[test]
+    fn prompt_runtime_context_keeps_raw_prompt_unmodified() {
+        let context = PromptRuntimeContext::new("raw prompt", true);
+        assert_eq!(context.raw_prompt(), "raw prompt");
+    }
+
+    #[test]
+    fn prompt_runtime_context_only_adds_cli_prefix_for_cli_agents() {
+        let context = PromptRuntimeContext::new("base prompt", false);
+        let cli_prompt = context.initial_prompt_for_agent(true);
+        let api_prompt = context.initial_prompt_for_agent(false);
+
+        assert!(cli_prompt.contains("Working directory:"));
+        assert!(cli_prompt.ends_with("base prompt"));
+        assert_eq!(api_prompt, "base prompt");
+    }
+
+    #[test]
+    fn prompt_runtime_context_appends_diagnostics_suffix() {
+        let context = PromptRuntimeContext::new("base prompt", true);
+        let prompt = context.initial_prompt_for_agent(false);
+
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("explicit \"Errors\" section"));
     }
 
     #[tokio::test]

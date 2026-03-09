@@ -9,6 +9,14 @@ pub struct OutputManager {
     run_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionInfo {
+    pub name: Option<String>,
+    pub mode: ExecutionMode,
+    pub agents: Vec<String>,
+    pub iterations: u32,
+}
+
 impl OutputManager {
     pub fn new(base_dir: &Path, session_name: Option<&str>) -> Result<Self, AppError> {
         let run_dir = Self::build_run_dir(base_dir, session_name);
@@ -85,6 +93,55 @@ impl OutputManager {
 
     pub fn run_dir(&self) -> &PathBuf {
         &self.run_dir
+    }
+
+    pub fn read_agent_session_info(run_dir: &Path) -> Result<AgentSessionInfo, AppError> {
+        let content = std::fs::read_to_string(run_dir.join("session.toml"))?;
+        let value = content
+            .parse::<Value>()
+            .map_err(|e| AppError::Config(format!("Failed to parse session info: {e}")))?;
+
+        let mode = match value.get("mode").and_then(|v| v.as_str()) {
+            Some("relay") => ExecutionMode::Relay,
+            Some("swarm") => ExecutionMode::Swarm,
+            Some("solo") => ExecutionMode::Solo,
+            Some("pipeline") => ExecutionMode::Pipeline,
+            Some(other) => {
+                return Err(AppError::Config(format!(
+                    "Unknown session mode in session info: {other}"
+                )));
+            }
+            None => return Err(AppError::Config("Missing mode in session info".to_string())),
+        };
+
+        let agents = value
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| AppError::Config("Missing agents in session info".to_string()))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| AppError::Config("Invalid agent entry in session info".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let iterations = value
+            .get("iterations")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0)
+            .max(0) as u32;
+
+        Ok(AgentSessionInfo {
+            name: value
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            mode,
+            agents,
+            iterations,
+        })
     }
 
     pub fn is_batch_root(path: &Path) -> bool {
@@ -443,5 +500,42 @@ mod tests {
         assert!(content.contains("one"));
         assert!(content.contains("two"));
         assert_eq!(content.lines().count(), 2);
+    }
+
+    #[test]
+    fn read_agent_session_info_parses_expected_fields() {
+        let base = tempdir().expect("tempdir");
+        let mgr = OutputManager::new(base.path(), Some("sess")).expect("new");
+        mgr.write_session_info(
+            &ExecutionMode::Relay,
+            &[
+                ("Claude".to_string(), "anthropic".to_string()),
+                ("OpenAI".to_string(), "openai".to_string()),
+            ],
+            2,
+            Some("sess"),
+            &[],
+        )
+        .expect("write");
+
+        let session = OutputManager::read_agent_session_info(mgr.run_dir()).expect("session");
+        assert_eq!(session.name.as_deref(), Some("sess"));
+        assert_eq!(session.mode, ExecutionMode::Relay);
+        assert_eq!(
+            session.agents,
+            vec!["Claude".to_string(), "OpenAI".to_string()]
+        );
+        assert_eq!(session.iterations, 2);
+    }
+
+    #[test]
+    fn read_agent_session_info_rejects_pipeline_shape_without_agents() {
+        let base = tempdir().expect("tempdir");
+        let mgr = OutputManager::new(base.path(), Some("pipeline")).expect("new");
+        mgr.write_pipeline_session_info(1, 0, 1, None)
+            .expect("write");
+
+        let err = OutputManager::read_agent_session_info(mgr.run_dir()).expect_err("should fail");
+        assert!(err.to_string().contains("Missing agents"));
     }
 }

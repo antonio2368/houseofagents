@@ -331,8 +331,10 @@ output_dir/
 ## Resume, Consolidation & Diagnostics
 
 - **Resume** (toggle with `Space` on Prompt screen) — available for relay and swarm modes
-  - With a session name: resumes the latest run matching that name
-  - Without: resumes the latest compatible run (matching mode + agents)
+  - With a session name: resolves the latest run with that name, then validates it against the current run configuration before resuming
+  - Without: resumes the latest compatible run with an exact mode match
+  - Relay resume requires the exact same agent order
+  - Swarm resume requires the exact same agent set
   - Batch roots are excluded from resume lookup; resume is currently single-run only
 - **Forward Prompt** (toggle with `Space` on Prompt screen) — relay mode only; when enabled, downstream agents receive the original prompt alongside the previous agent's output, preventing context loss in the handoff chain
 - **Consolidation**
