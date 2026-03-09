@@ -43,7 +43,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.selected_mode {
         ExecutionMode::Relay => draw_relay(f, app),
         ExecutionMode::Swarm => draw_swarm(f, app),
-        ExecutionMode::Solo => draw_solo(f, app),
         ExecutionMode::Pipeline => draw_pipeline_running(f, app),
     }
     if app.running.consolidation_active {
@@ -87,25 +86,6 @@ fn draw_swarm(f: &mut Frame, app: &App) {
     draw_title_bar(f, app, chunks[0]);
     draw_progress_gauge(f, app, chunks[1]);
     draw_swarm_round(f, app, chunks[2]);
-    draw_main_panel(f, app, chunks[3]);
-    draw_running_help_bar(f, app, chunks[4]);
-}
-
-fn draw_solo(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Length(3), // Gauge
-            Constraint::Length(5), // Agent cards
-            Constraint::Min(0),   // Main panel
-            Constraint::Length(3), // Help
-        ])
-        .split(f.area());
-
-    draw_title_bar(f, app, chunks[0]);
-    draw_progress_gauge(f, app, chunks[1]);
-    draw_agent_cards(f, app, chunks[2]);
     draw_main_panel(f, app, chunks[3]);
     draw_running_help_bar(f, app, chunks[4]);
 }
@@ -1125,7 +1105,6 @@ fn spinner_frame() -> char {
 fn compute_total_steps(app: &App) -> usize {
     let agents = app.selected_agents.len();
     match app.selected_mode {
-        crate::execution::ExecutionMode::Solo => agents,
         crate::execution::ExecutionMode::Relay => agents * app.prompt.iterations as usize,
         crate::execution::ExecutionMode::Swarm => agents * app.prompt.iterations as usize,
         crate::execution::ExecutionMode::Pipeline => {
@@ -1230,15 +1209,6 @@ mod tests {
     fn spinner_frame_returns_valid_character() {
         let c = spinner_frame();
         assert!(matches!(c, '|' | '/' | '-' | '\\'));
-    }
-
-    #[test]
-    fn compute_total_steps_solo_is_agent_count() {
-        let mut a = app();
-        a.selected_mode = ExecutionMode::Solo;
-        a.selected_agents = vec!["Claude".into(), "OpenAI".into()];
-        a.prompt.iterations = 9;
-        assert_eq!(compute_total_steps(&a), 2);
     }
 
     #[test]

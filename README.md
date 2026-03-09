@@ -294,46 +294,55 @@ Each run creates a directory inside `output_dir`:
 
 ```
 output_dir/
-  20260305_143022_a1b2/
-    prompt.md                    # Original prompt
-    session.toml                 # Run metadata
-    Claude_iter1.md              # Agent output per iteration
-    OpenAI_iter2.md
-    consolidated_Claude.md       # Optional: merged output
-    errors.md                    # Optional: diagnostics report
-    _errors.log                  # Application-level error log
+  latest -> 2026-03-05/my_session  # symlink to most recent run (unix)
+  runs.toml                        # append-only run index
+  2026-03-05/
+    my_session/                    # user-defined session name
+      prompt.md                    # Original prompt
+      session.toml                 # Run metadata
+      Claude_iter1.md              # Agent output per iteration
+      OpenAI_iter2.md
+      consolidated_Claude.md       # Optional: merged output
+      errors.md                    # Optional: diagnostics report
+      _errors.log                  # Application-level error log
+    swift-falcon/                  # auto-generated name (no session provided)
+      ...
 ```
 
 Pipeline runs produce per-block output files named using the block's name (sanitized) and a unique block id suffix:
 
 ```
 output_dir/
-  20260305_143022_234_my_session/
-    session.toml                         # mode = "pipeline", block/connection counts
-    prompt.md                            # Pipeline-level prompt (shared across blocks)
-    pipeline.toml                        # Pipeline definition snapshot
-    Analyzer_b1_Claude_iter1.md          # Block "Analyzer" (id 1), agent Claude, iteration 1
-    Reviewer_b2_Gemini_iter1.md          # Block "Reviewer" (id 2), agent Gemini, iteration 1
-    _errors.log
+  2026-03-05/
+    my_session/
+      session.toml                         # mode = "pipeline", block/connection counts
+      prompt.md                            # Pipeline-level prompt (shared across blocks)
+      pipeline.toml                        # Pipeline definition snapshot
+      Analyzer_b1_Claude_iter1.md          # Block "Analyzer" (id 1), agent Claude, iteration 1
+      Reviewer_b2_Gemini_iter1.md          # Block "Reviewer" (id 2), agent Gemini, iteration 1
+      _errors.log
 ```
 
-Directory names follow the pattern `YYYYMMDD_HHMMSS_<rand>` (with optional `_<session_name>` suffix).
+Runs are grouped by date: `YYYY-MM-DD/<session_name>`. When no session name is provided, a random two-word name (`adjective-noun`) is generated. Duplicate user-defined session names within the same date are rejected.
 
 When `runs > 1`, House of Agents creates a batch root and one subdirectory per independent run:
 
 ```
 output_dir/
-  20260308_222551_735_my_session/
-    batch.toml
-    cross_run_consolidation.md   # Optional: synthesis across successful runs
-    run_1/
-      prompt.md
-      session.toml
-      Claude_iter1.md
-      consolidation.md           # Optional: per-run synthesis
-    run_2/
-      ...
+  2026-03-08/
+    my_session/
+      batch.toml
+      cross_run_consolidation.md   # Optional: synthesis across successful runs
+      run_1/
+        prompt.md
+        session.toml
+        Claude_iter1.md
+        consolidation.md           # Optional: per-run synthesis
+      run_2/
+        ...
 ```
+
+Legacy directories (`YYYYMMDD_HHMMSS_NNN[_session]` and `YYYY-MM-DD/HH-MM-SS[_session]`) from older versions are preserved and remain searchable.
 
 ## Resume, Consolidation & Diagnostics
 

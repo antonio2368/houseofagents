@@ -8,8 +8,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 pub fn draw(f: &mut Frame, app: &App) {
-    let is_solo = app.selected_mode == ExecutionMode::Solo;
-    let options_height = if is_solo { 0 } else { 3 };
+    let options_height = 3;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -138,9 +137,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let iter_info = if is_solo {
-        "(Solo mode: always 1 iteration)".to_string()
-    } else if app.prompt.prompt_focus == PromptFocus::Iterations {
+    let iter_info = if app.prompt.prompt_focus == PromptFocus::Iterations {
         format!("{}_", app.prompt.iterations_buf)
     } else {
         format!("{}", app.prompt.iterations)
@@ -197,8 +194,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
     f.render_widget(concurrency_widget, run_cols[1]);
 
-    // Options row: Resume + Forward Prompt (hidden for Solo)
-    if !is_solo {
+    // Options row: Resume + Forward Prompt
+    {
         let is_relay = app.selected_mode == ExecutionMode::Relay;
         let option_cols = if is_relay {
             Layout::default()
@@ -266,7 +263,7 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     // Help bar
     let help_spans: Vec<Span> = match app.prompt.prompt_focus {
-        PromptFocus::Iterations if !is_solo => {
+        PromptFocus::Iterations => {
             vec![
                 Span::styled("Type", Style::default().fg(Color::Yellow)),
                 Span::raw(": set value  "),

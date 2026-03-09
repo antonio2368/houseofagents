@@ -1,7 +1,6 @@
 pub mod multi;
 pub mod pipeline;
 pub mod relay;
-pub mod solo;
 pub mod swarm;
 #[cfg(test)]
 pub(crate) mod test_utils;
@@ -80,7 +79,6 @@ impl PromptRuntimeContext {
 pub enum ExecutionMode {
     Relay,
     Swarm,
-    Solo,
     Pipeline,
 }
 
@@ -89,7 +87,6 @@ impl ExecutionMode {
         match self {
             ExecutionMode::Relay => "relay",
             ExecutionMode::Swarm => "swarm",
-            ExecutionMode::Solo => "solo",
             ExecutionMode::Pipeline => "pipeline",
         }
     }
@@ -98,7 +95,6 @@ impl ExecutionMode {
         match self {
             ExecutionMode::Relay => "Sequential cooperative - agents build on each other",
             ExecutionMode::Swarm => "Parallel cooperative - agents share results between rounds",
-            ExecutionMode::Solo => "Independent parallel - each agent works alone",
             ExecutionMode::Pipeline => {
                 "Custom pipeline \u{2014} build arbitrary DAGs of agent blocks"
             }
@@ -109,7 +105,6 @@ impl ExecutionMode {
         &[
             ExecutionMode::Relay,
             ExecutionMode::Swarm,
-            ExecutionMode::Solo,
             ExecutionMode::Pipeline,
         ]
     }
@@ -123,7 +118,6 @@ impl fmt::Display for ExecutionMode {
             match self {
                 ExecutionMode::Relay => "Relay",
                 ExecutionMode::Swarm => "Swarm",
-                ExecutionMode::Solo => "Solo",
                 ExecutionMode::Pipeline => "Pipeline",
             }
         )
@@ -308,14 +302,12 @@ mod tests {
     fn execution_mode_as_str_values() {
         assert_eq!(ExecutionMode::Relay.as_str(), "relay");
         assert_eq!(ExecutionMode::Swarm.as_str(), "swarm");
-        assert_eq!(ExecutionMode::Solo.as_str(), "solo");
     }
 
     #[test]
     fn execution_mode_display_values() {
         assert_eq!(ExecutionMode::Relay.to_string(), "Relay");
         assert_eq!(ExecutionMode::Swarm.to_string(), "Swarm");
-        assert_eq!(ExecutionMode::Solo.to_string(), "Solo");
     }
 
     #[test]

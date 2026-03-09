@@ -1,9 +1,104 @@
 use crate::error::AppError;
 use crate::execution::ExecutionMode;
 use chrono::{Local, Utc};
-use rand::Rng;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use toml::Value;
+
+const ADJECTIVES: &[&str] = &[
+    "swift", "bold", "calm", "dark", "keen", "warm", "pure", "vast", "wild", "soft", "deep",
+    "pale", "thin", "cool", "fair", "grey", "high", "late", "lean", "long", "loud", "near",
+    "open", "rare", "rich", "slow", "tall", "true", "wide", "worn", "blue", "cold", "firm",
+    "flat", "full", "glad", "gold", "hard", "iron", "jade", "kind", "live", "mint", "neat",
+    "pine", "real", "safe", "tame", "trim", "used", "wiry", "aged", "bent", "busy", "even",
+    "fine", "free", "good", "hazy", "iced",
+];
+
+const NOUNS: &[&str] = &[
+    "falcon", "river", "tiger", "stone", "grove", "flame", "frost", "cedar", "crane", "pearl",
+    "maple", "ridge", "spark", "cloud", "field", "shore", "bloom", "drift", "ember", "forge",
+    "glyph", "haven", "ivory", "knoll", "larch", "marsh", "noble", "olive", "prism", "quill",
+    "realm", "shard", "thorn", "umbra", "vault", "watch", "yield", "birch", "delta", "flint",
+    "grain", "heron", "inlet", "jetty", "kelp", "lodge", "mound", "nexus", "orbit", "plume",
+    "quest", "roost", "slate", "trail", "aspen", "basin", "crest", "dune", "finch", "glint",
+];
+
+fn generate_random_name() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let adj = ADJECTIVES[rng.gen_range(0..ADJECTIVES.len())];
+    let noun = NOUNS[rng.gen_range(0..NOUNS.len())];
+    format!("{adj}-{noun}")
+}
+
+/// Check if a directory name matches the YYYY-MM-DD date dir pattern.
+pub(crate) fn is_date_dir(name: &str) -> bool {
+    name.len() == 10
+        && name.as_bytes()[4] == b'-'
+        && name.as_bytes()[7] == b'-'
+        && name
+            .bytes()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+}
+
+/// Check if a leaf name looks like an old timestamp-based format.
+/// Matches legacy flat (`YYYYMMDD_HHMMSS[_...]`) and old grouped (`HH-MM-SS[...]`).
+fn is_old_format_leaf(leaf: &str) -> bool {
+    is_legacy_flat(leaf) || is_old_timestamp_leaf(leaf)
+}
+
+/// Check if a leaf starts with the old HH-MM-SS timestamp pattern.
+fn is_old_timestamp_leaf(leaf: &str) -> bool {
+    leaf.len() >= 8
+        && leaf.as_bytes()[2] == b'-'
+        && leaf.as_bytes()[5] == b'-'
+        && leaf[0..2].bytes().all(|b| b.is_ascii_digit())
+        && leaf[3..5].bytes().all(|b| b.is_ascii_digit())
+        && leaf[6..8].bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Check if a directory name matches the legacy flat format: YYYYMMDD_HHMMSS[_...]
+fn is_legacy_flat(dir_name: &str) -> bool {
+    let mut parts = dir_name.splitn(3, '_');
+    let date_part = match parts.next() {
+        Some(p) if p.len() == 8 && p.bytes().all(|b| b.is_ascii_digit()) => p,
+        _ => return false,
+    };
+    let time_part = match parts.next() {
+        Some(p) if p.len() == 6 && p.bytes().all(|b| b.is_ascii_digit()) => p,
+        _ => return false,
+    };
+    let _ = date_part;
+    let _ = time_part;
+    true
+}
+
+/// Approximate the creation time of a run directory.
+///
+/// Uses the mtime of `session.toml` or `batch.toml` (written once at run
+/// creation and never modified) so that later writes of iteration files,
+/// consolidation, or diagnostics into the directory do not alter the sort
+/// order.  Falls back to the directory's own mtime when neither metadata
+/// file exists (e.g. legacy layouts).
+fn run_creation_time(path: &Path) -> SystemTime {
+    let meta_file = path.join("session.toml");
+    if let Ok(m) = std::fs::metadata(&meta_file) {
+        if let Ok(t) = m.modified() {
+            return t;
+        }
+    }
+    let batch_file = path.join("batch.toml");
+    if let Ok(m) = std::fs::metadata(&batch_file) {
+        if let Ok(t) = m.modified() {
+            return t;
+        }
+    }
+    // Fallback: directory mtime (may shift if files are added later).
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
 
 #[derive(Debug, Clone)]
 pub struct OutputManager {
@@ -20,26 +115,157 @@ pub struct AgentSessionInfo {
 
 impl OutputManager {
     pub fn new(base_dir: &Path, session_name: Option<&str>) -> Result<Self, AppError> {
-        let run_dir = Self::build_run_dir(base_dir, session_name);
-        std::fs::create_dir_all(&run_dir)?;
+        Self::new_impl(base_dir, session_name, Local::now())
+    }
+
+    fn new_impl(
+        base_dir: &Path,
+        session_name: Option<&str>,
+        _now: chrono::DateTime<Local>,
+    ) -> Result<Self, AppError> {
+        let date_part = _now.format("%Y-%m-%d").to_string();
+        let date_dir = base_dir.join(&date_part);
+        std::fs::create_dir_all(&date_dir)?;
+
+        let run_dir = match session_name.map(|n| n.trim()).filter(|n| !n.is_empty()) {
+            Some(name) => {
+                let leaf = Self::sanitize_session_name(name);
+                let candidate = date_dir.join(&leaf);
+                match std::fs::create_dir(&candidate) {
+                    Ok(()) => candidate,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        return Err(AppError::Io(std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            format!(
+                                "Session '{}' already exists for {}. Choose a different name.",
+                                name, date_part
+                            ),
+                        )));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            None => {
+                let mut attempts = 0;
+                loop {
+                    let leaf = generate_random_name();
+                    let candidate = date_dir.join(&leaf);
+                    match std::fs::create_dir(&candidate) {
+                        Ok(()) => break candidate,
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            attempts += 1;
+                            if attempts >= 10 {
+                                // Last resort: append numeric suffix. Use
+                                // create_dir (not create_dir_all) so we never
+                                // silently reuse an existing directory.
+                                let fallback = format!("{leaf}-{attempts}");
+                                let candidate = date_dir.join(&fallback);
+                                std::fs::create_dir(&candidate)?;
+                                break candidate;
+                            }
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        };
+
+        #[cfg(unix)]
+        Self::update_latest_symlink(base_dir, &run_dir);
+        Self::append_run_index(base_dir, &run_dir, session_name);
+
         Ok(Self { run_dir })
+    }
+
+    #[cfg(unix)]
+    fn update_latest_symlink(base_dir: &Path, run_dir: &Path) {
+        use std::os::unix::fs::symlink;
+        let Ok(relative) = run_dir.strip_prefix(base_dir) else {
+            return;
+        };
+        let link = base_dir.join("latest");
+        let _ = std::fs::remove_file(&link);
+        let _ = symlink(relative, &link);
+    }
+
+    fn append_run_index(base_dir: &Path, run_dir: &Path, session_name: Option<&str>) {
+        use std::io::Write;
+        let Ok(relative) = run_dir.strip_prefix(base_dir) else {
+            return;
+        };
+        let relative_str = relative.to_string_lossy();
+        let timestamp = Utc::now().to_rfc3339();
+
+        let index_path = base_dir.join("runs.toml");
+        let needs_sep = index_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+
+        let path_val = toml::Value::String(relative_str.into_owned());
+        let ts_val = toml::Value::String(timestamp);
+
+        let mut block = String::new();
+        if needs_sep {
+            block.push('\n');
+        }
+        block.push_str(&format!(
+            "[[entries]]\npath = {path_val}\ntimestamp = {ts_val}\n"
+        ));
+        if let Some(name) = session_name.filter(|n| !n.is_empty()) {
+            let name_val = toml::Value::String(name.to_string());
+            block.push_str(&format!("session_name = {name_val}\n"));
+        }
+
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&index_path)
+            .and_then(|mut f| f.write_all(block.as_bytes()));
+    }
+
+    /// Enumerate all run directories under base_dir (legacy flat, old grouped
+    /// with timestamps, and new grouped with plain names), returned newest-first
+    /// by run creation time.
+    pub(crate) fn scan_run_dirs(base_dir: &Path) -> Result<Vec<PathBuf>, AppError> {
+        let mut entries: Vec<(SystemTime, PathBuf)> = Vec::new();
+
+        for entry in std::fs::read_dir(base_dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            if !ft.is_dir() && !ft.is_symlink() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if name_str == "latest" {
+                continue;
+            }
+
+            if ft.is_dir() && is_date_dir(&name_str) {
+                // Scan subdirectories of date dir — accepts old HH-MM-SS leaves
+                // and new plain-name leaves (anything that's a directory).
+                for sub in std::fs::read_dir(entry.path())? {
+                    let sub = sub?;
+                    if !sub.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let path = sub.path();
+                    let mtime = run_creation_time(&path);
+                    entries.push((mtime, path));
+                }
+            } else if ft.is_dir() && is_legacy_flat(&name_str) {
+                let path = entry.path();
+                let mtime = run_creation_time(&path);
+                entries.push((mtime, path));
+            }
+        }
+
+        entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest-first
+        Ok(entries.into_iter().map(|(_, p)| p).collect())
     }
 
     pub fn new_batch_parent(base_dir: &Path, session_name: Option<&str>) -> Result<Self, AppError> {
         Self::new(base_dir, session_name)
-    }
-
-    fn build_run_dir(base_dir: &Path, session_name: Option<&str>) -> PathBuf {
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
-        let suffix: u16 = rand::rng().random_range(100..999);
-        let dir_name = match session_name {
-            Some(name) if !name.is_empty() => {
-                let sanitized = Self::sanitize_session_name(name);
-                format!("{}_{}_{}", timestamp, suffix, sanitized)
-            }
-            _ => format!("{}_{}", timestamp, suffix),
-        };
-        base_dir.join(dir_name)
     }
 
     pub fn from_existing(run_dir: PathBuf) -> Result<Self, AppError> {
@@ -71,25 +297,26 @@ impl OutputManager {
         if !base_dir.exists() {
             return Ok(None);
         }
-        let suffix = format!("_{}", Self::sanitize_session_name(session_name));
-        let mut matches: Vec<(String, PathBuf)> = Vec::new();
+        let sanitized = Self::sanitize_session_name(session_name);
+        let old_suffix = format!("_{sanitized}");
 
-        for entry in std::fs::read_dir(base_dir)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
+        for path in Self::scan_run_dirs(base_dir)? {
+            let leaf = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if Self::is_batch_root(&path) {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with(&suffix) {
-                if Self::is_batch_root(&entry.path()) {
-                    continue;
-                }
-                matches.push((name, entry.path()));
+            // New format: leaf is exactly the sanitized session name
+            if leaf == sanitized {
+                return Ok(Some(path));
+            }
+            // Old format only: leaf has a timestamp prefix and ends with _session_name.
+            // Restrict to old-format leaves so a new-format dir like "foo_alpha"
+            // is not incorrectly matched when searching for "alpha".
+            if is_old_format_leaf(leaf) && leaf.ends_with(&old_suffix) {
+                return Ok(Some(path));
             }
         }
-
-        matches.sort_by(|a, b| b.0.cmp(&a.0));
-        Ok(matches.into_iter().next().map(|(_, path)| path))
+        Ok(None)
     }
 
     pub fn run_dir(&self) -> &PathBuf {
@@ -105,7 +332,7 @@ impl OutputManager {
         let mode = match value.get("mode").and_then(|v| v.as_str()) {
             Some("relay") => ExecutionMode::Relay,
             Some("swarm") => ExecutionMode::Swarm,
-            Some("solo") => ExecutionMode::Solo,
+            Some("solo") => ExecutionMode::Swarm,
             Some("pipeline") => ExecutionMode::Pipeline,
             Some(other) => {
                 return Err(AppError::Config(format!(
@@ -325,18 +552,52 @@ mod tests {
         let mgr = OutputManager::new(base.path(), None).expect("new");
         assert!(mgr.run_dir().exists());
         assert!(mgr.run_dir().starts_with(base.path()));
+        // Parent should be a date dir
+        let parent_name = mgr
+            .run_dir()
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        assert!(
+            is_date_dir(parent_name),
+            "parent should be a date dir: {parent_name}"
+        );
+        // Leaf should match adjective-noun pattern
+        let leaf = mgr
+            .run_dir()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let parts: Vec<&str> = leaf.split('-').collect();
+        assert_eq!(parts.len(), 2, "leaf should be adjective-noun: {leaf}");
+        assert!(
+            ADJECTIVES.contains(&parts[0]),
+            "first word should be an adjective: {leaf}"
+        );
+        assert!(
+            NOUNS.contains(&parts[1]),
+            "second word should be a noun: {leaf}"
+        );
     }
 
     #[test]
     fn new_creates_run_dir_with_sanitized_session_name() {
         let base = tempdir().expect("tempdir");
         let mgr = OutputManager::new(base.path(), Some("my session")).expect("new");
-        let name = mgr
+        let leaf = mgr
             .run_dir()
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        assert!(name.ends_with("_my_session"));
+        assert_eq!(leaf, "my_session");
+        let parent_name = mgr
+            .run_dir()
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        assert!(is_date_dir(parent_name));
     }
 
     #[test]
@@ -368,34 +629,57 @@ mod tests {
     }
 
     #[test]
-    fn find_latest_session_run_picks_lexicographically_latest_match() {
+    fn find_latest_session_run_finds_new_format() {
         let base = tempdir().expect("tempdir");
-        let p1 = base.path().join("20260101_000000_111_alpha");
-        let p2 = base.path().join("20260201_000000_222_alpha");
-        let p3 = base.path().join("20260301_000000_333_beta");
+        // New format: leaf is the session name directly
+        let p1 = base.path().join("2026-01-01/alpha");
         std::fs::create_dir_all(&p1).expect("mkdir");
-        std::fs::create_dir_all(&p2).expect("mkdir");
-        std::fs::create_dir_all(&p3).expect("mkdir");
 
         let found = OutputManager::find_latest_session_run(base.path(), "alpha")
             .expect("find")
             .expect("some");
-        assert_eq!(found, p2);
+        assert_eq!(found, p1);
+    }
+
+    #[test]
+    fn find_latest_session_run_finds_old_format() {
+        let base = tempdir().expect("tempdir");
+        // Old grouped format with timestamp prefix
+        let p1 = base.path().join("2026-04-01/00-00-00_alpha");
+        std::fs::create_dir_all(&p1).expect("mkdir");
+
+        let found = OutputManager::find_latest_session_run(base.path(), "alpha")
+            .expect("find")
+            .expect("some");
+        assert_eq!(found, p1);
+    }
+
+    #[test]
+    fn find_latest_session_run_finds_legacy_format() {
+        let base = tempdir().expect("tempdir");
+        let p1 = base.path().join("20260101_000000_111_alpha");
+        std::fs::create_dir_all(&p1).expect("mkdir");
+
+        let found = OutputManager::find_latest_session_run(base.path(), "alpha")
+            .expect("find")
+            .expect("some");
+        assert_eq!(found, p1);
     }
 
     #[test]
     fn find_latest_session_run_skips_batch_roots() {
         let base = tempdir().expect("tempdir");
-        let batch_root = base.path().join("20260201_000000_222_alpha");
-        let single_root = base.path().join("20260101_000000_111_alpha");
+        let batch_root = base.path().join("2026-03-01/alpha");
         std::fs::create_dir_all(&batch_root).expect("mkdir");
-        std::fs::create_dir_all(&single_root).expect("mkdir");
         std::fs::write(batch_root.join("batch.toml"), "runs = 2").expect("write batch");
+
+        let single = base.path().join("2026-02-01/alpha");
+        std::fs::create_dir_all(&single).expect("mkdir");
 
         let found = OutputManager::find_latest_session_run(base.path(), "alpha")
             .expect("find")
             .expect("some");
-        assert_eq!(found, single_root);
+        assert_eq!(found, single);
     }
 
     #[test]
@@ -538,5 +822,251 @@ mod tests {
 
         let err = OutputManager::read_agent_session_info(mgr.run_dir()).expect_err("should fail");
         assert!(err.to_string().contains("Missing agents"));
+    }
+
+    // --- is_date_dir tests ---
+
+    #[test]
+    fn is_date_dir_valid() {
+        assert!(is_date_dir("2026-03-09"));
+        assert!(is_date_dir("2000-01-01"));
+        assert!(is_date_dir("9999-12-31"));
+    }
+
+    #[test]
+    fn is_date_dir_invalid() {
+        assert!(!is_date_dir("20260309"));
+        assert!(!is_date_dir("2026-3-9"));
+        assert!(!is_date_dir("abcd-ef-gh"));
+        assert!(!is_date_dir("latest"));
+        assert!(!is_date_dir(""));
+        assert!(!is_date_dir("2026-03-09x"));
+    }
+
+    // --- new_impl tests ---
+
+    #[test]
+    fn new_impl_session_name_becomes_leaf() {
+        use chrono::TimeZone;
+        let base = tempdir().expect("tempdir");
+        let now = Local.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let mgr = OutputManager::new_impl(base.path(), Some("my_run"), now).expect("new_impl");
+        assert_eq!(
+            mgr.run_dir(),
+            &base.path().join("2026-01-01").join("my_run")
+        );
+    }
+
+    #[test]
+    fn new_impl_random_name_when_no_session() {
+        use chrono::TimeZone;
+        let base = tempdir().expect("tempdir");
+        let now = Local.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let mgr = OutputManager::new_impl(base.path(), None, now).expect("new_impl");
+        let leaf = mgr
+            .run_dir()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let parts: Vec<&str> = leaf.split('-').collect();
+        assert_eq!(parts.len(), 2, "leaf should be adjective-noun: {leaf}");
+        assert!(ADJECTIVES.contains(&parts[0]));
+        assert!(NOUNS.contains(&parts[1]));
+    }
+
+    #[test]
+    fn new_impl_duplicate_session_returns_error() {
+        use chrono::TimeZone;
+        let base = tempdir().expect("tempdir");
+        let now = Local.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        std::fs::create_dir_all(base.path().join("2026-01-01/my_session")).expect("mkdir");
+        let err = OutputManager::new_impl(base.path(), Some("my_session"), now)
+            .expect_err("should fail");
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    // --- symlink tests ---
+
+    #[cfg(unix)]
+    #[test]
+    fn latest_symlink_created() {
+        let base = tempdir().expect("tempdir");
+        let mgr = OutputManager::new(base.path(), None).expect("new");
+        let link = base.path().join("latest");
+        assert!(link.exists(), "latest symlink should exist");
+        let target = std::fs::read_link(&link).expect("readlink");
+        assert!(target.is_relative(), "symlink should be relative");
+        assert_eq!(base.path().join(&target), *mgr.run_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn latest_symlink_updated() {
+        let base = tempdir().expect("tempdir");
+        let _mgr1 = OutputManager::new(base.path(), Some("first")).expect("new");
+        let mgr2 = OutputManager::new(base.path(), Some("second")).expect("new");
+        let link = base.path().join("latest");
+        let target = std::fs::read_link(&link).expect("readlink");
+        assert_eq!(base.path().join(&target), *mgr2.run_dir());
+    }
+
+    // --- runs.toml tests ---
+
+    #[test]
+    fn runs_toml_single_entry() {
+        let base = tempdir().expect("tempdir");
+        let _mgr = OutputManager::new(base.path(), Some("sess")).expect("new");
+        let content = std::fs::read_to_string(base.path().join("runs.toml")).expect("read");
+        let parsed: toml::Value = content.parse().expect("parse");
+        let entries = parsed["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 1);
+        let path = entries[0]["path"].as_str().expect("path");
+        assert!(path.contains("sess"), "path should contain session name");
+    }
+
+    #[test]
+    fn runs_toml_two_entries() {
+        let base = tempdir().expect("tempdir");
+        let _mgr1 = OutputManager::new(base.path(), Some("a")).expect("new");
+        let _mgr2 = OutputManager::new(base.path(), Some("b")).expect("new");
+        let content = std::fs::read_to_string(base.path().join("runs.toml")).expect("read");
+        let parsed: toml::Value = content.parse().expect("parse");
+        let entries = parsed["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn runs_toml_no_leading_newline() {
+        let base = tempdir().expect("tempdir");
+        let _mgr = OutputManager::new(base.path(), None).expect("new");
+        let content = std::fs::read_to_string(base.path().join("runs.toml")).expect("read");
+        assert!(
+            content.starts_with('['),
+            "first byte should be '[', got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn runs_toml_omits_session_name_when_none() {
+        let base = tempdir().expect("tempdir");
+        let _mgr = OutputManager::new(base.path(), None).expect("new");
+        let content = std::fs::read_to_string(base.path().join("runs.toml")).expect("read");
+        assert!(
+            !content.contains("session_name"),
+            "should not contain session_name"
+        );
+    }
+
+    // --- scan_run_dirs tests ---
+
+    #[test]
+    fn scan_run_dirs_handles_all_three_formats() {
+        let base = tempdir().expect("tempdir");
+        // Legacy flat
+        std::fs::create_dir_all(base.path().join("20260101_120000_111")).expect("mkdir");
+        // Old grouped with timestamp leaf
+        std::fs::create_dir_all(base.path().join("2026-03-01/14-00-00")).expect("mkdir");
+        // New grouped with plain name leaf
+        std::fs::create_dir_all(base.path().join("2026-04-01/swift-falcon")).expect("mkdir");
+
+        let dirs = OutputManager::scan_run_dirs(base.path()).expect("scan");
+        assert_eq!(dirs.len(), 3);
+    }
+
+    #[test]
+    fn scan_run_dirs_skips_junk() {
+        let base = tempdir().expect("tempdir");
+        std::fs::create_dir_all(base.path().join("random_dir")).expect("mkdir");
+        std::fs::create_dir_all(base.path().join("20260101_120000_111")).expect("mkdir");
+        let dirs = OutputManager::scan_run_dirs(base.path()).expect("scan");
+        assert_eq!(dirs.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_run_dirs_skips_latest() {
+        use std::os::unix::fs::symlink;
+        let base = tempdir().expect("tempdir");
+        let real = base.path().join("2026-01-01/swift-falcon");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        symlink("2026-01-01/swift-falcon", base.path().join("latest")).expect("symlink");
+        let dirs = OutputManager::scan_run_dirs(base.path()).expect("scan");
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0], real);
+    }
+
+    // --- find_latest_session_run with new format ---
+
+    #[test]
+    fn find_session_run_new_format_exact_match() {
+        let base = tempdir().expect("tempdir");
+        std::fs::create_dir_all(base.path().join("2026-01-01/alpha")).expect("mkdir");
+        std::fs::create_dir_all(base.path().join("2026-02-01/alpha")).expect("mkdir");
+        let found = OutputManager::find_latest_session_run(base.path(), "alpha")
+            .expect("find")
+            .expect("some");
+        // Should find one of the two "alpha" dirs (whichever is newest by mtime)
+        let leaf = found.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert_eq!(leaf, "alpha");
+    }
+
+    #[test]
+    fn find_session_run_old_format_backward_compat() {
+        let base = tempdir().expect("tempdir");
+        std::fs::create_dir_all(base.path().join("2026-01-01/10-00-00_alpha")).expect("mkdir");
+        let found = OutputManager::find_latest_session_run(base.path(), "alpha")
+            .expect("find")
+            .expect("some");
+        assert!(found.ends_with("10-00-00_alpha"));
+    }
+
+    #[test]
+    fn find_session_run_legacy_backward_compat() {
+        let base = tempdir().expect("tempdir");
+        std::fs::create_dir_all(base.path().join("20260101_120000_111_alpha")).expect("mkdir");
+        let found = OutputManager::find_latest_session_run(base.path(), "alpha")
+            .expect("find")
+            .expect("some");
+        assert!(
+            found
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .ends_with("_alpha")
+        );
+    }
+
+    #[test]
+    fn find_session_run_does_not_shadow_with_new_format_suffix() {
+        let base = tempdir().expect("tempdir");
+        // Create a new-format dir "foo_alpha" (newer mtime) and the real "alpha" (older)
+        std::fs::create_dir_all(base.path().join("2026-01-01/alpha")).expect("mkdir");
+        std::fs::create_dir_all(base.path().join("2026-02-01/foo_alpha")).expect("mkdir");
+        let found = OutputManager::find_latest_session_run(base.path(), "alpha")
+            .expect("find")
+            .expect("some");
+        // Must return the exact "alpha" match, not "foo_alpha"
+        let leaf = found.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert_eq!(leaf, "alpha");
+    }
+
+    // --- generate_random_name tests ---
+
+    #[test]
+    fn random_name_generated_when_no_session() {
+        let name = generate_random_name();
+        let parts: Vec<&str> = name.split('-').collect();
+        assert_eq!(parts.len(), 2);
+        assert!(ADJECTIVES.contains(&parts[0]));
+        assert!(NOUNS.contains(&parts[1]));
+    }
+
+    #[test]
+    fn duplicate_session_name_returns_error() {
+        let base = tempdir().expect("tempdir");
+        let _mgr1 = OutputManager::new(base.path(), Some("dup")).expect("first should succeed");
+        let err = OutputManager::new(base.path(), Some("dup")).expect_err("second should fail");
+        assert!(err.to_string().contains("already exists"));
     }
 }

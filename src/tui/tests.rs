@@ -499,13 +499,20 @@ fn find_latest_compatible_run_ordering() {
     write_agent_iter(&run3, "anthropic", 1);
     write_agent_iter(&run3, "openai", 1);
 
+    // Add a grouped dir from April with matching mode+agents — should win
+    let run4 = dir.path().join("2026-04-01/10-00-00");
+    fs::create_dir_all(&run4).unwrap();
+    write_session_toml(&run4, "relay", &["anthropic", "openai"]);
+    write_agent_iter(&run4, "anthropic", 1);
+    write_agent_iter(&run4, "openai", 1);
+
     assert_eq!(
         find_latest_compatible_run(
             dir.path(),
             ExecutionMode::Relay,
             &["anthropic".to_string(), "openai".to_string()]
         ),
-        Some(run2)
+        Some(run4)
     );
 }
 
@@ -542,6 +549,13 @@ fn find_latest_compatible_run_ignores_invalid_session_toml() {
     fs::write(bad.join("session.toml"), "mode = ").unwrap();
     write_agent_iter(&bad, "anthropic", 1);
     write_agent_iter(&bad, "openai", 1);
+
+    // Also add a grouped dir with bad TOML
+    let bad_grouped = dir.path().join("2026-03-01/12-00-00");
+    fs::create_dir_all(&bad_grouped).unwrap();
+    fs::write(bad_grouped.join("session.toml"), "mode = ").unwrap();
+    write_agent_iter(&bad_grouped, "anthropic", 1);
+    write_agent_iter(&bad_grouped, "openai", 1);
 
     assert_eq!(
         find_latest_compatible_run(
@@ -1306,5 +1320,86 @@ fn pipeline_builder_arrow_navigates_shift_arrow_moves_block() {
         app.pipeline.pipeline_block_cursor,
         Some(2),
         "cursor stays on the moved block"
+    );
+}
+
+// --- New tests for grouped directory support in find_latest_compatible_run ---
+
+#[test]
+fn find_latest_compatible_run_grouped() {
+    let dir = tempdir().unwrap();
+
+    let run1 = dir.path().join("2026-01-01/10-00-00");
+    fs::create_dir_all(&run1).unwrap();
+    write_session_toml(&run1, "relay", &["anthropic", "openai"]);
+    write_agent_iter(&run1, "anthropic", 1);
+    write_agent_iter(&run1, "openai", 1);
+
+    let run2 = dir.path().join("2026-02-01/11-00-00");
+    fs::create_dir_all(&run2).unwrap();
+    write_session_toml(&run2, "relay", &["anthropic", "openai"]);
+    write_agent_iter(&run2, "anthropic", 1);
+    write_agent_iter(&run2, "openai", 1);
+
+    assert_eq!(
+        find_latest_compatible_run(
+            dir.path(),
+            ExecutionMode::Relay,
+            &["anthropic".to_string(), "openai".to_string()]
+        ),
+        Some(run2)
+    );
+}
+
+#[test]
+fn find_latest_compatible_run_mixed_grouped_wins() {
+    let dir = tempdir().unwrap();
+
+    let legacy = dir.path().join("20260101_000000");
+    fs::create_dir_all(&legacy).unwrap();
+    write_session_toml(&legacy, "relay", &["anthropic", "openai"]);
+    write_agent_iter(&legacy, "anthropic", 1);
+    write_agent_iter(&legacy, "openai", 1);
+
+    let grouped = dir.path().join("2026-02-01/12-00-00");
+    fs::create_dir_all(&grouped).unwrap();
+    write_session_toml(&grouped, "relay", &["anthropic", "openai"]);
+    write_agent_iter(&grouped, "anthropic", 1);
+    write_agent_iter(&grouped, "openai", 1);
+
+    assert_eq!(
+        find_latest_compatible_run(
+            dir.path(),
+            ExecutionMode::Relay,
+            &["anthropic".to_string(), "openai".to_string()]
+        ),
+        Some(grouped)
+    );
+}
+
+#[test]
+fn find_latest_compatible_run_skips_grouped_batch() {
+    let dir = tempdir().unwrap();
+
+    let batch = dir.path().join("2026-02-01/12-00-00");
+    fs::create_dir_all(&batch).unwrap();
+    write_session_toml(&batch, "relay", &["anthropic", "openai"]);
+    write_agent_iter(&batch, "anthropic", 1);
+    write_agent_iter(&batch, "openai", 1);
+    fs::write(batch.join("batch.toml"), "runs = 2").unwrap();
+
+    let good = dir.path().join("2026-01-01/10-00-00");
+    fs::create_dir_all(&good).unwrap();
+    write_session_toml(&good, "relay", &["anthropic", "openai"]);
+    write_agent_iter(&good, "anthropic", 1);
+    write_agent_iter(&good, "openai", 1);
+
+    assert_eq!(
+        find_latest_compatible_run(
+            dir.path(),
+            ExecutionMode::Relay,
+            &["anthropic".to_string(), "openai".to_string()]
+        ),
+        Some(good)
     );
 }

@@ -87,23 +87,12 @@ pub(super) fn find_latest_compatible_run(
     mode: ExecutionMode,
     agents: &[String],
 ) -> Option<std::path::PathBuf> {
-    let mut dirs: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(base_dir)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            if entry.file_type().ok()?.is_dir() {
-                Some((
-                    entry.file_name().to_string_lossy().to_string(),
-                    entry.path(),
-                ))
-            } else {
-                None
-            }
-        })
-        .collect();
-    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    let dirs = OutputManager::scan_run_dirs(base_dir).ok()?;
 
-    for (_, run_dir) in dirs {
+    for run_dir in dirs {
+        if OutputManager::is_batch_root(&run_dir) {
+            continue;
+        }
         if !run_dir_matches_mode_and_agents(&run_dir, mode, agents) {
             continue;
         }

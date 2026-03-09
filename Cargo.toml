@@ -21,8 +21,8 @@ shell-words = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "process", "io-util", "fs"] }
 toml = "0.8"
-rand = "0.9"
 pulldown-cmark = "0.10"
+rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 unicode-width = "0.2"
 

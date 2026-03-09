@@ -460,7 +460,7 @@ impl App {
             screen: Screen::Home,
             should_quit: false,
             selected_agents: Vec::new(),
-            selected_mode: ExecutionMode::Solo,
+            selected_mode: ExecutionMode::Swarm,
             home_cursor: 0,
             home_section: HomeSection::Agents,
             prompt: PromptState::new(),
@@ -1224,7 +1224,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Home);
         assert!(!app.should_quit);
         assert!(app.selected_agents.is_empty());
-        assert_eq!(app.selected_mode, crate::execution::ExecutionMode::Solo);
+        assert_eq!(app.selected_mode, crate::execution::ExecutionMode::Swarm);
         assert_eq!(app.prompt.iterations, 1);
         assert_eq!(app.prompt.iterations_buf, "1");
         assert!(!app.running.is_running);
