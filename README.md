@@ -176,7 +176,7 @@ extra_cli_args = ""
 | `model` | Model identifier to use |
 | `use_cli` | Use local CLI binary instead of HTTP API |
 | `cli_print_mode` | Anthropic only: use print mode (`-p`) instead of agent mode (default: `true`) |
-| `extra_cli_args` | Raw string appended as one extra CLI argument |
+| `extra_cli_args` | Shell-style extra CLI args parsed at runtime, for example `--sandbox workspace-write --profile "fast mode"` |
 | `reasoning_effort` | OpenAI effort setting — `low` / `medium` / `high` / `xhigh` |
 | `thinking_effort` | Anthropic & Gemini effort setting — `low` / `medium` / `high`; Anthropic CLI also supports `max` for `claude-opus-4-6` |
 

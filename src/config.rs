@@ -44,7 +44,7 @@ pub struct AgentConfig {
     /// Use print mode (-p) instead of agent mode for Anthropic CLI
     #[serde(default = "default_true")]
     pub cli_print_mode: bool,
-    /// Extra CLI argument appended as a single raw argument to provider CLI calls (no splitting)
+    /// Extra CLI arguments parsed with shell-style quoting at runtime
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub extra_cli_args: String,
 }
@@ -95,7 +95,7 @@ pub struct ProviderConfig {
     /// Use print mode (-p) instead of agent mode for Anthropic CLI
     #[serde(default = "default_true")]
     pub cli_print_mode: bool,
-    /// Extra CLI argument appended as a single raw argument to provider CLI calls (no splitting)
+    /// Extra CLI arguments parsed with shell-style quoting at runtime
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub extra_cli_args: String,
 }

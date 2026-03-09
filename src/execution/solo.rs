@@ -23,14 +23,13 @@ pub async fn run_solo(
             .initial_prompt_for_agent(use_cli_by_agent.get(&name).copied().unwrap_or(false));
         let tx = progress_tx.clone();
         let cancel = cancel.clone();
-        let run_dir = output.run_dir().clone();
+        let task_output = output.clone();
         let provider_kind = provider.kind();
         let agent_name = name.clone();
 
-        let handle =
-            tokio::spawn(
-                async move { solo_agent(name, provider, &prompt, &run_dir, tx, cancel).await },
-            );
+        let handle = tokio::spawn(async move {
+            solo_agent(name, provider, &prompt, task_output, tx, cancel).await
+        });
         handles.push((agent_name, provider_kind, handle));
     }
 
@@ -56,7 +55,7 @@ async fn solo_agent(
     name: String,
     mut provider: Box<dyn Provider>,
     prompt: &str,
-    run_dir: &std::path::Path,
+    output: OutputManager,
     tx: mpsc::UnboundedSender<ProgressEvent>,
     cancel: Arc<AtomicBool>,
 ) {
@@ -132,9 +131,10 @@ async fn solo_agent(
             });
             let sanitized = OutputManager::sanitize_session_name(&name);
             let filename = format!("{sanitized}_iter1.md");
-            let path = run_dir.join(&filename);
+            let path = output.run_dir().join(&filename);
             if let Err(e) = tokio::fs::write(&path, &resp.content).await {
                 let err = format!("Failed to write output file {}: {e}", path.display());
+                let _ = output.append_error(&format!("{name} iter1: {err}"));
                 let _ = tx.send(ProgressEvent::AgentError {
                     agent: name.clone(),
                     kind,
@@ -152,6 +152,7 @@ async fn solo_agent(
         }
         Err(e) => {
             let err_str = e.to_string();
+            let _ = output.append_error(&format!("{name} iter1: {err_str}"));
             let _ = tx.send(ProgressEvent::AgentError {
                 agent: name,
                 kind,
@@ -314,6 +315,10 @@ mod tests {
             )
         }));
         assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
+
+        let log = std::fs::read_to_string(out.run_dir().join("_errors.log")).expect("log");
+        assert!(log.contains("Gemini iter1"));
+        assert!(log.contains("boom"));
     }
 
     #[tokio::test]
@@ -355,6 +360,10 @@ mod tests {
                 }
             )
         }));
+
+        let log = std::fs::read_to_string(out.run_dir().join("_errors.log")).expect("log");
+        assert!(log.contains("Claude iter1"));
+        assert!(log.contains("Failed to write output file"));
     }
 
     #[tokio::test]

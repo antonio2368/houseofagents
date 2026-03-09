@@ -5,6 +5,7 @@ use rand::Rng;
 use std::path::{Path, PathBuf};
 use toml::Value;
 
+#[derive(Debug, Clone)]
 pub struct OutputManager {
     run_dir: PathBuf,
 }

@@ -7,7 +7,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn draw(f: &mut Frame, app: &App) {
@@ -478,7 +477,7 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
     let mut agent_row_idx: HashMap<(String, u32), usize> = HashMap::new();
     let mut block_row_idx: HashMap<(u32, u32), usize> = HashMap::new();
 
-    for evt in &app.progress_events {
+    for evt in app.activity_log() {
         match evt {
             ProgressEvent::AgentStarted {
                 agent, iteration, ..
@@ -761,46 +760,12 @@ fn render_activity_list(f: &mut Frame, app: &App, area: Rect) {
 
 /// Collect the last 10 AgentLog/BlockLog events for currently active agents
 fn collect_active_agent_logs(app: &App) -> Vec<(String, String)> {
-    app.progress_events
-        .iter()
-        .rev()
-        .filter_map(|evt| match evt {
-            ProgressEvent::AgentLog {
-                agent,
-                iteration,
-                message,
-                ..
-            } => Some((agent.clone(), format!("[iter {iteration}] {message}"))),
-            ProgressEvent::BlockLog {
-                agent_name,
-                iteration,
-                message,
-                ..
-            } => Some((agent_name.clone(), format!("[iter {iteration}] {message}"))),
-            _ => None,
-        })
-        .take(10)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+    app.recent_activity_logs().iter().cloned().collect()
 }
 
 /// Find the last error event (if any) to show full details
 fn find_last_error(app: &App) -> Option<(String, String)> {
-    app.progress_events.iter().rev().find_map(|evt| match evt {
-        ProgressEvent::AgentError {
-            agent,
-            details: Some(details),
-            ..
-        } => Some((agent.clone(), details.clone())),
-        ProgressEvent::BlockError {
-            label,
-            details: Some(details),
-            ..
-        } => Some((label.clone(), details.clone())),
-        _ => None,
-    })
+    app.last_error().cloned()
 }
 
 fn truncate_line(s: &str, max: usize) -> String {
@@ -835,19 +800,7 @@ fn compute_total_steps(app: &App) -> usize {
 }
 
 fn count_completed_steps(app: &App) -> usize {
-    app.progress_events
-        .iter()
-        .filter(|e| {
-            matches!(
-                e,
-                ProgressEvent::AgentFinished { .. }
-                    | ProgressEvent::AgentError { .. }
-                    | ProgressEvent::BlockFinished { .. }
-                    | ProgressEvent::BlockError { .. }
-                    | ProgressEvent::BlockSkipped { .. }
-            )
-        })
-        .count()
+    app.completed_steps()
 }
 
 fn current_status(app: &App) -> String {
@@ -865,43 +818,20 @@ fn current_status(app: &App) -> String {
     }
 
     if app.selected_mode == ExecutionMode::Pipeline {
-        // Collect block labels whose most recent event is BlockStarted (still running)
-        let mut active_blocks: Vec<String> = Vec::new();
-        let mut seen_block_ids = HashSet::new();
-        for event in app.progress_events.iter().rev() {
-            match event {
-                ProgressEvent::BlockStarted {
-                    block_id, label, ..
-                } => {
-                    if seen_block_ids.insert(*block_id) {
-                        active_blocks.push(label.clone());
-                    }
-                }
-                ProgressEvent::BlockFinished { block_id, .. }
-                | ProgressEvent::BlockError { block_id, .. }
-                | ProgressEvent::BlockSkipped { block_id, .. } => {
-                    seen_block_ids.insert(*block_id);
-                }
-                _ => {}
-            }
-        }
+        let active_blocks = app
+            .active_block_labels()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
         return if active_blocks.is_empty() {
             "Waiting...".into()
         } else {
-            active_blocks.reverse();
             format!("{} thinking...", active_blocks.join(", "))
         };
     }
 
     let mut active_agents: Vec<&str> = Vec::new();
     for name in &app.selected_agents {
-        let last = app.progress_events.iter().rev().find(|e| match e {
-            ProgressEvent::AgentStarted { agent, .. }
-            | ProgressEvent::AgentFinished { agent, .. }
-            | ProgressEvent::AgentError { agent, .. } => agent == name,
-            _ => false,
-        });
-        if matches!(last, Some(ProgressEvent::AgentStarted { .. })) {
+        if app.is_agent_active(name) {
             active_agents.push(name.as_str());
         }
     }
@@ -933,6 +863,12 @@ mod tests {
             agents: Vec::new(),
             providers: std::collections::HashMap::new(),
         })
+    }
+
+    fn push_events(app: &mut App, events: impl IntoIterator<Item = ProgressEvent>) {
+        for event in events {
+            app.record_progress(event);
+        }
     }
 
     #[test]
@@ -981,25 +917,28 @@ mod tests {
     #[test]
     fn count_completed_steps_counts_finished_and_error_only() {
         let mut a = app();
-        a.progress_events = vec![
-            ProgressEvent::AgentStarted {
-                agent: "Claude".into(),
-                kind: ProviderKind::Anthropic,
-                iteration: 1,
-            },
-            ProgressEvent::AgentFinished {
-                agent: "Claude".into(),
-                kind: ProviderKind::Anthropic,
-                iteration: 1,
-            },
-            ProgressEvent::AgentError {
-                agent: "OpenAI".into(),
-                kind: ProviderKind::OpenAI,
-                iteration: 1,
-                error: "x".to_string(),
-                details: Some("x".to_string()),
-            },
-        ];
+        push_events(
+            &mut a,
+            vec![
+                ProgressEvent::AgentStarted {
+                    agent: "Claude".into(),
+                    kind: ProviderKind::Anthropic,
+                    iteration: 1,
+                },
+                ProgressEvent::AgentFinished {
+                    agent: "Claude".into(),
+                    kind: ProviderKind::Anthropic,
+                    iteration: 1,
+                },
+                ProgressEvent::AgentError {
+                    agent: "OpenAI".into(),
+                    kind: ProviderKind::OpenAI,
+                    iteration: 1,
+                    error: "x".to_string(),
+                    details: Some("x".to_string()),
+                },
+            ],
+        );
         assert_eq!(count_completed_steps(&a), 2);
     }
 
@@ -1007,7 +946,7 @@ mod tests {
     fn collect_active_agent_logs_returns_last_10_in_order() {
         let mut a = app();
         for i in 0..12 {
-            a.progress_events.push(ProgressEvent::AgentLog {
+            a.record_progress(ProgressEvent::AgentLog {
                 agent: "Claude".into(),
                 kind: ProviderKind::Anthropic,
                 iteration: i,
@@ -1023,22 +962,25 @@ mod tests {
     #[test]
     fn find_last_error_prefers_most_recent_with_details() {
         let mut a = app();
-        a.progress_events = vec![
-            ProgressEvent::AgentError {
-                agent: "Claude".into(),
-                kind: ProviderKind::Anthropic,
-                iteration: 1,
-                error: "old".to_string(),
-                details: Some("old details".to_string()),
-            },
-            ProgressEvent::AgentError {
-                agent: "OpenAI".into(),
-                kind: ProviderKind::OpenAI,
-                iteration: 2,
-                error: "new".to_string(),
-                details: Some("new details".to_string()),
-            },
-        ];
+        push_events(
+            &mut a,
+            vec![
+                ProgressEvent::AgentError {
+                    agent: "Claude".into(),
+                    kind: ProviderKind::Anthropic,
+                    iteration: 1,
+                    error: "old".to_string(),
+                    details: Some("old details".to_string()),
+                },
+                ProgressEvent::AgentError {
+                    agent: "OpenAI".into(),
+                    kind: ProviderKind::OpenAI,
+                    iteration: 2,
+                    error: "new".to_string(),
+                    details: Some("new details".to_string()),
+                },
+            ],
+        );
         assert_eq!(
             find_last_error(&a),
             Some(("OpenAI".to_string(), "new details".to_string()))
@@ -1048,7 +990,7 @@ mod tests {
     #[test]
     fn find_last_error_ignores_missing_details() {
         let mut a = app();
-        a.progress_events.push(ProgressEvent::AgentError {
+        a.record_progress(ProgressEvent::AgentError {
             agent: "OpenAI".into(),
             kind: ProviderKind::OpenAI,
             iteration: 1,
@@ -1081,11 +1023,14 @@ mod tests {
         let mut a = app();
         a.is_running = true;
         a.selected_agents = vec!["Claude".into()];
-        a.progress_events = vec![ProgressEvent::AgentFinished {
-            agent: "Claude".into(),
-            kind: ProviderKind::Anthropic,
-            iteration: 1,
-        }];
+        push_events(
+            &mut a,
+            vec![ProgressEvent::AgentFinished {
+                agent: "Claude".into(),
+                kind: ProviderKind::Anthropic,
+                iteration: 1,
+            }],
+        );
         assert_eq!(current_status(&a), "Waiting...");
     }
 
@@ -1094,18 +1039,21 @@ mod tests {
         let mut a = app();
         a.is_running = true;
         a.selected_agents = vec!["Claude".into(), "OpenAI".into()];
-        a.progress_events = vec![
-            ProgressEvent::AgentStarted {
-                agent: "Claude".into(),
-                kind: ProviderKind::Anthropic,
-                iteration: 1,
-            },
-            ProgressEvent::AgentStarted {
-                agent: "OpenAI".into(),
-                kind: ProviderKind::OpenAI,
-                iteration: 1,
-            },
-        ];
+        push_events(
+            &mut a,
+            vec![
+                ProgressEvent::AgentStarted {
+                    agent: "Claude".into(),
+                    kind: ProviderKind::Anthropic,
+                    iteration: 1,
+                },
+                ProgressEvent::AgentStarted {
+                    agent: "OpenAI".into(),
+                    kind: ProviderKind::OpenAI,
+                    iteration: 1,
+                },
+            ],
+        );
         let s = current_status(&a);
         assert!(s.contains("Claude"));
         assert!(s.contains("OpenAI"));
@@ -1117,20 +1065,23 @@ mod tests {
         let mut a = app();
         a.is_running = true;
         a.selected_mode = ExecutionMode::Pipeline;
-        a.progress_events = vec![
-            ProgressEvent::BlockStarted {
-                block_id: 1,
-                agent_name: "Claude".into(),
-                label: "Block 1 (Claude)".into(),
-                iteration: 1,
-            },
-            ProgressEvent::BlockStarted {
-                block_id: 2,
-                agent_name: "OpenAI".into(),
-                label: "Block 2 (OpenAI)".into(),
-                iteration: 1,
-            },
-        ];
+        push_events(
+            &mut a,
+            vec![
+                ProgressEvent::BlockStarted {
+                    block_id: 1,
+                    agent_name: "Claude".into(),
+                    label: "Block 1 (Claude)".into(),
+                    iteration: 1,
+                },
+                ProgressEvent::BlockStarted {
+                    block_id: 2,
+                    agent_name: "OpenAI".into(),
+                    label: "Block 2 (OpenAI)".into(),
+                    iteration: 1,
+                },
+            ],
+        );
         let s = current_status(&a);
         assert!(s.contains("Block 1 (Claude)"));
         assert!(s.contains("Block 2 (OpenAI)"));
@@ -1142,26 +1093,29 @@ mod tests {
         let mut a = app();
         a.is_running = true;
         a.selected_mode = ExecutionMode::Pipeline;
-        a.progress_events = vec![
-            ProgressEvent::BlockStarted {
-                block_id: 1,
-                agent_name: "Claude".into(),
-                label: "Block 1 (Claude)".into(),
-                iteration: 1,
-            },
-            ProgressEvent::BlockFinished {
-                block_id: 1,
-                agent_name: "Claude".into(),
-                label: "Block 1 (Claude)".into(),
-                iteration: 1,
-            },
-            ProgressEvent::BlockStarted {
-                block_id: 2,
-                agent_name: "OpenAI".into(),
-                label: "Block 2 (OpenAI)".into(),
-                iteration: 1,
-            },
-        ];
+        push_events(
+            &mut a,
+            vec![
+                ProgressEvent::BlockStarted {
+                    block_id: 1,
+                    agent_name: "Claude".into(),
+                    label: "Block 1 (Claude)".into(),
+                    iteration: 1,
+                },
+                ProgressEvent::BlockFinished {
+                    block_id: 1,
+                    agent_name: "Claude".into(),
+                    label: "Block 1 (Claude)".into(),
+                    iteration: 1,
+                },
+                ProgressEvent::BlockStarted {
+                    block_id: 2,
+                    agent_name: "OpenAI".into(),
+                    label: "Block 2 (OpenAI)".into(),
+                    iteration: 1,
+                },
+            ],
+        );
         let s = current_status(&a);
         assert!(!s.contains("Block 1"));
         assert!(s.contains("Block 2 (OpenAI)"));
@@ -1172,12 +1126,15 @@ mod tests {
         let mut a = app();
         a.is_running = true;
         a.selected_mode = ExecutionMode::Pipeline;
-        a.progress_events = vec![ProgressEvent::BlockFinished {
-            block_id: 1,
-            agent_name: "Claude".into(),
-            label: "Block 1 (Claude)".into(),
-            iteration: 1,
-        }];
+        push_events(
+            &mut a,
+            vec![ProgressEvent::BlockFinished {
+                block_id: 1,
+                agent_name: "Claude".into(),
+                label: "Block 1 (Claude)".into(),
+                iteration: 1,
+            }],
+        );
         assert_eq!(current_status(&a), "Waiting...");
     }
 
@@ -1196,18 +1153,21 @@ mod tests {
         a.is_running = false;
         a.cancel_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        a.progress_events = vec![
-            ProgressEvent::AgentStarted {
-                agent: "Claude".into(),
-                kind: ProviderKind::Anthropic,
-                iteration: 1,
-            },
-            ProgressEvent::AgentFinished {
-                agent: "OpenAI".into(),
-                kind: ProviderKind::OpenAI,
-                iteration: 1,
-            },
-        ];
+        push_events(
+            &mut a,
+            vec![
+                ProgressEvent::AgentStarted {
+                    agent: "Claude".into(),
+                    kind: ProviderKind::Anthropic,
+                    iteration: 1,
+                },
+                ProgressEvent::AgentFinished {
+                    agent: "OpenAI".into(),
+                    kind: ProviderKind::OpenAI,
+                    iteration: 1,
+                },
+            ],
+        );
         let items = build_event_items(&a);
         let texts: Vec<String> = items.iter().map(|i| format!("{:?}", i)).collect();
         let joined = texts.join("\n");
@@ -1230,11 +1190,14 @@ mod tests {
     fn build_event_items_keeps_thinking_when_not_cancelled() {
         let mut a = app();
         a.is_running = true;
-        a.progress_events = vec![ProgressEvent::AgentStarted {
-            agent: "Claude".into(),
-            kind: ProviderKind::Anthropic,
-            iteration: 1,
-        }];
+        push_events(
+            &mut a,
+            vec![ProgressEvent::AgentStarted {
+                agent: "Claude".into(),
+                kind: ProviderKind::Anthropic,
+                iteration: 1,
+            }],
+        );
         let items = build_event_items(&a);
         let joined: String = items.iter().map(|i| format!("{:?}", i)).collect();
         assert!(
@@ -1249,12 +1212,15 @@ mod tests {
         a.is_running = false;
         a.cancel_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        a.progress_events = vec![ProgressEvent::BlockStarted {
-            block_id: 1,
-            agent_name: "Claude".into(),
-            label: "Block 1 (Claude)".into(),
-            iteration: 1,
-        }];
+        push_events(
+            &mut a,
+            vec![ProgressEvent::BlockStarted {
+                block_id: 1,
+                agent_name: "Claude".into(),
+                label: "Block 1 (Claude)".into(),
+                iteration: 1,
+            }],
+        );
         let items = build_event_items(&a);
         let joined: String = items.iter().map(|i| format!("{:?}", i)).collect();
         assert!(

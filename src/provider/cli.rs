@@ -8,10 +8,27 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+const CLI_STDOUT_MAX_BYTES: usize = 1024 * 1024;
+const CLI_STDERR_MAX_BYTES: usize = 256 * 1024;
+const CLI_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const CLI_LIVE_LOG_LINE_MAX_BYTES: usize = 4096;
+
+#[derive(Debug)]
+struct BoundedBytes {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct BoundedText {
+    text: String,
+    truncated: bool,
+}
 
 pub struct CliProvider {
     kind: ProviderKind,
@@ -74,12 +91,15 @@ impl CliProvider {
         self.thinking_effort.as_deref()
     }
 
-    fn extra_cli_arg(&self) -> Option<String> {
+    fn parse_extra_cli_args(&self) -> Result<Vec<String>, AppError> {
         let trimmed = self.extra_cli_args.trim();
         if trimmed.is_empty() {
-            None
+            Ok(Vec::new())
         } else {
-            Some(trimmed.to_string())
+            shell_words::split(trimmed).map_err(|e| AppError::Provider {
+                provider: self.provider_name().into(),
+                message: format!("Invalid extra_cli_args: {e}"),
+            })
         }
     }
 
@@ -260,6 +280,155 @@ impl CliProvider {
         }
     }
 
+    async fn read_bounded_bytes<R>(
+        mut reader: R,
+        max_bytes: usize,
+    ) -> Result<BoundedBytes, std::io::Error>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let mut out = Vec::new();
+        let mut truncated = false;
+        let mut buf = [0u8; 8192];
+
+        loop {
+            let read = reader.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+
+            let remaining = max_bytes.saturating_sub(out.len());
+            if remaining > 0 {
+                let take = remaining.min(read);
+                out.extend_from_slice(&buf[..take]);
+                if take < read {
+                    truncated = true;
+                }
+            } else {
+                truncated = true;
+            }
+        }
+
+        Ok(BoundedBytes {
+            bytes: out,
+            truncated,
+        })
+    }
+
+    async fn read_bounded_stderr(
+        mut stderr: impl AsyncRead + Unpin,
+        max_bytes: usize,
+        live_log_tx: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<BoundedText, std::io::Error> {
+        let mut full = Vec::new();
+        let mut truncated = false;
+        let mut chunk = [0u8; 4096];
+        let mut live_line = Vec::new();
+        let mut live_line_truncated = false;
+
+        loop {
+            let read = stderr.read(&mut chunk).await?;
+            if read == 0 {
+                break;
+            }
+
+            let remaining = max_bytes.saturating_sub(full.len());
+            if remaining > 0 {
+                let take = remaining.min(read);
+                full.extend_from_slice(&chunk[..take]);
+                if take < read {
+                    truncated = true;
+                }
+            } else {
+                truncated = true;
+            }
+
+            for &byte in &chunk[..read] {
+                match byte {
+                    b'\n' => {
+                        Self::emit_stderr_live_log(
+                            live_log_tx.as_ref(),
+                            &live_line,
+                            live_line_truncated,
+                        );
+                        live_line.clear();
+                        live_line_truncated = false;
+                    }
+                    b'\r' => {}
+                    _ => {
+                        if live_line.len() < CLI_LIVE_LOG_LINE_MAX_BYTES {
+                            live_line.push(byte);
+                        } else {
+                            live_line_truncated = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        Self::emit_stderr_live_log(live_log_tx.as_ref(), &live_line, live_line_truncated);
+
+        Ok(BoundedText {
+            text: String::from_utf8_lossy(&full).into_owned(),
+            truncated,
+        })
+    }
+
+    fn emit_stderr_live_log(
+        live_log_tx: Option<&mpsc::UnboundedSender<String>>,
+        line: &[u8],
+        truncated: bool,
+    ) {
+        let trimmed = String::from_utf8_lossy(line).trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        let clipped = if truncated {
+            format!("{}...", Self::clip(&trimmed, 180))
+        } else {
+            Self::clip(&trimmed, 180)
+        };
+
+        if let Some(tx) = live_log_tx {
+            let _ = tx.send(format!("stderr> {clipped}"));
+        }
+    }
+
+    async fn await_reader_task<T, U>(
+        task: &mut tokio::task::JoinHandle<Result<T, std::io::Error>>,
+        other_task: &tokio::task::JoinHandle<Result<U, std::io::Error>>,
+        bin: &str,
+        stream_name: &str,
+        debug_logs: &[String],
+    ) -> Result<T, AppError> {
+        match tokio::time::timeout(CLI_POST_EXIT_DRAIN_TIMEOUT, &mut *task).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(e))) => Err(Self::provider_error_with_debug(
+                bin,
+                format!("Failed reading {stream_name}: {e}"),
+                debug_logs,
+            )),
+            Ok(Err(e)) => Err(Self::provider_error_with_debug(
+                bin,
+                format!("{stream_name} task failed: {e}"),
+                debug_logs,
+            )),
+            Err(_) => {
+                task.abort();
+                other_task.abort();
+                Err(Self::provider_error_with_debug(
+                    bin,
+                    format!(
+                        "Timed out draining {stream_name} after process exit ({} ms)",
+                        CLI_POST_EXIT_DRAIN_TIMEOUT.as_millis()
+                    ),
+                    debug_logs,
+                ))
+            }
+        }
+    }
+
     fn provider_name(&self) -> &'static str {
         match self.kind {
             ProviderKind::Anthropic => "Anthropic",
@@ -376,9 +545,7 @@ impl Provider for CliProvider {
             args.push("--model".to_string());
             args.push(self.model.clone());
         }
-        if let Some(extra_arg) = self.extra_cli_arg() {
-            args.push(extra_arg);
-        }
+        args.extend(self.parse_extra_cli_args()?);
         self.push_command_debug(&mut debug_logs, bin, &args);
         self.emit_live_log(format!("start {} (timeout {}s)", bin, self.timeout_seconds));
 
@@ -408,32 +575,12 @@ impl Provider for CliProvider {
             )
         })?;
 
-        let stdout_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut out = Vec::new();
-            reader.read_to_end(&mut out).await?;
-            Ok::<Vec<u8>, std::io::Error>(out)
+        let mut stdout_task = tokio::spawn(async move {
+            CliProvider::read_bounded_bytes(stdout, CLI_STDOUT_MAX_BYTES).await
         });
         let live_log_tx = self.live_log_tx.clone();
-        let stderr_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            let mut full = String::new();
-            loop {
-                line.clear();
-                let read = reader.read_line(&mut line).await?;
-                if read == 0 {
-                    break;
-                }
-                full.push_str(&line);
-                let trimmed = line.trim_end_matches(['\r', '\n']).trim();
-                if !trimmed.is_empty() {
-                    if let Some(tx) = live_log_tx.as_ref() {
-                        let _ = tx.send(format!("stderr> {}", CliProvider::clip(trimmed, 180)));
-                    }
-                }
-            }
-            Ok::<String, std::io::Error>(full)
+        let mut stderr_task = tokio::spawn(async move {
+            CliProvider::read_bounded_stderr(stderr, CLI_STDERR_MAX_BYTES, live_log_tx).await
         });
 
         // Write prompt via stdin
@@ -492,58 +639,42 @@ impl Provider for CliProvider {
                 }
             };
 
-        let stdout_bytes = match stdout_task.await {
-            Ok(Ok(bytes)) => bytes,
-            Ok(Err(e)) => {
-                return Err(Self::provider_error_with_debug(
-                    bin,
-                    format!("Failed reading stdout: {e}"),
-                    &debug_logs,
-                ))
-            }
-            Err(e) => {
-                return Err(Self::provider_error_with_debug(
-                    bin,
-                    format!("stdout task failed: {e}"),
-                    &debug_logs,
-                ))
-            }
-        };
-        let stderr_text = match stderr_task.await {
-            Ok(Ok(text)) => text,
-            Ok(Err(e)) => {
-                return Err(Self::provider_error_with_debug(
-                    bin,
-                    format!("Failed reading stderr: {e}"),
-                    &debug_logs,
-                ))
-            }
-            Err(e) => {
-                return Err(Self::provider_error_with_debug(
-                    bin,
-                    format!("stderr task failed: {e}"),
-                    &debug_logs,
-                ))
-            }
-        };
+        let stdout_result =
+            Self::await_reader_task(&mut stdout_task, &stderr_task, bin, "stdout", &debug_logs)
+                .await?;
+        let stderr_result =
+            Self::await_reader_task(&mut stderr_task, &stdout_task, bin, "stderr", &debug_logs)
+                .await?;
 
         debug_logs.push(format!(
             "exit: {} (elapsed {} ms, stdout {} bytes, stderr {} bytes)",
             status,
             started_at.elapsed().as_millis(),
-            stdout_bytes.len(),
-            stderr_text.len(),
+            stdout_result.bytes.len(),
+            stderr_result.text.len(),
         ));
         self.emit_live_log(format!("exit {}", status));
-        Self::append_stderr_debug(&mut debug_logs, &stderr_text);
+        if stdout_result.truncated {
+            debug_logs.push(format!(
+                "stdout truncated to {} bytes",
+                CLI_STDOUT_MAX_BYTES
+            ));
+        }
+        if stderr_result.truncated {
+            debug_logs.push(format!(
+                "stderr truncated to {} bytes",
+                CLI_STDERR_MAX_BYTES
+            ));
+        }
+        Self::append_stderr_debug(&mut debug_logs, &stderr_result.text);
 
-        let stdout_text: String = String::from_utf8_lossy(&stdout_bytes).into();
+        let stdout_text: String = String::from_utf8_lossy(&stdout_result.bytes).into();
 
         if !status.success() {
             if let Some(path) = codex_output_path.as_ref() {
                 let _ = fs::remove_file(path).await;
             }
-            let mut msg = format!("exit {}: {}", status, stderr_text);
+            let mut msg = format!("exit {}: {}", status, stderr_result.text);
             let stdout_trimmed = stdout_text.trim();
             if !stdout_trimmed.is_empty() {
                 msg.push_str("\nstdout: ");
@@ -600,9 +731,14 @@ impl Provider for CliProvider {
 
 #[cfg(test)]
 mod tests {
-    use super::CliProvider;
+    use super::{
+        CliProvider, CLI_POST_EXIT_DRAIN_TIMEOUT, CLI_STDERR_MAX_BYTES, CLI_STDOUT_MAX_BYTES,
+    };
     use crate::provider::ProviderKind;
     use serde_json::json;
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
+    use tokio::time::{sleep, Duration};
 
     fn provider_with_extra(extra: &str) -> CliProvider {
         CliProvider::new(
@@ -619,27 +755,38 @@ mod tests {
     }
 
     #[test]
-    fn extra_cli_arg_none_when_blank() {
+    fn parse_extra_cli_args_none_when_blank() {
         let provider = provider_with_extra("   ");
-        assert_eq!(provider.extra_cli_arg(), None);
+        assert!(provider.parse_extra_cli_args().unwrap().is_empty());
     }
 
     #[test]
-    fn extra_cli_arg_uses_single_trimmed_argument_without_splitting() {
-        let provider = provider_with_extra("  --config key=value with spaces  ");
+    fn parse_extra_cli_args_supports_shell_quoting() {
+        let provider = provider_with_extra("  --config 'key=value with spaces' --flag  ");
         assert_eq!(
-            provider.extra_cli_arg(),
-            Some("--config key=value with spaces".to_string())
+            provider.parse_extra_cli_args().unwrap(),
+            vec![
+                "--config".to_string(),
+                "key=value with spaces".to_string(),
+                "--flag".to_string()
+            ]
         );
     }
 
     #[test]
-    fn extra_cli_arg_preserves_quote_characters() {
-        let provider = provider_with_extra("--opt \"quoted value\"");
+    fn parse_extra_cli_args_allows_empty_quoted_value() {
+        let provider = provider_with_extra("--opt \"\"");
         assert_eq!(
-            provider.extra_cli_arg(),
-            Some("--opt \"quoted value\"".to_string())
+            provider.parse_extra_cli_args().unwrap(),
+            vec!["--opt".to_string(), String::new()]
         );
+    }
+
+    #[test]
+    fn parse_extra_cli_args_rejects_malformed_quoting() {
+        let provider = provider_with_extra("--opt \"unterminated");
+        let err = provider.parse_extra_cli_args().expect_err("should fail");
+        assert!(err.to_string().contains("Invalid extra_cli_args"));
     }
 
     #[test]
@@ -712,5 +859,54 @@ not json
         assert!(logs.iter().any(|line| line.contains("session:")));
         assert!(logs.iter().any(|line| line.contains("(resuming)")));
         assert!(!logs.iter().any(|line| line.contains("(initial)")));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_bytes_caps_output_without_failing() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let payload = vec![b'x'; CLI_STDOUT_MAX_BYTES + 16];
+        tokio::spawn(async move {
+            writer.write_all(&payload).await.unwrap();
+        });
+
+        let result = CliProvider::read_bounded_bytes(reader, CLI_STDOUT_MAX_BYTES)
+            .await
+            .expect("read");
+        assert_eq!(result.bytes.len(), CLI_STDOUT_MAX_BYTES);
+        assert!(result.truncated);
+    }
+
+    #[tokio::test]
+    async fn read_bounded_stderr_caps_buffer_and_keeps_live_logs() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let payload = format!("{}\n", "y".repeat(CLI_STDERR_MAX_BYTES + 16));
+        tokio::spawn(async move {
+            writer.write_all(payload.as_bytes()).await.unwrap();
+        });
+
+        let result = CliProvider::read_bounded_stderr(reader, CLI_STDERR_MAX_BYTES, Some(tx))
+            .await
+            .expect("read");
+        assert_eq!(result.text.len(), CLI_STDERR_MAX_BYTES);
+        assert!(result.truncated);
+        let live = rx.try_recv().expect("live log");
+        assert!(live.starts_with("stderr> "));
+        assert!(live.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn await_reader_task_times_out_and_aborts() {
+        let mut stalled = tokio::spawn(async {
+            sleep(CLI_POST_EXIT_DRAIN_TIMEOUT + Duration::from_millis(50)).await;
+            Ok::<_, std::io::Error>(())
+        });
+        let other = tokio::spawn(async { Ok::<_, std::io::Error>(()) });
+
+        let err = CliProvider::await_reader_task(&mut stalled, &other, "codex", "stdout", &[])
+            .await
+            .expect_err("should timeout");
+
+        assert!(err.to_string().contains("Timed out draining stdout"));
     }
 }

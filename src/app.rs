@@ -9,6 +9,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+const ACTIVITY_LOG_LIMIT: usize = 200;
+const ERROR_LEDGER_LIMIT: usize = 200;
+const ERROR_LEDGER_ENTRY_MAX_CHARS: usize = 4096;
+const RECENT_ACTIVITY_LOG_LIMIT: usize = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     Home,
@@ -55,7 +60,15 @@ pub struct App {
     pub order_grabbed: Option<usize>,
 
     // Running screen state
-    pub progress_events: Vec<ProgressEvent>,
+    activity_log: VecDeque<ProgressEvent>,
+    error_ledger: VecDeque<String>,
+    recent_activity_logs: VecDeque<(String, String)>,
+    last_error: Option<(String, String)>,
+    completed_steps: usize,
+    completed_agent_steps: HashSet<(String, u32)>,
+    completed_block_steps: HashSet<(u32, u32)>,
+    active_agents: HashSet<String>,
+    active_blocks: Vec<(u32, String)>,
     pub is_running: bool,
     pub run_error: Option<String>,
     pub consolidation_active: bool,
@@ -333,7 +346,15 @@ impl App {
             prompt_focus: PromptFocus::Text,
             order_cursor: 0,
             order_grabbed: None,
-            progress_events: Vec::new(),
+            activity_log: VecDeque::new(),
+            error_ledger: VecDeque::new(),
+            recent_activity_logs: VecDeque::new(),
+            last_error: None,
+            completed_steps: 0,
+            completed_agent_steps: HashSet::new(),
+            completed_block_steps: HashSet::new(),
+            active_agents: HashSet::new(),
+            active_blocks: Vec::new(),
             is_running: false,
             run_error: None,
             consolidation_active: false,
@@ -497,6 +518,188 @@ impl App {
             .collect();
         self.multi_run_step_labels = step_labels;
     }
+
+    pub fn clear_run_activity(&mut self) {
+        self.activity_log.clear();
+        self.error_ledger.clear();
+        self.recent_activity_logs.clear();
+        self.last_error = None;
+        self.completed_steps = 0;
+        self.completed_agent_steps.clear();
+        self.completed_block_steps.clear();
+        self.active_agents.clear();
+        self.active_blocks.clear();
+    }
+
+    pub fn record_progress(&mut self, event: ProgressEvent) {
+        self.reduce_progress_event(&event);
+        if self.activity_log.len() == ACTIVITY_LOG_LIMIT {
+            self.activity_log.pop_front();
+        }
+        self.activity_log.push_back(event);
+    }
+
+    pub fn activity_log(&self) -> &VecDeque<ProgressEvent> {
+        &self.activity_log
+    }
+
+    pub fn error_ledger(&self) -> &VecDeque<String> {
+        &self.error_ledger
+    }
+
+    pub fn recent_activity_logs(&self) -> &VecDeque<(String, String)> {
+        &self.recent_activity_logs
+    }
+
+    pub fn last_error(&self) -> Option<&(String, String)> {
+        self.last_error.as_ref()
+    }
+
+    pub fn completed_steps(&self) -> usize {
+        self.completed_steps
+    }
+
+    pub fn is_agent_active(&self, name: &str) -> bool {
+        self.active_agents.contains(name)
+    }
+
+    pub fn active_block_labels(&self) -> impl Iterator<Item = &str> {
+        self.active_blocks.iter().map(|(_, label)| label.as_str())
+    }
+
+    fn reduce_progress_event(&mut self, event: &ProgressEvent) {
+        match event {
+            ProgressEvent::AgentStarted { agent, .. } => {
+                self.active_agents.insert(agent.clone());
+            }
+            ProgressEvent::AgentLog {
+                agent,
+                iteration,
+                message,
+                ..
+            } => self
+                .push_recent_activity_log(agent.clone(), format!("[iter {iteration}] {message}")),
+            ProgressEvent::AgentFinished {
+                agent, iteration, ..
+            } => {
+                self.active_agents.remove(agent);
+                if self
+                    .completed_agent_steps
+                    .insert((agent.clone(), *iteration))
+                {
+                    self.completed_steps += 1;
+                }
+            }
+            ProgressEvent::AgentError {
+                agent,
+                iteration,
+                error,
+                details,
+                ..
+            } => {
+                self.active_agents.remove(agent);
+                if self
+                    .completed_agent_steps
+                    .insert((agent.clone(), *iteration))
+                {
+                    self.completed_steps += 1;
+                }
+                let body = details.as_deref().unwrap_or(error);
+                self.push_error_ledger_entry(format!("[{agent} iter {iteration}] {body}"));
+                if let Some(details) = details {
+                    self.last_error = Some((agent.clone(), details.clone()));
+                }
+            }
+            ProgressEvent::IterationComplete { .. } => {}
+            ProgressEvent::BlockStarted {
+                block_id, label, ..
+            } => self.upsert_active_block(*block_id, label.clone()),
+            ProgressEvent::BlockLog {
+                agent_name,
+                iteration,
+                message,
+                ..
+            } => self.push_recent_activity_log(
+                agent_name.clone(),
+                format!("[iter {iteration}] {message}"),
+            ),
+            ProgressEvent::BlockFinished {
+                block_id,
+                iteration,
+                ..
+            } => {
+                self.remove_active_block(*block_id);
+                if self.completed_block_steps.insert((*block_id, *iteration)) {
+                    self.completed_steps += 1;
+                }
+            }
+            ProgressEvent::BlockError {
+                block_id,
+                agent_name,
+                iteration,
+                error,
+                details,
+                label,
+                ..
+            } => {
+                self.remove_active_block(*block_id);
+                if self.completed_block_steps.insert((*block_id, *iteration)) {
+                    self.completed_steps += 1;
+                }
+                let body = details.as_deref().unwrap_or(error);
+                self.push_error_ledger_entry(format!(
+                    "[block {block_id} {agent_name} iter {iteration}] {body}"
+                ));
+                if let Some(details) = details {
+                    self.last_error = Some((label.clone(), details.clone()));
+                }
+            }
+            ProgressEvent::BlockSkipped {
+                block_id,
+                iteration,
+                ..
+            } => {
+                self.remove_active_block(*block_id);
+                if self.completed_block_steps.insert((*block_id, *iteration)) {
+                    self.completed_steps += 1;
+                }
+            }
+            ProgressEvent::AllDone => {}
+        }
+    }
+
+    fn push_recent_activity_log(&mut self, name: String, message: String) {
+        self.recent_activity_logs.push_back((name, message));
+        if self.recent_activity_logs.len() > RECENT_ACTIVITY_LOG_LIMIT {
+            self.recent_activity_logs.pop_front();
+        }
+    }
+
+    fn push_error_ledger_entry(&mut self, entry: String) {
+        let bounded = truncate_error_ledger_entry(&entry);
+        self.error_ledger.push_back(bounded);
+        if self.error_ledger.len() > ERROR_LEDGER_LIMIT {
+            self.error_ledger.pop_front();
+        }
+    }
+
+    fn upsert_active_block(&mut self, block_id: u32, label: String) {
+        self.remove_active_block(block_id);
+        self.active_blocks.push((block_id, label));
+    }
+
+    fn remove_active_block(&mut self, block_id: u32) {
+        self.active_blocks.retain(|(id, _)| *id != block_id);
+    }
+}
+
+fn truncate_error_ledger_entry(entry: &str) -> String {
+    let clipped: String = entry.chars().take(ERROR_LEDGER_ENTRY_MAX_CHARS).collect();
+    if entry.chars().count() > ERROR_LEDGER_ENTRY_MAX_CHARS {
+        format!("{clipped}... [truncated]")
+    } else {
+        clipped
+    }
 }
 
 impl RunState {
@@ -582,6 +785,81 @@ mod tests {
         assert_eq!(app.iterations, 1);
         assert_eq!(app.iterations_buf, "1");
         assert!(!app.is_running);
+    }
+
+    #[test]
+    fn record_progress_caps_activity_log_and_tracks_summary_state() {
+        let mut app = App::new(base_config());
+        for iteration in 0..(ACTIVITY_LOG_LIMIT as u32 + 5) {
+            app.record_progress(ProgressEvent::AgentLog {
+                agent: "Claude".into(),
+                kind: ProviderKind::Anthropic,
+                iteration,
+                message: format!("m{iteration}"),
+            });
+        }
+
+        assert_eq!(app.activity_log.len(), ACTIVITY_LOG_LIMIT);
+        assert_eq!(
+            app.recent_activity_logs.back(),
+            Some(&(
+                "Claude".to_string(),
+                format!(
+                    "[iter {}] m{}",
+                    ACTIVITY_LOG_LIMIT as u32 + 4,
+                    ACTIVITY_LOG_LIMIT as u32 + 4
+                )
+            ))
+        );
+
+        app.record_progress(ProgressEvent::AgentStarted {
+            agent: "Claude".into(),
+            kind: ProviderKind::Anthropic,
+            iteration: 1,
+        });
+        assert!(app.is_agent_active("Claude"));
+
+        app.record_progress(ProgressEvent::AgentError {
+            agent: "Claude".into(),
+            kind: ProviderKind::Anthropic,
+            iteration: 1,
+            error: "boom".into(),
+            details: Some("full boom".into()),
+        });
+        assert_eq!(app.completed_steps(), 1);
+        assert_eq!(
+            app.error_ledger().iter().cloned().collect::<Vec<_>>(),
+            vec!["[Claude iter 1] full boom".to_string()]
+        );
+        assert_eq!(
+            app.last_error(),
+            Some(&("Claude".to_string(), "full boom".to_string()))
+        );
+        assert!(!app.is_agent_active("Claude"));
+    }
+
+    #[test]
+    fn error_ledger_is_bounded_by_size_and_count() {
+        let mut app = App::new(base_config());
+        let oversized = "x".repeat(ERROR_LEDGER_ENTRY_MAX_CHARS + 32);
+
+        for iteration in 0..(ERROR_LEDGER_LIMIT as u32 + 5) {
+            app.record_progress(ProgressEvent::AgentError {
+                agent: "Claude".into(),
+                kind: ProviderKind::Anthropic,
+                iteration,
+                error: "boom".into(),
+                details: Some(oversized.clone()),
+            });
+        }
+
+        assert_eq!(app.error_ledger.len(), ERROR_LEDGER_LIMIT);
+        assert!(app.error_ledger[0].contains("iter 5"));
+        assert!(app
+            .error_ledger
+            .back()
+            .unwrap()
+            .ends_with("... [truncated]"));
     }
 
     #[test]

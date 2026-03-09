@@ -1922,7 +1922,7 @@ fn reset_to_home(app: &mut App) {
     app.prompt_cursor = 0;
     app.session_name.clear();
     app.selected_agents.clear();
-    app.progress_events.clear();
+    app.clear_run_activity();
     app.result_files.clear();
     app.result_preview.clear();
     app.iterations = 1;
@@ -2748,7 +2748,7 @@ fn effective_concurrency(runs: u32, concurrency: u32) -> u32 {
 
 fn reset_running_state(app: &mut App) {
     app.screen = Screen::Running;
-    app.progress_events.clear();
+    app.clear_run_activity();
     app.is_running = true;
     app.run_error = None;
     app.consolidation_active = false;
@@ -3588,7 +3588,7 @@ fn validate_agent_runtime(
 
 fn handle_progress(app: &mut App, event: ProgressEvent) {
     let is_done = matches!(event, ProgressEvent::AllDone);
-    app.progress_events.push(event);
+    app.record_progress(event);
     if is_done {
         app.is_running = false;
         app.progress_rx = None;
@@ -3629,7 +3629,7 @@ fn handle_batch_progress(app: &mut App, event: BatchProgressEvent) {
                 event,
                 ProgressEvent::AgentError { .. } | ProgressEvent::BlockError { .. }
             ) {
-                app.progress_events.push(event);
+                app.record_progress(event);
             }
         }
         BatchProgressEvent::RunFinished {
@@ -4162,12 +4162,61 @@ fn selected_consolidation_agent(app: &App) -> Result<(String, AgentConfig), Stri
     Ok((agent_name, agent_config))
 }
 
+const POST_RUN_SYNTHESIS_MAX_INPUT_BYTES: u64 = 200 * 1024;
+const CROSS_RUN_MAX_INPUT_BYTES: u64 = POST_RUN_SYNTHESIS_MAX_INPUT_BYTES;
+
+struct PostRunPromptBudget {
+    used_bytes: u64,
+}
+
+impl PostRunPromptBudget {
+    fn new() -> Self {
+        Self { used_bytes: 0 }
+    }
+
+    fn add_bytes(&mut self, bytes: u64, context: &str) -> Result<(), String> {
+        self.used_bytes = self.used_bytes.saturating_add(bytes);
+        if self.used_bytes > POST_RUN_SYNTHESIS_MAX_INPUT_BYTES {
+            return Err(format!(
+                "{context} is too large to inline into a post-run synthesis prompt (limit: {} KB). Reduce the number of reports or shorten the outputs.",
+                POST_RUN_SYNTHESIS_MAX_INPUT_BYTES / 1024
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_text(&mut self, text: &str, context: &str) -> Result<(), String> {
+        self.add_bytes(text.len() as u64, context)
+    }
+
+    async fn add_file_async(
+        &mut self,
+        path: &std::path::Path,
+        context: &str,
+    ) -> Result<(), String> {
+        let bytes = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| format!("Failed to inspect {}: {e}", path.display()))?
+            .len();
+        self.add_bytes(bytes, context)
+    }
+
+    fn add_file_sync(&mut self, path: &std::path::Path, context: &str) -> Result<(), String> {
+        let bytes = std::fs::metadata(path)
+            .map_err(|e| format!("Failed to inspect {}: {e}", path.display()))?
+            .len();
+        self.add_bytes(bytes, context)
+    }
+}
+
 async fn build_file_consolidation_prompt(
     files: &[(String, std::path::PathBuf)],
     additional: &str,
     use_cli: bool,
 ) -> Result<String, String> {
     let mut prompt = String::from("Consolidate these outputs into one final markdown answer.\n\n");
+    let mut budget = PostRunPromptBudget::new();
+    budget.add_text(additional, "Additional consolidation instructions")?;
 
     if use_cli {
         prompt.push_str("Files to read:\n");
@@ -4178,6 +4227,9 @@ async fn build_file_consolidation_prompt(
     } else {
         prompt.push_str("Input reports:\n");
         for (label, path) in files {
+            budget
+                .add_file_async(path, "Consolidation report input")
+                .await?;
             let content = tokio::fs::read_to_string(path)
                 .await
                 .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
@@ -4228,9 +4280,6 @@ fn build_cross_run_consolidation_prompt(
     );
     prompt
 }
-
-const CROSS_RUN_MAX_INPUT_BYTES: u64 = 200 * 1024;
-
 struct ConsolidationRequest {
     run_dir: std::path::PathBuf,
     target: ConsolidationTarget,
@@ -4413,12 +4462,12 @@ fn start_consolidation(app: &mut App) {
     let provider_config = agent_config.to_provider_config();
     let additional = app.consolidation_prompt.trim().to_string();
 
-    app.progress_events.push(ProgressEvent::AgentStarted {
+    app.record_progress(ProgressEvent::AgentStarted {
         agent: agent_name.clone(),
         kind: provider_kind,
         iteration: 0,
     });
-    app.progress_events.push(ProgressEvent::AgentLog {
+    app.record_progress(ProgressEvent::AgentLog {
         agent: agent_name.clone(),
         kind: provider_kind,
         iteration: 0,
@@ -4487,12 +4536,12 @@ fn handle_consolidation_result(app: &mut App, result: Result<String, String>) {
 
     match result {
         Ok(path) => {
-            app.progress_events.push(ProgressEvent::AgentFinished {
+            app.record_progress(ProgressEvent::AgentFinished {
                 agent: agent_name.clone(),
                 kind,
                 iteration: 0,
             });
-            app.progress_events.push(ProgressEvent::AgentLog {
+            app.record_progress(ProgressEvent::AgentLog {
                 agent: agent_name,
                 kind,
                 iteration: 0,
@@ -4511,7 +4560,7 @@ fn handle_consolidation_result(app: &mut App, result: Result<String, String>) {
             }
         }
         Err(e) => {
-            app.progress_events.push(ProgressEvent::AgentError {
+            app.record_progress(ProgressEvent::AgentError {
                 agent: agent_name,
                 kind,
                 iteration: 0,
@@ -4563,7 +4612,13 @@ fn maybe_start_diagnostics(app: &mut App) {
 
     let report_files = collect_report_files(&run_dir);
     let app_errors = collect_application_errors(app, &run_dir);
-    let prompt = build_diagnostic_prompt(&report_files, &app_errors, pconfig.use_cli);
+    let prompt = match build_diagnostic_prompt(&report_files, &app_errors, pconfig.use_cli) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            app.error_modal = Some(error);
+            return;
+        }
+    };
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(
@@ -4586,7 +4641,7 @@ fn maybe_start_diagnostics(app: &mut App) {
         app.effective_cli_timeout_seconds().max(1),
     );
 
-    app.progress_events.push(ProgressEvent::AgentLog {
+    app.record_progress(ProgressEvent::AgentLog {
         agent: diag_agent_name,
         kind: diagnostic_kind,
         iteration: 0,
@@ -4629,7 +4684,7 @@ fn handle_diagnostic_result(app: &mut App, result: Result<String, String>) {
 
     match result {
         Ok(path) => {
-            app.progress_events.push(ProgressEvent::AgentLog {
+            app.record_progress(ProgressEvent::AgentLog {
                 agent: agent_name,
                 kind,
                 iteration: 0,
@@ -4637,7 +4692,7 @@ fn handle_diagnostic_result(app: &mut App, result: Result<String, String>) {
             });
         }
         Err(e) => {
-            app.progress_events.push(ProgressEvent::AgentError {
+            app.record_progress(ProgressEvent::AgentError {
                 agent: agent_name,
                 kind,
                 iteration: 0,
@@ -4685,35 +4740,7 @@ fn collect_report_files(run_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 fn collect_application_errors(app: &App, run_dir: &std::path::Path) -> Vec<String> {
-    let mut errors = Vec::new();
-    for event in &app.progress_events {
-        match event {
-            ProgressEvent::AgentError {
-                agent,
-                iteration,
-                error,
-                details,
-                ..
-            } => {
-                let body = details.as_deref().unwrap_or(error);
-                errors.push(format!("[{agent} iter {iteration}] {body}"));
-            }
-            ProgressEvent::BlockError {
-                block_id,
-                agent_name,
-                iteration,
-                error,
-                details,
-                ..
-            } => {
-                let body = details.as_deref().unwrap_or(error);
-                errors.push(format!(
-                    "[block {block_id} {agent_name} iter {iteration}] {body}"
-                ));
-            }
-            _ => {}
-        }
-    }
+    let mut errors = app.error_ledger().iter().cloned().collect::<Vec<_>>();
 
     let mut dirs = vec![run_dir.to_path_buf()];
     if OutputManager::is_batch_root(run_dir) {
@@ -4741,10 +4768,11 @@ fn build_diagnostic_prompt(
     report_files: &[std::path::PathBuf],
     app_errors: &[String],
     use_cli: bool,
-) -> String {
+) -> Result<String, String> {
     let mut prompt = String::from(
         "Analyze all reports for OPERATIONAL errors only and produce a markdown report.\n",
     );
+    let mut budget = PostRunPromptBudget::new();
     prompt.push_str(
         "Focus exclusively on errors that prevented an agent from completing its task:\n",
     );
@@ -4771,6 +4799,7 @@ fn build_diagnostic_prompt(
         prompt.push_str("- none reported by application\n");
     } else {
         for err in app_errors {
+            budget.add_text(err, "Application error diagnostics input")?;
             prompt.push_str("- ");
             prompt.push_str(err);
             prompt.push('\n');
@@ -4780,7 +4809,7 @@ fn build_diagnostic_prompt(
     prompt.push_str("\nReports to analyze:\n");
     if report_files.is_empty() {
         prompt.push_str("- none\n");
-        return prompt;
+        return Ok(prompt);
     }
     for path in report_files {
         prompt.push_str("- ");
@@ -4792,11 +4821,12 @@ fn build_diagnostic_prompt(
         prompt.push_str(
             "\nRead each listed file from disk before writing the report. Include permission/tool errors explicitly.\n",
         );
-        return prompt;
+        return Ok(prompt);
     }
 
     prompt.push_str("\nReport contents:\n");
     for path in report_files {
+        budget.add_file_sync(path, "Diagnostic report input")?;
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -4815,7 +4845,7 @@ fn build_diagnostic_prompt(
         }
     }
 
-    prompt
+    Ok(prompt)
 }
 
 fn load_results(app: &mut App) {
@@ -5592,14 +5622,14 @@ mod tests {
     fn collect_application_errors_deduplicates() {
         let dir = tempdir().unwrap();
         let mut app = test_app();
-        app.progress_events.push(ProgressEvent::AgentError {
+        app.record_progress(ProgressEvent::AgentError {
             agent: "Claude".to_string(),
             kind: ProviderKind::Anthropic,
             iteration: 1,
             error: "boom".to_string(),
             details: None,
         });
-        app.progress_events.push(ProgressEvent::AgentError {
+        app.record_progress(ProgressEvent::AgentError {
             agent: "Claude".to_string(),
             kind: ProviderKind::Anthropic,
             iteration: 1,
@@ -5616,7 +5646,7 @@ mod tests {
     fn collect_application_errors_merges_log_file() {
         let dir = tempdir().unwrap();
         let mut app = test_app();
-        app.progress_events.push(ProgressEvent::AgentError {
+        app.record_progress(ProgressEvent::AgentError {
             agent: "OpenAI".to_string(),
             kind: ProviderKind::OpenAI,
             iteration: 2,
@@ -5644,7 +5674,7 @@ mod tests {
         let report = dir.path().join("anthropic_iter1.md");
         fs::write(&report, "hidden content").unwrap();
 
-        let prompt = build_diagnostic_prompt(&[report], &[], true);
+        let prompt = build_diagnostic_prompt(&[report], &[], true).expect("prompt");
         assert!(prompt.contains("Read each listed file from disk"));
         assert!(!prompt.contains("hidden content"));
     }
@@ -5655,7 +5685,7 @@ mod tests {
         let report = dir.path().join("anthropic_iter1.md");
         fs::write(&report, "file body").unwrap();
 
-        let prompt = build_diagnostic_prompt(&[report], &[], false);
+        let prompt = build_diagnostic_prompt(&[report], &[], false).expect("prompt");
         assert!(prompt.contains("=== BEGIN anthropic_iter1.md ==="));
         assert!(prompt.contains("file body"));
         assert!(prompt.contains("=== END anthropic_iter1.md ==="));
@@ -5663,7 +5693,7 @@ mod tests {
 
     #[test]
     fn build_diagnostic_prompt_no_report_files() {
-        let prompt = build_diagnostic_prompt(&[], &[], false);
+        let prompt = build_diagnostic_prompt(&[], &[], false).expect("prompt");
         assert!(prompt.contains("Reports to analyze:\n- none"));
         assert!(!prompt.contains("Report contents:"));
     }
@@ -5671,8 +5701,36 @@ mod tests {
     #[test]
     fn build_diagnostic_prompt_unreadable_file_in_api_mode() {
         let missing = PathBuf::from("/tmp/does-not-exist-for-houseofagents-tests.md");
-        let prompt = build_diagnostic_prompt(&[missing], &[], false);
-        assert!(prompt.contains("Failed to read file:"));
+        let err = build_diagnostic_prompt(&[missing], &[], false).expect_err("should fail");
+        assert!(err.contains("Failed to inspect"));
+    }
+
+    #[test]
+    fn build_diagnostic_prompt_rejects_oversized_inline_input() {
+        let dir = tempdir().unwrap();
+        let report = dir.path().join("anthropic_iter1.md");
+        fs::write(
+            &report,
+            "x".repeat((POST_RUN_SYNTHESIS_MAX_INPUT_BYTES as usize) + 1),
+        )
+        .unwrap();
+
+        let err = build_diagnostic_prompt(&[report], &[], false).expect_err("should reject");
+        assert!(err.contains("too large"));
+    }
+
+    #[test]
+    fn build_diagnostic_prompt_cli_mode_does_not_budget_file_contents() {
+        let dir = tempdir().unwrap();
+        let report = dir.path().join("anthropic_iter1.md");
+        fs::write(
+            &report,
+            "x".repeat((POST_RUN_SYNTHESIS_MAX_INPUT_BYTES as usize) + 1),
+        )
+        .unwrap();
+
+        let prompt = build_diagnostic_prompt(&[report], &[], true).expect("prompt");
+        assert!(prompt.contains("Read each listed file from disk"));
     }
 
     #[tokio::test]
@@ -5718,6 +5776,38 @@ mod tests {
             fs::read_to_string(run2.run_dir().join("consolidation.md")).unwrap(),
             "call 1"
         );
+    }
+
+    #[tokio::test]
+    async fn build_file_consolidation_prompt_rejects_oversized_inline_input() {
+        let dir = tempdir().unwrap();
+        let report = dir.path().join("anthropic_iter1.md");
+        fs::write(
+            &report,
+            "x".repeat((POST_RUN_SYNTHESIS_MAX_INPUT_BYTES as usize) + 1),
+        )
+        .unwrap();
+
+        let err = build_file_consolidation_prompt(&[("Claude".to_string(), report)], "", false)
+            .await
+            .expect_err("should reject");
+        assert!(err.contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn build_file_consolidation_prompt_cli_mode_does_not_budget_file_contents() {
+        let dir = tempdir().unwrap();
+        let report = dir.path().join("anthropic_iter1.md");
+        fs::write(
+            &report,
+            "x".repeat((POST_RUN_SYNTHESIS_MAX_INPUT_BYTES as usize) + 1),
+        )
+        .unwrap();
+
+        let prompt = build_file_consolidation_prompt(&[("Claude".to_string(), report)], "", true)
+            .await
+            .expect("prompt");
+        assert!(prompt.contains("Files to read:"));
     }
 
     #[test]

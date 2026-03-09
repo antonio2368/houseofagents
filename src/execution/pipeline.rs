@@ -530,7 +530,7 @@ where
 
                     let ptx = progress_tx.clone();
                     let cancel_clone = cancel.clone();
-                    let output_run_dir = output.run_dir().to_path_buf();
+                    let task_output = output.clone();
                     let file_key = OutputManager::sanitize_session_name(&agent_name);
                     let block_name_key = if block.name.trim().is_empty() {
                         format!("block{}", block_id)
@@ -588,9 +588,12 @@ where
                                 }
                                 // Write output
                                 let filename = format!("{}_{}_iter{}.md", block_name_key, file_key, iteration);
-                                let path = output_run_dir.join(&filename);
+                                let path = task_output.run_dir().join(&filename);
                                 if let Err(e) = std::fs::write(&path, &resp.content) {
                                     let error = format!("Failed to write output: {e}");
+                                    let _ = task_output.append_error(&format!(
+                                        "block {block_id} {agent_name} iter{iteration}: {error}"
+                                    ));
                                     let _ = ptx.send(ProgressEvent::BlockError {
                                         block_id,
                                         agent_name,
@@ -611,15 +614,19 @@ where
                                 }
                             }
                             Some(Err(e)) => {
+                                let error = e.to_string();
+                                let _ = task_output.append_error(&format!(
+                                    "block {block_id} {agent_name} iter{iteration}: {error}"
+                                ));
                                 let _ = ptx.send(ProgressEvent::BlockError {
                                     block_id,
                                     agent_name,
                                     label,
                                     iteration,
-                                    error: e.to_string(),
-                                    details: Some(e.to_string()),
+                                    error: error.clone(),
+                                    details: Some(error.clone()),
                                 });
-                                (block_id, Err(e.to_string()))
+                                (block_id, Err(error))
                             }
                         }
                     });
@@ -811,12 +818,12 @@ fn build_pipeline_block_message(
 mod tests {
     use super::*;
     use crate::config::ProviderConfig;
-    use crate::execution::test_utils::{collect_progress_events, PanicProvider};
+    use crate::execution::test_utils::{collect_progress_events, MockProvider, PanicProvider};
     use crate::output::OutputManager;
     use crate::provider::ProviderKind;
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
     fn block(id: BlockId, col: u16, row: u16) -> PipelineBlock {
@@ -1285,5 +1292,78 @@ to = 1
         let log = std::fs::read_to_string(output.run_dir().join("_errors.log")).expect("log");
         assert!(log.contains("block 1 Claude iter1"));
         assert!(log.contains("pipeline panic"));
+    }
+
+    #[tokio::test]
+    async fn run_pipeline_provider_error_appends_error_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("pipeline-provider-error")).unwrap();
+        let def = PipelineDefinition {
+            initial_prompt: "base prompt".into(),
+            iterations: 1,
+            blocks: vec![PipelineBlock {
+                id: 1,
+                name: "Root".into(),
+                agent: "Claude".into(),
+                prompt: String::new(),
+                session_id: None,
+                position: (0, 0),
+            }],
+            connections: vec![],
+        };
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        run_pipeline_with_provider_factory(
+            &def,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            |_kind, _cfg| {
+                Box::new(MockProvider::err(
+                    ProviderKind::Anthropic,
+                    "provider failed",
+                    received.clone(),
+                ))
+            },
+        )
+        .await
+        .expect("run");
+
+        let events = collect_progress_events(rx);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ProgressEvent::BlockError {
+                    block_id,
+                    agent_name,
+                    error,
+                    ..
+                } if *block_id == 1 && agent_name == "Claude" && error.contains("provider failed")
+            )
+        }));
+
+        let log = std::fs::read_to_string(output.run_dir().join("_errors.log")).expect("log");
+        assert!(log.contains("block 1 Claude iter1"));
+        assert!(log.contains("provider failed"));
     }
 }

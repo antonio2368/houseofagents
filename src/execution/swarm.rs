@@ -74,7 +74,7 @@ pub async fn run_swarm(
 
             let tx = progress_tx.clone();
             let cancel_flag = cancel.clone();
-            let run_dir = output.run_dir().clone();
+            let task_output = output.clone();
             let iter = iteration;
 
             let handle = tokio::spawn(async move {
@@ -136,10 +136,12 @@ pub async fn run_swarm(
                         });
                         let sanitized = OutputManager::sanitize_session_name(&agent_name);
                         let filename = format!("{}_iter{}.md", sanitized, iter);
-                        let path = run_dir.join(&filename);
+                        let path = task_output.run_dir().join(&filename);
                         if let Err(e) = tokio::fs::write(&path, &resp.content).await {
                             let err =
                                 format!("Failed to write output file {}: {e}", path.display());
+                            let _ = task_output
+                                .append_error(&format!("{agent_name} iter{iter}: {err}"));
                             let _ = tx.send(ProgressEvent::AgentError {
                                 agent: agent_name.clone(),
                                 kind,
@@ -159,6 +161,8 @@ pub async fn run_swarm(
                     }
                     Err(e) => {
                         let err_str = e.to_string();
+                        let _ = task_output
+                            .append_error(&format!("{agent_name} iter{iter}: {err_str}"));
                         let _ = tx.send(ProgressEvent::AgentError {
                             agent: agent_name.clone(),
                             kind,
@@ -547,6 +551,10 @@ mod tests {
             .iter()
             .any(|e| matches!(e, ProgressEvent::AgentError { .. })));
         assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
+
+        let log = std::fs::read_to_string(out.run_dir().join("_errors.log")).expect("log");
+        assert!(log.contains("Claude iter1"));
+        assert!(log.contains("bad"));
     }
 
     #[tokio::test]
@@ -626,6 +634,10 @@ mod tests {
                 if error.contains("Failed to write output file")
             )
         }));
+
+        let log = std::fs::read_to_string(out.run_dir().join("_errors.log")).expect("log");
+        assert!(log.contains("Claude iter1"));
+        assert!(log.contains("Failed to write output file"));
     }
 
     #[tokio::test]
