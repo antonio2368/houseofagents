@@ -205,14 +205,14 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                     PromptFocus::Resume
                 }
                 (PromptFocus::Resume, ExecutionMode::Relay) => PromptFocus::ForwardPrompt,
-                (PromptFocus::Resume, _) => PromptFocus::Text,
-                (PromptFocus::ForwardPrompt, _) => PromptFocus::Text,
+                (PromptFocus::Resume, _) => PromptFocus::KeepSession,
+                (PromptFocus::ForwardPrompt, _) => PromptFocus::KeepSession,
+                (PromptFocus::KeepSession, _) => PromptFocus::Text,
             };
         }
         KeyCode::BackTab => {
             app.prompt.prompt_focus = match (&app.prompt.prompt_focus, app.selected_mode) {
-                (PromptFocus::Text, ExecutionMode::Relay) => PromptFocus::ForwardPrompt,
-                (PromptFocus::Text, _) => PromptFocus::Resume,
+                (PromptFocus::Text, _) => PromptFocus::KeepSession,
                 (PromptFocus::SessionName, _) => PromptFocus::Text,
                 (PromptFocus::Iterations, _) => {
                     sync_iterations_buf(app);
@@ -233,6 +233,8 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                     PromptFocus::Concurrency
                 }
                 (PromptFocus::ForwardPrompt, _) => PromptFocus::Resume,
+                (PromptFocus::KeepSession, ExecutionMode::Relay) => PromptFocus::ForwardPrompt,
+                (PromptFocus::KeepSession, _) => PromptFocus::Resume,
             };
         }
         KeyCode::Char(' ') if app.prompt.prompt_focus == PromptFocus::Resume => {
@@ -245,6 +247,9 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char(' ') if app.prompt.prompt_focus == PromptFocus::ForwardPrompt => {
             app.prompt.forward_prompt = !app.prompt.forward_prompt;
+        }
+        KeyCode::Char(' ') if app.prompt.prompt_focus == PromptFocus::KeepSession => {
+            app.prompt.keep_session = !app.prompt.keep_session;
         }
         KeyCode::F(5) | KeyCode::Enter
             if key.code == KeyCode::F(5) || app.prompt.prompt_focus != PromptFocus::Text =>
@@ -355,7 +360,7 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                 }
                 _ => {}
             },
-            PromptFocus::Resume | PromptFocus::ForwardPrompt => {}
+            PromptFocus::Resume | PromptFocus::ForwardPrompt | PromptFocus::KeepSession => {}
         },
     }
 }

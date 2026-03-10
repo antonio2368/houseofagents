@@ -65,6 +65,8 @@ impl Provider for MockProvider {
         self.kind
     }
 
+    fn clear_history(&mut self) {}
+
     fn set_live_log_sender(&mut self, tx: Option<mpsc::UnboundedSender<String>>) {
         self.live_tx = tx;
     }
@@ -90,6 +92,8 @@ impl Provider for PanicProvider {
     fn kind(&self) -> ProviderKind {
         self.kind
     }
+
+    fn clear_history(&mut self) {}
 
     fn send(&mut self, _message: &str) -> SendFuture<'_> {
         let msg = self.panic_message;

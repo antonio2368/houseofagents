@@ -42,14 +42,27 @@ fn key(code: KeyCode) -> KeyEvent {
 }
 
 fn write_session_toml(run_dir: &Path, mode: &str, agents: &[&str]) {
+    write_session_toml_with_keep(run_dir, mode, agents, None);
+}
+
+fn write_session_toml_with_keep(
+    run_dir: &Path,
+    mode: &str,
+    agents: &[&str],
+    keep_session: Option<bool>,
+) {
     let agent_values = agents
         .iter()
         .map(|a| format!("\"{a}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let keep_line = match keep_session {
+        Some(v) => format!("keep_session = {v}\n"),
+        None => String::new(),
+    };
     fs::write(
         run_dir.join("session.toml"),
-        format!("mode = \"{mode}\"\nagents = [{agent_values}]\n"),
+        format!("mode = \"{mode}\"\nagents = [{agent_values}]\n{keep_line}"),
     )
     .unwrap();
 }
@@ -95,6 +108,8 @@ impl Provider for HistoryEchoProvider {
     fn kind(&self) -> ProviderKind {
         self.kind
     }
+
+    fn clear_history(&mut self) {}
 
     fn send(&mut self, _message: &str) -> crate::provider::SendFuture<'_> {
         Box::pin(async move {
@@ -375,7 +390,8 @@ fn run_dir_matches_exact() {
     assert!(run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Relay,
-        &["anthropic".to_string(), "openai".to_string()]
+        &["anthropic".to_string(), "openai".to_string()],
+        true,
     ));
 }
 
@@ -387,7 +403,8 @@ fn run_dir_matches_wrong_mode() {
     assert!(!run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Relay,
-        &["anthropic".to_string(), "openai".to_string()]
+        &["anthropic".to_string(), "openai".to_string()],
+        true,
     ));
 }
 
@@ -399,7 +416,8 @@ fn run_dir_matches_relay_requires_exact_agent_order() {
     assert!(!run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Relay,
-        &["anthropic".to_string()]
+        &["anthropic".to_string()],
+        true,
     ));
 }
 
@@ -411,7 +429,8 @@ fn run_dir_matches_relay_rejects_different_agent_order() {
     assert!(!run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Relay,
-        &["openai".to_string(), "anthropic".to_string()]
+        &["openai".to_string(), "anthropic".to_string()],
+        true,
     ));
 }
 
@@ -423,7 +442,8 @@ fn run_dir_matches_swarm_accepts_different_agent_order_for_same_set() {
     assert!(run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Swarm,
-        &["openai".to_string(), "anthropic".to_string()]
+        &["openai".to_string(), "anthropic".to_string()],
+        true,
     ));
 }
 
@@ -435,7 +455,8 @@ fn run_dir_matches_missing_agent() {
     assert!(!run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Relay,
-        &["anthropic".to_string(), "gemini".to_string()]
+        &["anthropic".to_string(), "gemini".to_string()],
+        true,
     ));
 }
 
@@ -445,7 +466,8 @@ fn run_dir_matches_no_session_toml() {
     assert!(!run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Relay,
-        &["anthropic".to_string()]
+        &["anthropic".to_string()],
+        true,
     ));
 }
 
@@ -461,7 +483,8 @@ fn run_dir_matches_mode_and_agents_missing_mode_field() {
     assert!(!run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Relay,
-        &["anthropic".to_string(), "openai".to_string()]
+        &["anthropic".to_string(), "openai".to_string()],
+        true,
     ));
 }
 
@@ -473,7 +496,8 @@ fn run_dir_matches_mode_and_agents_missing_agents_field() {
     assert!(!run_dir_matches_mode_and_agents(
         dir.path(),
         ExecutionMode::Relay,
-        &["anthropic".to_string(), "openai".to_string()]
+        &["anthropic".to_string(), "openai".to_string()],
+        true,
     ));
 }
 
@@ -510,7 +534,8 @@ fn find_latest_compatible_run_ordering() {
         find_latest_compatible_run(
             dir.path(),
             ExecutionMode::Relay,
-            &["anthropic".to_string(), "openai".to_string()]
+            &["anthropic".to_string(), "openai".to_string()],
+            true,
         ),
         Some(run4)
     );
@@ -528,7 +553,8 @@ fn find_latest_compatible_run_none() {
         find_latest_compatible_run(
             dir.path(),
             ExecutionMode::Relay,
-            &["anthropic".to_string(), "openai".to_string()]
+            &["anthropic".to_string(), "openai".to_string()],
+            true,
         ),
         None
     );
@@ -561,7 +587,8 @@ fn find_latest_compatible_run_ignores_invalid_session_toml() {
         find_latest_compatible_run(
             dir.path(),
             ExecutionMode::Relay,
-            &["anthropic".to_string(), "openai".to_string()]
+            &["anthropic".to_string(), "openai".to_string()],
+            true,
         ),
         Some(good)
     );
@@ -576,8 +603,89 @@ fn validate_resume_run_rejects_named_session_with_wrong_relay_order() {
         dir.path(),
         ExecutionMode::Relay,
         &["openai".to_string(), "anthropic".to_string()],
+        true,
     )
     .expect_err("should reject");
+    assert!(err.contains("does not exactly match"));
+}
+
+#[test]
+fn run_dir_rejects_keep_session_mismatch() {
+    let dir = tempdir().unwrap();
+    write_session_toml_with_keep(dir.path(), "relay", &["anthropic", "openai"], Some(false));
+
+    assert!(!run_dir_matches_mode_and_agents(
+        dir.path(),
+        ExecutionMode::Relay,
+        &["anthropic".to_string(), "openai".to_string()],
+        true,
+    ));
+}
+
+#[test]
+fn run_dir_matches_explicit_keep_session_false() {
+    let dir = tempdir().unwrap();
+    write_session_toml_with_keep(dir.path(), "relay", &["anthropic", "openai"], Some(false));
+
+    assert!(run_dir_matches_mode_and_agents(
+        dir.path(),
+        ExecutionMode::Relay,
+        &["anthropic".to_string(), "openai".to_string()],
+        false,
+    ));
+}
+
+#[test]
+fn find_latest_compatible_run_respects_keep_session() {
+    let dir = tempdir().unwrap();
+
+    let run_keep = dir.path().join("20260101_000000");
+    fs::create_dir_all(&run_keep).unwrap();
+    write_session_toml_with_keep(&run_keep, "relay", &["anthropic", "openai"], Some(true));
+    write_agent_iter(&run_keep, "anthropic", 1);
+    write_agent_iter(&run_keep, "openai", 1);
+
+    let run_no_keep = dir.path().join("20260201_000000");
+    fs::create_dir_all(&run_no_keep).unwrap();
+    write_session_toml_with_keep(&run_no_keep, "relay", &["anthropic", "openai"], Some(false));
+    write_agent_iter(&run_no_keep, "anthropic", 1);
+    write_agent_iter(&run_no_keep, "openai", 1);
+
+    // Searching with keep_session=false should find run_no_keep (the newer one matches)
+    assert_eq!(
+        find_latest_compatible_run(
+            dir.path(),
+            ExecutionMode::Relay,
+            &["anthropic".to_string(), "openai".to_string()],
+            false,
+        ),
+        Some(run_no_keep)
+    );
+
+    // Searching with keep_session=true should find run_keep (skips the newer mismatched one)
+    assert_eq!(
+        find_latest_compatible_run(
+            dir.path(),
+            ExecutionMode::Relay,
+            &["anthropic".to_string(), "openai".to_string()],
+            true,
+        ),
+        Some(run_keep)
+    );
+}
+
+#[test]
+fn validate_resume_run_rejects_keep_session_mismatch() {
+    let dir = tempdir().unwrap();
+    write_session_toml_with_keep(dir.path(), "relay", &["anthropic", "openai"], Some(true));
+
+    let err = validate_resume_run(
+        dir.path(),
+        ExecutionMode::Relay,
+        &["anthropic".to_string(), "openai".to_string()],
+        false,
+    )
+    .expect_err("should reject keep_session mismatch");
     assert!(err.contains("does not exactly match"));
 }
 
@@ -1093,8 +1201,12 @@ fn prompt_focus_cycle_swarm_tab_and_backtab() {
     handle_prompt_key(&mut app, key(KeyCode::Tab));
     assert_eq!(app.prompt.prompt_focus, PromptFocus::Resume);
     handle_prompt_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.prompt.prompt_focus, PromptFocus::KeepSession);
+    handle_prompt_key(&mut app, key(KeyCode::Tab));
     assert_eq!(app.prompt.prompt_focus, PromptFocus::Text);
 
+    handle_prompt_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(app.prompt.prompt_focus, PromptFocus::KeepSession);
     handle_prompt_key(&mut app, key(KeyCode::BackTab));
     assert_eq!(app.prompt.prompt_focus, PromptFocus::Resume);
     handle_prompt_key(&mut app, key(KeyCode::BackTab));
@@ -1128,8 +1240,12 @@ fn prompt_focus_cycle_relay_tab_and_backtab() {
     handle_prompt_key(&mut app, key(KeyCode::Tab));
     assert_eq!(app.prompt.prompt_focus, PromptFocus::ForwardPrompt);
     handle_prompt_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(app.prompt.prompt_focus, PromptFocus::KeepSession);
+    handle_prompt_key(&mut app, key(KeyCode::Tab));
     assert_eq!(app.prompt.prompt_focus, PromptFocus::Text);
 
+    handle_prompt_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(app.prompt.prompt_focus, PromptFocus::KeepSession);
     handle_prompt_key(&mut app, key(KeyCode::BackTab));
     assert_eq!(app.prompt.prompt_focus, PromptFocus::ForwardPrompt);
     handle_prompt_key(&mut app, key(KeyCode::BackTab));
@@ -1316,7 +1432,8 @@ fn find_latest_compatible_run_grouped() {
         find_latest_compatible_run(
             dir.path(),
             ExecutionMode::Relay,
-            &["anthropic".to_string(), "openai".to_string()]
+            &["anthropic".to_string(), "openai".to_string()],
+            true,
         ),
         Some(run2)
     );
@@ -1342,7 +1459,8 @@ fn find_latest_compatible_run_mixed_grouped_wins() {
         find_latest_compatible_run(
             dir.path(),
             ExecutionMode::Relay,
-            &["anthropic".to_string(), "openai".to_string()]
+            &["anthropic".to_string(), "openai".to_string()],
+            true,
         ),
         Some(grouped)
     );
@@ -1369,7 +1487,8 @@ fn find_latest_compatible_run_skips_grouped_batch() {
         find_latest_compatible_run(
             dir.path(),
             ExecutionMode::Relay,
-            &["anthropic".to_string(), "openai".to_string()]
+            &["anthropic".to_string(), "openai".to_string()],
+            true,
         ),
         Some(good)
     );

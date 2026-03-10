@@ -1419,6 +1419,8 @@ to = 1
                 self.kind
             }
 
+            fn clear_history(&mut self) {}
+
             fn send(&mut self, _message: &str) -> SendFuture<'_> {
                 let active = self.active.clone();
                 let peak = self.peak.clone();

@@ -17,6 +17,7 @@ pub async fn run_relay(
     start_iteration: u32,
     initial_last_output: Option<String>,
     forward_prompt: bool,
+    keep_session: bool,
     use_cli_by_agent: HashMap<String, bool>,
     output: &OutputManager,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
@@ -33,6 +34,11 @@ pub async fn run_relay(
     let num_agents = agents.len();
 
     for offset in 0..iterations {
+        if !keep_session && offset > 0 {
+            for (_name, provider) in agents.iter_mut() {
+                provider.clear_history();
+            }
+        }
         let iteration = start_iteration + offset;
         for i in 0..num_agents {
             if cancel.load(Ordering::Relaxed) {
@@ -272,6 +278,7 @@ mod tests {
             1,
             None,
             false,
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -331,6 +338,7 @@ mod tests {
             1,
             None,
             false,
+            true,
             use_cli,
             &out,
             tx,
@@ -368,6 +376,7 @@ mod tests {
             2,
             Some("resume seed".to_string()),
             false,
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -405,6 +414,7 @@ mod tests {
             3,
             None,
             false,
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -438,6 +448,7 @@ mod tests {
             1,
             None,
             false,
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -479,6 +490,7 @@ mod tests {
             1,
             None,
             false,
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -518,6 +530,7 @@ mod tests {
             1,
             None,
             false,
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -573,6 +586,7 @@ mod tests {
             1,
             None,
             true,
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -626,6 +640,7 @@ mod tests {
             1,
             1,
             None,
+            true,
             true,
             use_cli,
             &out,

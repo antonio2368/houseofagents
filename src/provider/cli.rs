@@ -445,6 +445,20 @@ impl Provider for CliProvider {
         self.kind
     }
 
+    fn clear_history(&mut self) {
+        self.history.clear();
+        self.session_started = false;
+        match self.kind {
+            ProviderKind::Anthropic => {
+                self.session_id = Some(Uuid::new_v4().to_string());
+            }
+            ProviderKind::OpenAI => {
+                self.session_id = None;
+            }
+            ProviderKind::Gemini => {}
+        }
+    }
+
     fn set_live_log_sender(&mut self, tx: Option<mpsc::UnboundedSender<String>>) {
         self.live_log_tx = tx;
     }

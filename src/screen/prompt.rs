@@ -194,19 +194,22 @@ pub fn draw(f: &mut Frame, app: &App) {
     );
     f.render_widget(concurrency_widget, run_cols[1]);
 
-    // Options row: Resume + Forward Prompt
+    // Options row: Resume + Forward Prompt (Relay only) + Keep Session
     {
         let is_relay = app.selected_mode == ExecutionMode::Relay;
         let option_cols = if is_relay {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .constraints([
+                    Constraint::Ratio(1, 3),
+                    Constraint::Ratio(1, 3),
+                    Constraint::Ratio(1, 3),
+                ])
                 .split(chunks[5])
         } else {
-            // Swarm: only Resume, full width
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(100), Constraint::Min(0)])
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .split(chunks[5])
         };
 
@@ -217,7 +220,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray)
         };
         let resume_text = if app.prompt.resume_previous {
-            "on (uses session name, or latest compatible run if empty)"
+            "on (by name or latest)"
         } else {
             "off"
         };
@@ -259,6 +262,31 @@ pub fn draw(f: &mut Frame, app: &App) {
             );
             f.render_widget(fp, option_cols[1]);
         }
+
+        // Keep Session box
+        let ks_col = if is_relay { 2 } else { 1 };
+        let ks_border = if app.prompt.prompt_focus == PromptFocus::KeepSession {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let ks_text = if app.prompt.keep_session {
+            "on"
+        } else {
+            "off"
+        };
+        let ks_style = if app.prompt.keep_session {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        let ks = Paragraph::new(ks_text).style(ks_style).block(
+            Block::default()
+                .title(" Keep Session ")
+                .borders(Borders::ALL)
+                .border_style(ks_border),
+        );
+        f.render_widget(ks, option_cols[ks_col]);
     }
 
     // Help bar
@@ -313,7 +341,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Span::raw(": back"),
             ]
         }
-        PromptFocus::Resume | PromptFocus::ForwardPrompt => {
+        PromptFocus::Resume | PromptFocus::ForwardPrompt | PromptFocus::KeepSession => {
             vec![
                 Span::styled("Space", Style::default().fg(Color::Yellow)),
                 Span::raw(": toggle  "),

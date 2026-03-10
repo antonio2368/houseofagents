@@ -160,6 +160,7 @@ pub(crate) struct PromptState {
     pub(crate) concurrency_buf: String,
     pub(crate) resume_previous: bool,
     pub(crate) forward_prompt: bool,
+    pub(crate) keep_session: bool,
     pub(crate) prompt_focus: PromptFocus,
 }
 
@@ -286,6 +287,7 @@ pub(crate) struct PendingSingleExecution {
     pub(crate) agent_names: Vec<String>,
     pub(crate) mode: ExecutionMode,
     pub(crate) forward_prompt: bool,
+    pub(crate) keep_session: bool,
     pub(crate) iterations: u32,
     pub(crate) cli_timeout_secs: u64,
 }
@@ -324,6 +326,7 @@ pub enum PromptFocus {
     Concurrency,
     Resume,
     ForwardPrompt,
+    KeepSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -689,6 +692,7 @@ impl PromptState {
             concurrency_buf: "0".into(),
             resume_previous: false,
             forward_prompt: false,
+            keep_session: true,
             prompt_focus: PromptFocus::Text,
         }
     }
@@ -705,6 +709,7 @@ impl PromptState {
         self.concurrency_buf = "0".into();
         self.resume_previous = false;
         self.forward_prompt = false;
+        self.keep_session = true;
     }
 }
 

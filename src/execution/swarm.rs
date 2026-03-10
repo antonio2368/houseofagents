@@ -19,6 +19,7 @@ pub async fn run_swarm(
     iterations: u32,
     start_iteration: u32,
     initial_last_round_outputs: HashMap<String, String>,
+    keep_session: bool,
     use_cli_by_agent: HashMap<String, bool>,
     output: &OutputManager,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
@@ -48,6 +49,12 @@ pub async fn run_swarm(
                 prompt_context.augment_prompt_for_agent(&base_message, is_cli)
             })
             .collect();
+
+        if !keep_session && offset > 0 {
+            for (_name, provider) in agents.iter_mut() {
+                provider.clear_history();
+            }
+        }
 
         // Take ownership of agents for parallel execution
         let taken: Vec<(String, Box<dyn Provider>)> = std::mem::take(&mut agents);
@@ -348,6 +355,7 @@ mod tests {
             1,
             1,
             HashMap::new(),
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -400,6 +408,7 @@ mod tests {
             2,
             1,
             HashMap::new(),
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -454,6 +463,7 @@ mod tests {
             2,
             1,
             HashMap::new(),
+            true,
             use_cli,
             &out,
             tx,
@@ -505,6 +515,7 @@ mod tests {
             1,
             3,
             initial_outputs,
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -554,6 +565,7 @@ mod tests {
             1,
             1,
             HashMap::new(),
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -596,6 +608,7 @@ mod tests {
             1,
             1,
             HashMap::new(),
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -634,6 +647,7 @@ mod tests {
             1,
             1,
             HashMap::new(),
+            true,
             HashMap::new(),
             &out,
             tx,
@@ -682,6 +696,7 @@ mod tests {
             1,
             1,
             HashMap::new(),
+            true,
             HashMap::new(),
             &out,
             tx,

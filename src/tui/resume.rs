@@ -86,6 +86,7 @@ pub(super) fn find_latest_compatible_run(
     base_dir: &std::path::Path,
     mode: ExecutionMode,
     agents: &[String],
+    keep_session: bool,
 ) -> Option<std::path::PathBuf> {
     let dirs = OutputManager::scan_run_dirs(base_dir).ok()?;
 
@@ -93,7 +94,7 @@ pub(super) fn find_latest_compatible_run(
         if OutputManager::is_batch_root(&run_dir) {
             continue;
         }
-        if !run_dir_matches_mode_and_agents(&run_dir, mode, agents) {
+        if !run_dir_matches_mode_and_agents(&run_dir, mode, agents, keep_session) {
             continue;
         }
         if find_last_complete_iteration_for_agents(&run_dir, agents).is_some() {
@@ -107,8 +108,12 @@ pub(super) fn session_matches_resume(
     session: &AgentSessionInfo,
     mode: ExecutionMode,
     agents: &[String],
+    keep_session: bool,
 ) -> bool {
     if session.mode != mode {
+        return false;
+    }
+    if session.keep_session != keep_session {
         return false;
     }
 
@@ -126,14 +131,16 @@ pub(super) fn session_matches_resume(
     }
 }
 
+#[cfg(test)]
 pub(super) fn validate_resume_run(
     run_dir: &std::path::Path,
     mode: ExecutionMode,
     agents: &[String],
+    keep_session: bool,
 ) -> Result<(), String> {
     let session = OutputManager::read_agent_session_info(run_dir)
         .map_err(|e| format!("Failed to read session metadata: {e}"))?;
-    if session_matches_resume(&session, mode, agents) {
+    if session_matches_resume(&session, mode, agents, keep_session) {
         Ok(())
     } else {
         Err(format!(
@@ -148,9 +155,10 @@ pub(super) fn run_dir_matches_mode_and_agents(
     run_dir: &std::path::Path,
     mode: ExecutionMode,
     agents: &[String],
+    keep_session: bool,
 ) -> bool {
     OutputManager::read_agent_session_info(run_dir)
-        .map(|session| session_matches_resume(&session, mode, agents))
+        .map(|session| session_matches_resume(&session, mode, agents, keep_session))
         .unwrap_or(false)
 }
 

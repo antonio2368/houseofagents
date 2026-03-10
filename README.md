@@ -39,6 +39,7 @@ Each agent can run in API mode or CLI mode (`use_cli = true`). Mix and match fre
 - **Multiple runs** — launch N independent copies of the same setup in parallel with bounded concurrency
 - **Resume runs** — pick up where you left off in relay or swarm sessions
 - **Forward Prompt** — relay mode option to include the original prompt in every handoff
+- **Keep Session** — toggle per-provider conversation history persistence across iterations (on by default; turn off to clear provider memory between iterations while preserving inter-agent handoff context)
 - **Consolidation** — merge multi-agent output within a run or across multiple runs (any configured agent can consolidate)
 - **Diagnostics** — optional post-run analysis pass that writes `errors.md`
 - **Config editor** — add/remove/rename agents, edit settings, timeouts, and models live with a popup (`e`)
@@ -227,7 +228,7 @@ Anthropic `thinking_effort = "max"` is rejected in API mode. In CLI mode, House 
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift+Tab` | Cycle input fields forward / backward |
-| `Space` | Toggle focused option (Resume / Forward Prompt) |
+| `Space` | Toggle focused option (Resume / Forward Prompt / Keep Session) |
 | `Enter` / `F5` | Start run |
 | `Esc` | Back |
 
@@ -350,8 +351,11 @@ Legacy directories (`YYYYMMDD_HHMMSS_NNN[_session]` and `YYYY-MM-DD/HH-MM-SS[_se
   - Without: resumes the latest compatible run with an exact mode match
   - Relay resume requires the exact same agent order
   - Swarm resume requires the exact same agent set
+  - Resume also requires the same Keep Session setting — a run started with `keep_session = true` cannot be resumed with it off, and vice versa
   - Batch roots are excluded from resume lookup; resume is currently single-run only
+  - Note: resuming a `keep_session = true` run across app restarts does not restore provider conversation history — providers are recreated fresh, though inter-agent handoff context is preserved
 - **Forward Prompt** (toggle with `Space` on Prompt screen) — relay mode only; when enabled, downstream agents receive the original prompt alongside the previous agent's output, preventing context loss in the handoff chain
+- **Keep Session** (toggle with `Space` on Prompt screen) — on by default; controls whether providers retain their conversation history across iterations. When turned off, each provider's history is cleared before every iteration after the first, so agents treat each round as a fresh conversation. Inter-agent handoff context (relay's previous output, swarm's round outputs) is always preserved regardless of this setting. Pipeline mode is unaffected
 - **Consolidation**
   - Single-run: offered after non-cancelled swarm/pipeline runs with 2+ final outputs
   - Batch: first offers per-run consolidation, then optional cross-run consolidation across successful runs

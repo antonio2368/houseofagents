@@ -61,6 +61,10 @@ impl Provider for OpenAIProvider {
         ProviderKind::OpenAI
     }
 
+    fn clear_history(&mut self) {
+        self.base.clear_history();
+    }
+
     fn send(&mut self, message: &str) -> SendFuture<'_> {
         let message = message.to_string();
         Box::pin(async move {

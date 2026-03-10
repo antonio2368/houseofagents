@@ -111,6 +111,7 @@ pub struct AgentSessionInfo {
     pub mode: ExecutionMode,
     pub agents: Vec<String>,
     pub iterations: u32,
+    pub keep_session: bool,
 }
 
 impl OutputManager {
@@ -361,6 +362,11 @@ impl OutputManager {
             .unwrap_or(0)
             .max(0) as u32;
 
+        let keep_session = value
+            .get("keep_session")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         Ok(AgentSessionInfo {
             name: value
                 .get("name")
@@ -369,6 +375,7 @@ impl OutputManager {
             mode,
             agents,
             iterations,
+            keep_session,
         })
     }
 
@@ -396,6 +403,7 @@ impl OutputManager {
         iterations: u32,
         session_name: Option<&str>,
         models: &[(String, String)],
+        keep_session: bool,
     ) -> Result<(), AppError> {
         let mut root = toml::map::Map::new();
         if let Some(name) = session_name.filter(|n| !n.is_empty()) {
@@ -412,6 +420,10 @@ impl OutputManager {
             ),
         );
         root.insert("iterations".into(), Value::Integer(iterations as i64));
+        root.insert(
+            "keep_session".into(),
+            Value::Boolean(keep_session),
+        );
 
         let mut model_table = toml::map::Map::new();
         for (agent_name, model) in models {
@@ -737,6 +749,7 @@ mod tests {
                 ("Claude".to_string(), "claude-model".to_string()),
                 ("OpenAI".to_string(), "gpt-model".to_string()),
             ],
+            true,
         )
         .expect("write");
 
@@ -800,6 +813,7 @@ mod tests {
             2,
             Some("sess"),
             &[],
+            true,
         )
         .expect("write");
 

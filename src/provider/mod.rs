@@ -97,6 +97,10 @@ impl HttpProviderBase {
         Ok(resp.bytes_stream())
     }
 
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+    }
+
     /// Push assistant message and return `CompletionResponse`.
     pub fn finish_send(&mut self, content: String) -> CompletionResponse {
         self.history.push(Message {
@@ -193,6 +197,7 @@ pub trait Provider: Send {
     fn kind(&self) -> ProviderKind;
     fn set_live_log_sender(&mut self, _tx: Option<mpsc::UnboundedSender<String>>) {}
     fn send(&mut self, message: &str) -> SendFuture<'_>;
+    fn clear_history(&mut self);
     fn supports_streaming(&self) -> bool {
         false
     }

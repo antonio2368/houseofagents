@@ -5,7 +5,7 @@ use super::input::{
     sync_pipeline_runs_buf,
 };
 use super::resume::{
-    find_last_complete_iteration_for_agents, find_latest_compatible_run, validate_resume_run,
+    find_last_complete_iteration_for_agents, find_latest_compatible_run, session_matches_resume,
 };
 use super::*;
 
@@ -265,6 +265,7 @@ pub(super) struct MultiExecutionParams {
     mode: ExecutionMode,
     iterations: u32,
     forward_prompt: bool,
+    keep_session: bool,
     cli_timeout_secs: u64,
     runs: u32,
     concurrency: u32,
@@ -280,6 +281,7 @@ pub(super) fn start_multi_execution(app: &mut App, params: MultiExecutionParams)
         mode,
         iterations,
         forward_prompt,
+        keep_session,
         cli_timeout_secs,
         runs,
         concurrency,
@@ -400,6 +402,7 @@ pub(super) fn start_multi_execution(app: &mut App, params: MultiExecutionParams)
                         iterations,
                         session_name.as_deref(),
                         &run_models,
+                        keep_session,
                     ) {
                         let _ = output.append_error(&format!("Failed to write session info: {e}"));
                         return (
@@ -436,6 +439,7 @@ pub(super) fn start_multi_execution(app: &mut App, params: MultiExecutionParams)
                                 1,
                                 None,
                                 forward_prompt,
+                                keep_session,
                                 use_cli_by_agent,
                                 &output,
                                 progress_tx,
@@ -450,6 +454,7 @@ pub(super) fn start_multi_execution(app: &mut App, params: MultiExecutionParams)
                                 iterations,
                                 1,
                                 HashMap::new(),
+                                keep_session,
                                 use_cli_by_agent,
                                 &output,
                                 progress_tx,
@@ -700,6 +705,7 @@ pub(super) fn start_execution(app: &mut App) {
                 mode,
                 iterations,
                 forward_prompt: app.prompt.forward_prompt,
+                keep_session: app.prompt.keep_session,
                 cli_timeout_secs,
                 runs,
                 concurrency,
@@ -717,6 +723,7 @@ pub(super) fn start_execution(app: &mut App) {
         agent_names: agent_names.clone(),
         mode,
         forward_prompt: app.prompt.forward_prompt,
+        keep_session: app.prompt.keep_session,
         iterations,
         cli_timeout_secs,
     };
@@ -725,6 +732,7 @@ pub(super) fn start_execution(app: &mut App) {
         let output_dir = config.resolved_output_dir();
         let session_name = pending.session_name.clone();
         let agent_names = pending.agent_names.clone();
+        let keep_session = pending.keep_session;
 
         app.running.pending_single_execution = Some(pending);
         app.running.resume_prepare_rx = None;
@@ -742,7 +750,7 @@ pub(super) fn start_execution(app: &mut App) {
         app.running.resume_prepare_rx = Some(rx);
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                prepare_resume_execution(output_dir, session_name, mode, agent_names)
+                prepare_resume_execution(output_dir, session_name, mode, agent_names, keep_session)
             })
             .await;
 
@@ -853,6 +861,7 @@ fn continue_single_execution(
     let mode = pending.mode;
     let iterations = pending.iterations;
     let forward_prompt = pending.forward_prompt;
+    let keep_session = pending.keep_session;
     let agent_names = pending.agent_names.clone();
     let prompt_context = pending.prompt_context.clone();
 
@@ -881,6 +890,7 @@ fn continue_single_execution(
                     start_iteration,
                     relay_initial_last_output,
                     forward_prompt,
+                    keep_session,
                     use_cli_by_agent.clone(),
                     &output,
                     tx.clone(),
@@ -895,6 +905,7 @@ fn continue_single_execution(
                     iterations,
                     start_iteration,
                     swarm_initial_outputs,
+                    keep_session,
                     use_cli_by_agent,
                     &output,
                     tx.clone(),
@@ -950,6 +961,7 @@ fn build_execution_output(
             pending.iterations,
             pending.session_name.as_deref(),
             run_models,
+            pending.keep_session,
         )
         .map_err(|e| format!("Failed to write session metadata: {e}"))?;
     Ok((1, None, HashMap::new(), output))
@@ -960,6 +972,7 @@ fn prepare_resume_execution(
     session_name: Option<String>,
     mode: ExecutionMode,
     agent_names: Vec<String>,
+    keep_session: bool,
 ) -> Result<crate::app::ResumePreparation, String> {
     let run_dir = if let Some(name) = session_name.as_deref().filter(|n| !n.trim().is_empty()) {
         match OutputManager::find_latest_session_run(&output_dir, name.trim()) {
@@ -973,11 +986,19 @@ fn prepare_resume_execution(
             Err(e) => return Err(format!("Failed to search previous runs: {e}")),
         }
     } else {
-        find_latest_compatible_run(&output_dir, mode, &agent_names)
+        find_latest_compatible_run(&output_dir, mode, &agent_names, keep_session)
             .ok_or_else(|| "No compatible previous run found to resume".to_string())?
     };
 
-    validate_resume_run(&run_dir, mode, &agent_names)?;
+    let session_info = OutputManager::read_agent_session_info(&run_dir)
+        .map_err(|e| format!("Failed to read session metadata: {e}"))?;
+    if !session_matches_resume(&session_info, mode, &agent_names, keep_session) {
+        return Err(format!(
+            "Previous run at {} does not exactly match the selected {} configuration",
+            run_dir.display(),
+            mode
+        ));
+    }
     let last_iteration = find_last_complete_iteration_for_agents(&run_dir, &agent_names)
         .filter(|iteration| *iteration >= 1)
         .ok_or_else(|| "No previous iteration files found to resume".to_string())?;
