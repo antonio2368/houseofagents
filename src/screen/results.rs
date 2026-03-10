@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use std::path::{Path, PathBuf};
+use unicode_width::UnicodeWidthStr;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -222,6 +223,13 @@ struct MarkdownState {
     list_depth: usize,
     quote_depth: usize,
     item_prefix_needed: bool,
+    // Table state — rows buffered until End(Table) for correct column alignment
+    in_table: bool,
+    in_table_head: bool,
+    table_head_count: usize,
+    table_rows: Vec<Vec<Vec<Span<'static>>>>,
+    current_table_row: Vec<Vec<Span<'static>>>,
+    current_cell: Vec<Span<'static>>,
 }
 
 pub(crate) fn render_markdown(markdown: &str) -> Text<'static> {
@@ -258,6 +266,22 @@ pub(crate) fn render_markdown(markdown: &str) -> Text<'static> {
                     flush_line(&mut lines, &mut current, false);
                     state.in_code_block = true;
                 }
+                Tag::Table(_) => {
+                    flush_line(&mut lines, &mut current, false);
+                    state.in_table = true;
+                    state.table_rows.clear();
+                    state.table_head_count = 0;
+                }
+                Tag::TableHead => {
+                    state.in_table_head = true;
+                    state.current_table_row.clear();
+                }
+                Tag::TableRow => {
+                    state.current_table_row.clear();
+                }
+                Tag::TableCell => {
+                    state.current_cell.clear();
+                }
                 Tag::Strong => state.in_strong += 1,
                 Tag::Emphasis => state.in_emphasis += 1,
                 _ => {}
@@ -281,24 +305,59 @@ pub(crate) fn render_markdown(markdown: &str) -> Text<'static> {
                     state.in_code_block = false;
                     flush_line(&mut lines, &mut current, true);
                 }
+                TagEnd::TableCell => {
+                    state
+                        .current_table_row
+                        .push(std::mem::take(&mut state.current_cell));
+                }
+                TagEnd::TableHead => {
+                    if !state.current_table_row.is_empty() {
+                        state
+                            .table_rows
+                            .push(std::mem::take(&mut state.current_table_row));
+                        state.table_head_count = state.table_rows.len();
+                    }
+                    state.in_table_head = false;
+                }
+                TagEnd::TableRow => {
+                    if !state.current_table_row.is_empty() {
+                        state
+                            .table_rows
+                            .push(std::mem::take(&mut state.current_table_row));
+                    }
+                }
+                TagEnd::Table => {
+                    flush_table(&mut lines, &mut state);
+                    state.in_table = false;
+                }
                 TagEnd::Strong => state.in_strong = state.in_strong.saturating_sub(1),
                 TagEnd::Emphasis => state.in_emphasis = state.in_emphasis.saturating_sub(1),
                 _ => {}
             },
             Event::Text(text) => {
-                ensure_line_prefix(&state, &mut current);
-                current.push(Span::styled(text.to_string(), current_style(&state)));
-                state.item_prefix_needed = false;
+                if state.in_table {
+                    state
+                        .current_cell
+                        .push(Span::styled(text.to_string(), current_style(&state)));
+                } else {
+                    ensure_line_prefix(&state, &mut current);
+                    current.push(Span::styled(text.to_string(), current_style(&state)));
+                    state.item_prefix_needed = false;
+                }
             }
             Event::Code(text) => {
-                ensure_line_prefix(&state, &mut current);
-                current.push(Span::styled(
-                    text.to_string(),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ));
-                state.item_prefix_needed = false;
+                let code_style = Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD);
+                if state.in_table {
+                    state
+                        .current_cell
+                        .push(Span::styled(text.to_string(), code_style));
+                } else {
+                    ensure_line_prefix(&state, &mut current);
+                    current.push(Span::styled(text.to_string(), code_style));
+                    state.item_prefix_needed = false;
+                }
             }
             Event::Rule => {
                 flush_line(&mut lines, &mut current, false);
@@ -309,12 +368,19 @@ pub(crate) fn render_markdown(markdown: &str) -> Text<'static> {
             }
             Event::SoftBreak | Event::HardBreak => flush_line(&mut lines, &mut current, false),
             Event::Html(raw) => {
-                ensure_line_prefix(&state, &mut current);
-                current.push(Span::styled(
-                    raw.to_string(),
-                    Style::default().fg(Color::DarkGray),
-                ));
-                state.item_prefix_needed = false;
+                if state.in_table {
+                    state.current_cell.push(Span::styled(
+                        raw.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                } else {
+                    ensure_line_prefix(&state, &mut current);
+                    current.push(Span::styled(
+                        raw.to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    state.item_prefix_needed = false;
+                }
             }
             _ => {}
         }
@@ -374,6 +440,97 @@ fn flush_line(lines: &mut Vec<Line<'static>>, current: &mut Vec<Span<'static>>, 
     if force || !current.is_empty() {
         lines.push(Line::from(std::mem::take(current)));
     }
+}
+
+/// Compute the display width of a cell's spans.
+fn cell_display_width(cell: &[Span<'_>]) -> usize {
+    cell.iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum()
+}
+
+/// Build prefix spans for a table line (quote markers, list indentation, optional bullet).
+fn table_line_prefix(state: &MarkdownState, with_bullet: bool) -> Vec<Span<'static>> {
+    let mut prefix = Vec::new();
+    if state.quote_depth > 0 {
+        prefix.push(Span::styled(
+            format!("{} ", ">".repeat(state.quote_depth)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if with_bullet && state.list_depth > 0 {
+        let indent = "  ".repeat(state.list_depth.saturating_sub(1));
+        prefix.push(Span::styled(
+            format!("{indent}• "),
+            Style::default().fg(Color::Magenta),
+        ));
+    } else if state.list_depth > 0 {
+        let indent = "  ".repeat(state.list_depth);
+        prefix.push(Span::raw(indent));
+    }
+    prefix
+}
+
+fn flush_table(lines: &mut Vec<Line<'static>>, state: &mut MarkdownState) {
+    let rows = std::mem::take(&mut state.table_rows);
+    if rows.is_empty() {
+        return;
+    }
+
+    // Compute column widths from ALL rows (header + body)
+    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut widths = vec![0usize; col_count];
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell_display_width(cell));
+        }
+    }
+
+    let sep_style = Style::default().fg(Color::DarkGray);
+    let head_extra = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        let is_head = row_idx < state.table_head_count;
+        let with_bullet = row_idx == 0 && state.item_prefix_needed;
+        let mut spans = table_line_prefix(state, with_bullet);
+
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", sep_style));
+            }
+            for span in cell {
+                let style = if is_head {
+                    span.style.patch(head_extra)
+                } else {
+                    span.style
+                };
+                spans.push(Span::styled(span.content.to_string(), style));
+            }
+            let pad = widths[i].saturating_sub(cell_display_width(cell));
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+        }
+        lines.push(Line::from(spans));
+
+        // Separator after header
+        if row_idx + 1 == state.table_head_count {
+            let mut sep_spans = table_line_prefix(state, false);
+            for (i, &w) in widths.iter().enumerate() {
+                if i > 0 {
+                    sep_spans.push(Span::styled("─┼─", sep_style));
+                }
+                sep_spans.push(Span::styled("─".repeat(w), sep_style));
+            }
+            lines.push(Line::from(sep_spans));
+        }
+    }
+
+    state.item_prefix_needed = false;
+    state.table_head_count = 0;
+    lines.push(Line::from(""));
 }
 
 #[cfg(test)]
@@ -487,6 +644,7 @@ mod tests {
             list_depth: 0,
             quote_depth: 0,
             item_prefix_needed: false,
+            ..Default::default()
         };
         let style = current_style(&state);
         assert_eq!(style.fg, Some(Color::Cyan));
@@ -508,5 +666,31 @@ mod tests {
 
         flush_line(&mut lines, &mut current, true);
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn render_markdown_handles_table() {
+        let md = "| Name | Value |\n|------|-------|\n| a    | 1     |\n| bb   | 22    |";
+        let out = render_markdown(md);
+        let text: Vec<String> = out
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        // Header row, separator, two data rows, trailing blank
+        assert!(text.len() >= 4);
+        // Header contains column names
+        assert!(text[0].contains("Name"));
+        assert!(text[0].contains("Value"));
+        // Separator uses box-drawing
+        assert!(text[1].contains("─"));
+        // Data rows
+        assert!(text[2].contains("a"));
+        assert!(text[3].contains("bb"));
     }
 }
