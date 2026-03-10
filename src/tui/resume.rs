@@ -212,6 +212,16 @@ pub(super) fn parse_iteration_from_filename(name: &str) -> Option<u32> {
         return None;
     }
     let stem = name.trim_end_matches(".md");
+    // Strip optional _loop{N} suffix before parsing iteration number
+    let stem = if let Some(lp) = stem.rfind("_loop") {
+        if stem[lp + 5..].parse::<u32>().is_ok() {
+            &stem[..lp]
+        } else {
+            stem
+        }
+    } else {
+        stem
+    };
     let iter_pos = stem.rfind("_iter")?;
     let iter_str = &stem[iter_pos + 5..];
     iter_str.parse::<u32>().ok()

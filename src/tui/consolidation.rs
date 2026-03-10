@@ -82,6 +82,45 @@ pub(super) fn successful_run_ids(app: &App) -> Vec<u32> {
         .collect()
 }
 
+/// Given a list of `(filename, path)` pairs, keep only the highest `_loop{N}`
+/// variant per stem. Files without a `_loop{N}` suffix pass through unchanged.
+fn keep_highest_loop_pass(
+    files: Vec<(String, std::path::PathBuf)>,
+) -> Vec<(String, std::path::PathBuf)> {
+    use std::collections::HashMap;
+    let mut best: HashMap<String, (u32, String, std::path::PathBuf)> = HashMap::new();
+    let mut no_loop: Vec<(String, std::path::PathBuf)> = Vec::new();
+
+    for (name, path) in files {
+        let stem = name.trim_end_matches(".md");
+        if let Some(lp) = stem.rfind("_loop") {
+            if let Ok(n) = stem[lp + 5..].parse::<u32>() {
+                let base = stem[..lp].to_string();
+                let entry = best.entry(base).or_insert((0, String::new(), std::path::PathBuf::new()));
+                if n >= entry.0 {
+                    *entry = (n, name, path);
+                }
+                continue;
+            }
+        }
+        // Check if there is already a looped variant for this stem
+        let base = stem.to_string();
+        if !best.contains_key(&base) {
+            no_loop.push((name, path));
+        }
+    }
+
+    // Remove no-loop entries that have a looped counterpart
+    no_loop.retain(|(name, _)| {
+        let stem = name.trim_end_matches(".md");
+        !best.contains_key(stem)
+    });
+
+    let mut result = no_loop;
+    result.extend(best.into_values().map(|(_, name, path)| (name, path)));
+    result
+}
+
 pub(super) fn discover_final_outputs(
     run_dir: &std::path::Path,
     mode: ExecutionMode,
@@ -105,6 +144,8 @@ pub(super) fn discover_final_outputs(
                 }
             })
             .collect::<Vec<_>>();
+        // Keep only the highest loop pass per stem
+        files = keep_highest_loop_pass(files);
         files.sort_by(|a, b| natural_cmp(&a.0, &b.0));
         return files;
     }
@@ -164,6 +205,8 @@ pub(super) async fn discover_final_outputs_async(
             }
         }
 
+        // Keep only the highest loop pass per stem
+        files = keep_highest_loop_pass(files);
         files.sort_by(|a, b| natural_cmp(&a.0, &b.0));
         return files;
     }

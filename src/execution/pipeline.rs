@@ -25,6 +25,7 @@ struct PipelineTaskMetadata {
     agent_name: String,
     label: String,
     iteration: u32,
+    loop_pass: u32,
 }
 
 struct PipelineMessageContext<'a> {
@@ -125,6 +126,14 @@ fn replica_filename(info: &RuntimeReplicaInfo, iteration: u32) -> String {
     format!("{}_iter{}.md", info.filename_stem, iteration)
 }
 
+fn loop_replica_filename(info: &RuntimeReplicaInfo, iteration: u32, loop_pass: u32) -> String {
+    if loop_pass == 0 {
+        replica_filename(info, iteration)
+    } else {
+        format!("{}_iter{}_loop{}.md", info.filename_stem, iteration, loop_pass)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineBlock {
     pub id: BlockId,
@@ -162,6 +171,15 @@ pub struct PipelineConnection {
     pub to: BlockId,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopConnection {
+    pub from: BlockId,
+    pub to: BlockId,
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionConfig {
     pub agent: String,
@@ -192,6 +210,8 @@ pub struct PipelineDefinition {
     pub connections: Vec<PipelineConnection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_configs: Vec<SessionConfig>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loop_connections: Vec<LoopConnection>,
 }
 
 fn default_iterations() -> u32 {
@@ -210,6 +230,7 @@ impl Default for PipelineDefinition {
             blocks: Vec::new(),
             connections: Vec::new(),
             session_configs: Vec::new(),
+            loop_connections: Vec::new(),
         }
     }
 }
@@ -331,9 +352,13 @@ impl PipelineDefinition {
 // ---------------------------------------------------------------------------
 
 /// Blocks with no incoming connections (DAG roots).
+/// Loop forward edges (from→to) count as incoming for `to`.
 #[allow(dead_code)]
 pub fn root_blocks(def: &PipelineDefinition) -> Vec<BlockId> {
-    let has_incoming: HashSet<BlockId> = def.connections.iter().map(|c| c.to).collect();
+    let mut has_incoming: HashSet<BlockId> = def.connections.iter().map(|c| c.to).collect();
+    for lc in &def.loop_connections {
+        has_incoming.insert(lc.to);
+    }
     def.blocks
         .iter()
         .filter(|b| !has_incoming.contains(&b.id))
@@ -342,8 +367,12 @@ pub fn root_blocks(def: &PipelineDefinition) -> Vec<BlockId> {
 }
 
 /// Blocks with no outgoing connections (DAG terminals).
+/// Loop forward edges (from→to) count as outgoing for `from`.
 pub fn terminal_blocks(def: &PipelineDefinition) -> Vec<BlockId> {
-    let has_outgoing: HashSet<BlockId> = def.connections.iter().map(|c| c.from).collect();
+    let mut has_outgoing: HashSet<BlockId> = def.connections.iter().map(|c| c.from).collect();
+    for lc in &def.loop_connections {
+        has_outgoing.insert(lc.from);
+    }
     def.blocks
         .iter()
         .filter(|b| !has_outgoing.contains(&b.id))
@@ -352,12 +381,19 @@ pub fn terminal_blocks(def: &PipelineDefinition) -> Vec<BlockId> {
 }
 
 /// Direct predecessors of a block.
+/// Includes loop forward edges: if block is `to` of a loop, `from` is upstream.
 pub fn upstream_of(def: &PipelineDefinition, id: BlockId) -> Vec<BlockId> {
-    def.connections
+    let mut result: Vec<BlockId> = def.connections
         .iter()
         .filter(|c| c.to == id)
         .map(|c| c.from)
-        .collect()
+        .collect();
+    for lc in &def.loop_connections {
+        if lc.to == id {
+            result.push(lc.from);
+        }
+    }
+    result
 }
 
 /// Kahn's algorithm: returns parallelizable layers or Err on cycle.
@@ -369,6 +405,10 @@ pub fn topological_layers(def: &PipelineDefinition) -> Result<Vec<Vec<BlockId>>,
     for conn in &def.connections {
         *in_degree.entry(conn.to).or_default() += 1;
         downstream.entry(conn.from).or_default().push(conn.to);
+    }
+    for lc in &def.loop_connections {
+        *in_degree.entry(lc.to).or_default() += 1;
+        downstream.entry(lc.from).or_default().push(lc.to);
     }
 
     let mut queue: VecDeque<BlockId> = in_degree
@@ -434,6 +474,9 @@ pub fn would_create_cycle(def: &PipelineDefinition, from: BlockId, to: BlockId) 
         let mut map: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         for conn in &def.connections {
             map.entry(conn.from).or_default().push(conn.to);
+        }
+        for lc in &def.loop_connections {
+            map.entry(lc.from).or_default().push(lc.to);
         }
         map
     };
@@ -541,7 +584,7 @@ pub(crate) fn validate_replicas(def: &PipelineDefinition) -> Result<(), AppError
     Ok(())
 }
 
-fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError> {
+pub(crate) fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError> {
     // Check duplicate block IDs
     let mut seen = HashSet::new();
     for block in &def.blocks {
@@ -576,7 +619,85 @@ fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError> {
         }
     }
 
-    // Check for cycles
+    // Duplicate regular connections
+    {
+        let mut seen_conns = HashSet::new();
+        for conn in &def.connections {
+            if !seen_conns.insert((conn.from, conn.to)) {
+                return Err(AppError::Config(format!(
+                    "Duplicate connection from {} to {}",
+                    conn.from, conn.to
+                )));
+            }
+        }
+    }
+
+    // --- Loop connection validation ---
+    {
+        let mut loop_participants = HashSet::new();
+        let mut seen_loops = HashSet::new();
+
+        for lc in &def.loop_connections {
+            // Self-edge
+            if lc.from == lc.to {
+                return Err(AppError::Config(format!(
+                    "Loop self-edge on block {}",
+                    lc.from
+                )));
+            }
+            // Count bounds
+            if lc.count < 1 || lc.count > 99 {
+                return Err(AppError::Config(format!(
+                    "Loop count must be 1-99, got {}",
+                    lc.count
+                )));
+            }
+            // Dangling refs
+            if !seen.contains(&lc.from) {
+                return Err(AppError::Config(format!(
+                    "Loop references non-existent block: {}",
+                    lc.from
+                )));
+            }
+            if !seen.contains(&lc.to) {
+                return Err(AppError::Config(format!(
+                    "Loop references non-existent block: {}",
+                    lc.to
+                )));
+            }
+            // One-loop-per-block
+            if !loop_participants.insert(lc.from) {
+                return Err(AppError::Config(format!(
+                    "Block {} is already in a loop connection",
+                    lc.from
+                )));
+            }
+            if !loop_participants.insert(lc.to) {
+                return Err(AppError::Config(format!(
+                    "Block {} is already in a loop connection",
+                    lc.to
+                )));
+            }
+            // No duplicate loops
+            if !seen_loops.insert((lc.from, lc.to)) {
+                return Err(AppError::Config(format!(
+                    "Duplicate loop connection from {} to {}",
+                    lc.from, lc.to
+                )));
+            }
+            // No regular/loop overlap (either direction)
+            if def.connections.iter().any(|c|
+                (c.from == lc.from && c.to == lc.to) || (c.from == lc.to && c.to == lc.from)
+            ) {
+                return Err(AppError::Config(format!(
+                    "Regular connection exists between loop blocks {} and {}",
+                    lc.from, lc.to
+                )));
+            }
+        }
+    }
+
+    // Check for cycles (topological_layers now includes loop forward edges)
     topological_layers(def)
         .map_err(|_| AppError::Config("Pipeline contains a cycle".to_string()))?;
 
@@ -622,6 +743,24 @@ pub fn list_pipeline_files() -> io::Result<Vec<PathBuf>> {
 // ---------------------------------------------------------------------------
 // Execution engine
 // ---------------------------------------------------------------------------
+
+struct LoopRuntimeState {
+    remaining: u32,
+    current_pass: u32,
+    prompt: String,
+    from_replicas: u32,
+    to_replicas: u32,
+    to_completed_this_pass: u32,
+    from_completed_this_pass: u32,
+}
+
+impl LoopRuntimeState {
+    /// Number of tasks that will never run because the loop was abandoned.
+    /// Call BEFORE setting remaining to 0.
+    fn abandoned_task_count(&self) -> usize {
+        self.remaining as usize * (self.from_replicas as usize + self.to_replicas as usize)
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pipeline(
@@ -673,11 +812,18 @@ where
     F: Fn(ProviderKind, &crate::config::ProviderConfig) -> Box<dyn provider::Provider>,
 {
     let rt = build_runtime_table(def);
-    let total_tasks = rt.entries.len();
-    if total_tasks == 0 {
+    if rt.entries.is_empty() {
         let _ = progress_tx.send(ProgressEvent::AllDone);
         return Ok(());
     }
+
+    // Account for loop re-runs in total task count
+    let loop_extra: usize = def.loop_connections.iter().map(|lc| {
+        let fr = def.blocks.iter().find(|b| b.id == lc.from).map(|b| b.replicas).unwrap_or(1);
+        let tr = def.blocks.iter().find(|b| b.id == lc.to).map(|b| b.replicas).unwrap_or(1);
+        lc.count as usize * (fr as usize + tr as usize)
+    }).sum();
+    let total_tasks = rt.entries.len() + loop_extra;
 
     let concurrency_sem = Arc::new(tokio::sync::Semaphore::new(if max_block_concurrency == 0 {
         tokio::sync::Semaphore::MAX_PERMITS
@@ -705,6 +851,17 @@ where
         *in_degree.entry(conn.to).or_default() += from_block.replicas as usize;
         downstream.entry(conn.from).or_default().push(conn.to);
     }
+    // Loop forward edges also contribute to adjacency
+    for lc in &def.loop_connections {
+        let from_block = def.blocks.iter().find(|b| b.id == lc.from).unwrap();
+        *in_degree.entry(lc.to).or_default() += from_block.replicas as usize;
+        downstream.entry(lc.from).or_default().push(lc.to);
+    }
+    // Loop lookup indexes
+    let loop_by_to: HashMap<BlockId, &LoopConnection> = def.loop_connections.iter()
+        .map(|lc| (lc.to, lc)).collect();
+    let loop_by_from: HashMap<BlockId, &LoopConnection> = def.loop_connections.iter()
+        .map(|lc| (lc.from, lc)).collect();
 
     let mut previous_terminal_outputs = String::new();
 
@@ -733,6 +890,26 @@ where
         let mut failed_logical: HashSet<BlockId> = HashSet::new();
         let mut replica_outputs: HashMap<u32, String> = HashMap::new();
         let mut completed = 0usize;
+
+        // Loop runtime state per iteration
+        let mut loop_state: HashMap<(BlockId, BlockId), LoopRuntimeState> =
+            def.loop_connections.iter().map(|lc| {
+                let fr = def.blocks.iter().find(|b| b.id == lc.from).map(|b| b.replicas).unwrap_or(1);
+                let tr = def.blocks.iter().find(|b| b.id == lc.to).map(|b| b.replicas).unwrap_or(1);
+                ((lc.from, lc.to), LoopRuntimeState {
+                    remaining: lc.count,
+                    current_pass: 0,
+                    prompt: lc.prompt.clone(),
+                    from_replicas: fr,
+                    to_replicas: tr,
+                    to_completed_this_pass: 0,
+                    from_completed_this_pass: 0,
+                })
+            }).collect();
+        let mut deferred_decrements: HashMap<BlockId, HashMap<BlockId, usize>> = HashMap::new();
+        let mut pass0_anchors: HashMap<BlockId, String> = HashMap::new();
+        // Track current loop pass per block for progress events
+        let mut block_loop_pass: HashMap<BlockId, u32> = HashMap::new();
 
         // Seed ready queue with root blocks (logical IDs)
         let (ready_tx, mut ready_rx) = mpsc::unbounded_channel::<BlockId>();
@@ -768,6 +945,16 @@ where
                     };
                     let replica_count = block.replicas as usize;
 
+                    // Determine loop pass for this block
+                    let current_loop_pass = if let Some(lc) = loop_by_from.get(&block_id) {
+                        loop_state.get(&(lc.from, lc.to)).map(|ls| ls.current_pass).unwrap_or(0)
+                    } else if let Some(lc) = loop_by_to.get(&block_id) {
+                        loop_state.get(&(lc.from, lc.to)).map(|ls| ls.current_pass).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    block_loop_pass.insert(block_id, current_loop_pass);
+
                     // Group-aware failure: skip only if ALL replicas of an upstream block failed
                     let failed_upstream: Vec<BlockId> = upstream_of(def, block_id)
                         .into_iter()
@@ -784,6 +971,7 @@ where
                                     agent_name: info.agent.clone(),
                                     label: info.display_label.clone(),
                                     iteration,
+                                    loop_pass: current_loop_pass,
                                     reason: reason.clone(),
                                 });
                                 failed_replicas.insert(rid);
@@ -791,6 +979,27 @@ where
                         }
                         failed_logical.insert(block_id);
                         completed += replica_count;
+                        // For loop failure: abandon loop and apply deferred decrements
+                        if let Some(lc) = loop_by_from.get(&block_id).or(loop_by_to.get(&block_id)) {
+                            let key = (lc.from, lc.to);
+                            if let Some(ls) = loop_state.get_mut(&key) {
+                                completed += ls.abandoned_task_count();
+                                ls.remaining = 0;
+                            }
+                            let partner = if lc.from == block_id { lc.to } else { lc.from };
+                            failed_logical.insert(partner);
+                            // Apply deferred decrements for the loop's from block
+                            if let Some(deferred) = deferred_decrements.remove(&lc.from) {
+                                for (child, weight) in deferred {
+                                    if let Some(deg) = current_in_degree.get_mut(&child) {
+                                        *deg = deg.saturating_sub(weight);
+                                        if *deg == 0 {
+                                            let _ = ready_tx.send(child);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         if let Some(children) = downstream.get(&block_id) {
                             for &child in children {
                                 let deg = current_in_degree.get_mut(&child).unwrap();
@@ -808,20 +1017,52 @@ where
                         .map(|(_, _, cli)| *cli)
                         .unwrap_or(false);
 
-                    // Build message ONCE (shared by all replicas of this block)
-                    let message = build_pipeline_block_message(
-                        block,
-                        use_cli,
-                        &PipelineMessageContext {
-                            def,
-                            iteration,
-                            block_outputs: &replica_outputs,
-                            previous_terminal_outputs: &previous_terminal_outputs,
+                    // Build message: normal for pass 0, loop re-run for pass > 0
+                    let message = if current_loop_pass > 0 {
+                        let (partner_id, is_from) = if let Some(lc) = loop_by_from.get(&block_id) {
+                            (lc.to, true)
+                        } else if let Some(lc) = loop_by_to.get(&block_id) {
+                            (lc.from, false)
+                        } else {
+                            unreachable!("loop_pass > 0 but block not in a loop")
+                        };
+                        let lc_key = if is_from {
+                            (block_id, partner_id)
+                        } else {
+                            (partner_id, block_id)
+                        };
+                        let ls = loop_state.get(&lc_key).unwrap();
+                        let lc = if is_from { loop_by_from.get(&block_id).unwrap() } else { loop_by_to.get(&block_id).unwrap() };
+                        build_loop_rerun_message(
+                            block,
+                            use_cli,
+                            partner_id,
+                            is_from,
+                            current_loop_pass,
+                            lc.count + 1,
+                            &ls.prompt,
+                            &pass0_anchors,
+                            &replica_outputs,
+                            &rt,
                             output,
+                            iteration,
                             prompt_context,
-                            runtime_table: &rt,
-                        },
-                    );
+                        )
+                    } else {
+                        build_pipeline_block_message(
+                            block,
+                            use_cli,
+                            &PipelineMessageContext {
+                                def,
+                                iteration,
+                                block_outputs: &replica_outputs,
+                                previous_terminal_outputs: &previous_terminal_outputs,
+                                output,
+                                prompt_context,
+                                runtime_table: &rt,
+                            },
+                        )
+                    };
 
                     // Check provider availability (all replicas share the same agent)
                     let rids = match rt.logical_to_runtime.get(&block_id) {
@@ -837,6 +1078,7 @@ where
                                 agent_name: info.agent.clone(),
                                 label: info.display_label.clone(),
                                 iteration,
+                                loop_pass: current_loop_pass,
                                 error: "No provider available".into(),
                                 details: None,
                             });
@@ -868,6 +1110,7 @@ where
                                     agent_name: info.agent.clone(),
                                     label: info.display_label.clone(),
                                     iteration,
+                                    loop_pass: current_loop_pass,
                                     error: "No provider available".into(),
                                     details: None,
                                 });
@@ -891,16 +1134,18 @@ where
                             agent_name: info.agent.clone(),
                             label: info.display_label.clone(),
                             iteration,
+                            loop_pass: current_loop_pass,
                         });
 
                         let ptx = progress_tx.clone();
                         let cancel_clone = cancel.clone();
                         let task_output = output.clone();
-                        let task_filename = replica_filename(info, iteration);
+                        let task_filename = loop_replica_filename(info, iteration, current_loop_pass);
                         let task_agent_name = info.agent.clone();
                         let task_label = info.display_label.clone();
                         let message_clone = message.clone();
                         let sem_clone = concurrency_sem.clone();
+                        let task_loop_pass = current_loop_pass;
                         let task_handle = tasks.spawn(async move {
                             let mut guard = provider_arc.lock().await;
                             let _permit = sem_clone.acquire().await.expect("semaphore closed");
@@ -911,6 +1156,7 @@ where
                             let bid = rid;
                             let an = task_agent_name.clone();
                             let it = iteration;
+                            let lp = task_loop_pass;
                             let ptx2 = ptx.clone();
                             let live_forward = tokio::spawn(async move {
                                 while let Some(line) = live_rx.recv().await {
@@ -918,6 +1164,7 @@ where
                                         block_id: bid,
                                         agent_name: an.clone(),
                                         iteration: it,
+                                        loop_pass: lp,
                                         message: format!("CLI {line}"),
                                     });
                                 }
@@ -932,10 +1179,12 @@ where
                                         let agent_name = task_agent_name.clone();
                                         let bid = rid;
                                         let it = iteration;
+                                        let lp = task_loop_pass;
                                         move |chunk| ProgressEvent::BlockStreamChunk {
                                             block_id: bid,
                                             agent_name: agent_name.clone(),
                                             iteration: it,
+                                            loop_pass: lp,
                                             chunk,
                                         }
                                     },
@@ -956,6 +1205,7 @@ where
                                             block_id: rid,
                                             agent_name: task_agent_name.clone(),
                                             iteration,
+                                            loop_pass: task_loop_pass,
                                             message: log.clone(),
                                         });
                                     }
@@ -970,6 +1220,7 @@ where
                                             agent_name: task_agent_name,
                                             label: task_label,
                                             iteration,
+                                            loop_pass: task_loop_pass,
                                             error: error.clone(),
                                             details: Some(error.clone()),
                                         });
@@ -980,6 +1231,7 @@ where
                                             agent_name: task_agent_name,
                                             label: task_label,
                                             iteration,
+                                            loop_pass: task_loop_pass,
                                         });
                                         (rid, Ok(resp.content))
                                     }
@@ -994,6 +1246,7 @@ where
                                         agent_name: task_agent_name,
                                         label: task_label,
                                         iteration,
+                                        loop_pass: task_loop_pass,
                                         error: error.clone(),
                                         details: Some(error.clone()),
                                     });
@@ -1009,47 +1262,30 @@ where
                                 agent_name: info.agent.clone(),
                                 label: info.display_label.clone(),
                                 iteration,
+                                loop_pass: current_loop_pass,
                             },
                         );
                     }
                 }
                 Some(result) = tasks.join_next() => {
                     completed += 1;
-                    match result {
-                        Ok((runtime_id, outcome)) => {
-                            let source_id = rt.entries[runtime_id as usize].source_block_id;
-                            match outcome {
-                                Ok(content) => {
-                                    replica_outputs.insert(runtime_id, content);
-                                }
-                                Err(_) => {
-                                    failed_replicas.insert(runtime_id);
-                                    if let Some(rids) = rt.logical_to_runtime.get(&source_id) {
-                                        if rids.iter().all(|r| failed_replicas.contains(r)) {
-                                            failed_logical.insert(source_id);
-                                        }
-                                    }
-                                }
-                            }
-                            // Decrement downstream by 1 per replica completion
-                            if let Some(children) = downstream.get(&source_id) {
-                                for &child in children {
-                                    let deg = current_in_degree.get_mut(&child).unwrap();
-                                    *deg -= 1;
-                                    if *deg == 0 {
-                                        let _ = ready_tx.send(child);
-                                    }
-                                }
-                            }
+
+                    // Normalize panics into the same shape as normal results so
+                    // both paths share the loop-aware downstream propagation.
+                    let (source_id, this_loop_pass) = match &result {
+                        Ok((runtime_id, _)) => {
+                            let sid = rt.entries[*runtime_id as usize].source_block_id;
+                            (Some(sid), block_loop_pass.get(&sid).copied().unwrap_or(0))
                         }
                         Err(join_error) => {
-                            let error = format!("Pipeline worker panicked: {join_error}");
                             if let Some(metadata) = task_metadata.get(&join_error.id()).cloned() {
+                                let error = format!("Pipeline worker panicked: {join_error}");
                                 let _ = progress_tx.send(ProgressEvent::BlockError {
                                     block_id: metadata.runtime_id,
                                     agent_name: metadata.agent_name.clone(),
                                     label: metadata.label.clone(),
                                     iteration: metadata.iteration,
+                                    loop_pass: metadata.loop_pass,
                                     error: error.clone(),
                                     details: Some(error.clone()),
                                 });
@@ -1061,24 +1297,219 @@ where
                                     error
                                 ));
                                 failed_replicas.insert(metadata.runtime_id);
-                                if let Some(rids) = rt.logical_to_runtime.get(&metadata.source_block_id) {
+                                let src = metadata.source_block_id;
+                                if let Some(rids) = rt.logical_to_runtime.get(&src) {
                                     if rids.iter().all(|r| failed_replicas.contains(r)) {
-                                        failed_logical.insert(metadata.source_block_id);
+                                        failed_logical.insert(src);
                                     }
                                 }
-                                if let Some(children) = downstream.get(&metadata.source_block_id) {
+                                (Some(src), block_loop_pass.get(&src).copied().unwrap_or(0))
+                            } else {
+                                let _ = output.append_error(&format!(
+                                    "pipeline panic could not be attributed to a block: {join_error}"
+                                ));
+                                (None, 0)
+                            }
+                        }
+                    };
+
+                    // Handle normal (non-panic) outcome recording
+                    if let Ok((runtime_id, ref outcome)) = result {
+                        let sid = rt.entries[runtime_id as usize].source_block_id;
+                        match outcome {
+                            Ok(content) => {
+                                replica_outputs.insert(runtime_id, content.clone());
+                            }
+                            Err(_) => {
+                                failed_replicas.insert(runtime_id);
+                                if let Some(rids) = rt.logical_to_runtime.get(&sid) {
+                                    if rids.iter().all(|r| failed_replicas.contains(r)) {
+                                        failed_logical.insert(sid);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Shared loop-aware downstream propagation ---
+                    let Some(source_id) = source_id else { continue };
+
+                    if let Some(lc) = loop_by_to.get(&source_id) {
+                        // CASE A: source_id is `to` of a loop
+                        let key = (lc.from, lc.to);
+                        let all_to_done = if let Some(ls) = loop_state.get_mut(&key) {
+                            ls.to_completed_this_pass += 1;
+                            ls.to_completed_this_pass >= ls.to_replicas
+                        } else {
+                            true
+                        };
+
+                        if all_to_done {
+                            // Check for failure - abandon loop
+                            if failed_logical.contains(&source_id) || failed_logical.contains(&lc.from) {
+                                if let Some(ls) = loop_state.get_mut(&key) {
+                                    completed += ls.abandoned_task_count();
+                                    ls.remaining = 0;
+                                }
+                                // Apply deferred decrements
+                                if let Some(deferred) = deferred_decrements.remove(&lc.from) {
+                                    for (child, weight) in deferred {
+                                        if let Some(deg) = current_in_degree.get_mut(&child) {
+                                            *deg = deg.saturating_sub(weight);
+                                            if *deg == 0 {
+                                                let _ = ready_tx.send(child);
+                                            }
+                                        }
+                                    }
+                                }
+                                // Propagate to to's downstream normally
+                                if let Some(children) = downstream.get(&source_id) {
                                     for &child in children {
+                                        let replica_count = rt.logical_to_runtime.get(&source_id)
+                                            .map(|v| v.len()).unwrap_or(1);
                                         let deg = current_in_degree.get_mut(&child).unwrap();
-                                        *deg -= 1;
+                                        *deg = deg.saturating_sub(replica_count);
                                         if *deg == 0 {
                                             let _ = ready_tx.send(child);
                                         }
                                     }
                                 }
-                            } else {
-                                let _ = output.append_error(&format!(
-                                    "pipeline panic could not be attributed to a block: {error}"
-                                ));
+                            } else if let Some(ls) = loop_state.get_mut(&key) {
+                                if ls.remaining > 0 {
+                                    // More loop passes needed
+                                    ls.remaining -= 1;
+                                    ls.current_pass += 1;
+                                    ls.to_completed_this_pass = 0;
+                                    ls.from_completed_this_pass = 0;
+                                    // Reset to's in-degree to from_replicas only
+                                    if let Some(deg) = current_in_degree.get_mut(&lc.to) {
+                                        *deg = ls.from_replicas as usize;
+                                    }
+                                    // Re-queue from
+                                    let _ = ready_tx.send(lc.from);
+                                    // Do NOT propagate to to's downstream
+                                } else {
+                                    // Loop complete - propagate to's downstream normally
+                                    if let Some(children) = downstream.get(&source_id) {
+                                        for &child in children {
+                                            let replica_count = rt.logical_to_runtime.get(&source_id)
+                                                .map(|v| v.len()).unwrap_or(1);
+                                            let deg = current_in_degree.get_mut(&child).unwrap();
+                                            *deg = deg.saturating_sub(replica_count);
+                                            if *deg == 0 {
+                                                let _ = ready_tx.send(child);
+                                            }
+                                        }
+                                    }
+                                    // Apply deferred decrements for from's regular children
+                                    if let Some(deferred) = deferred_decrements.remove(&lc.from) {
+                                        for (child, weight) in deferred {
+                                            if let Some(deg) = current_in_degree.get_mut(&child) {
+                                                *deg = deg.saturating_sub(weight);
+                                                if *deg == 0 {
+                                                    let _ = ready_tx.send(child);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Individual to replicas don't propagate (wait for all)
+                    } else if let Some(lc) = loop_by_from.get(&source_id) {
+                        // CASE B/C: source_id is `from` of a loop
+                        let key = (lc.from, lc.to);
+                        if let Some(ls) = loop_state.get_mut(&key) {
+                            ls.from_completed_this_pass += 1;
+
+                            // Store pass-0 anchor when all from replicas complete their first pass
+                            if ls.current_pass == 0
+                                && ls.from_completed_this_pass >= ls.from_replicas
+                            {
+                                if let std::collections::hash_map::Entry::Vacant(e) = pass0_anchors.entry(source_id) {
+                                    let mut anchor = String::new();
+                                    if let Some(rids) = rt.logical_to_runtime.get(&source_id) {
+                                        for &rid in rids {
+                                            if let Some(content) = replica_outputs.get(&rid) {
+                                                if !anchor.is_empty() {
+                                                    anchor.push_str("\n---\n");
+                                                }
+                                                let truncated: String = content.chars().take(200).collect();
+                                                anchor.push_str(&truncated);
+                                            }
+                                        }
+                                    }
+                                    e.insert(anchor);
+                                }
+                            }
+                        }
+
+                        if this_loop_pass > 0 {
+                            // CASE B: loop re-run of from — only decrement to's in-degree
+                            if let Some(deg) = current_in_degree.get_mut(&lc.to) {
+                                *deg -= 1;
+                                if *deg == 0 {
+                                    let _ = ready_tx.send(lc.to);
+                                }
+                            }
+                        } else {
+                            // CASE C: initial run of from — decrement to normally, defer others
+                            if let Some(children) = downstream.get(&source_id) {
+                                for &child in children {
+                                    if child == lc.to {
+                                        // Decrement to's in-degree normally
+                                        let deg = current_in_degree.get_mut(&child).unwrap();
+                                        *deg -= 1;
+                                        if *deg == 0 {
+                                            let _ = ready_tx.send(child);
+                                        }
+                                    } else {
+                                        // Defer decrement for regular children
+                                        *deferred_decrements
+                                            .entry(source_id)
+                                            .or_default()
+                                            .entry(child)
+                                            .or_default() += 1;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // CASE D: source_id not in any loop — existing behavior
+                        if let Some(children) = downstream.get(&source_id) {
+                            for &child in children {
+                                let deg = current_in_degree.get_mut(&child).unwrap();
+                                *deg -= 1;
+                                if *deg == 0 {
+                                    let _ = ready_tx.send(child);
+                                }
+                            }
+                        }
+                    }
+
+                    // Store pass-0 anchor for `to` blocks
+                    if let Some(lc) = loop_by_to.get(&source_id) {
+                        let key = (lc.from, lc.to);
+                        if let Some(ls) = loop_state.get(&key) {
+                            if ls.current_pass == 0 || (ls.current_pass == 1 && ls.to_completed_this_pass == 0) {
+                                if let std::collections::hash_map::Entry::Vacant(e) = pass0_anchors.entry(source_id) {
+                                    if let Some(rids) = rt.logical_to_runtime.get(&source_id) {
+                                        let all_done = rids.iter().all(|r| replica_outputs.contains_key(r));
+                                        if all_done {
+                                            let mut anchor = String::new();
+                                            for &rid in rids {
+                                                if let Some(content) = replica_outputs.get(&rid) {
+                                                    if !anchor.is_empty() {
+                                                        anchor.push_str("\n---\n");
+                                                    }
+                                                    let truncated: String = content.chars().take(200).collect();
+                                                    anchor.push_str(&truncated);
+                                                }
+                                            }
+                                            e.insert(anchor);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1203,6 +1634,93 @@ fn build_pipeline_block_message(
         .augment_prompt_for_agent(&base_message, use_cli)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_loop_rerun_message(
+    block: &PipelineBlock,
+    use_cli: bool,
+    partner_block_id: BlockId,
+    is_from: bool,
+    current_pass: u32,
+    total_passes: u32,
+    loop_prompt: &str,
+    pass0_anchors: &HashMap<BlockId, String>,
+    replica_outputs: &HashMap<u32, String>,
+    runtime_table: &RuntimeReplicaTable,
+    output: &OutputManager,
+    iteration: u32,
+    prompt_context: &PromptRuntimeContext,
+) -> String {
+    let mut message = String::new();
+
+    // Start with pass-0 anchor for context continuity
+    if let Some(anchor) = pass0_anchors.get(&block.id) {
+        message.push_str(anchor);
+        message.push_str("\n\n");
+    }
+
+    // Loop iteration header
+    message.push_str(&format!(
+        "[Loop iteration {} of {}]\n\n",
+        current_pass + 1,
+        total_passes
+    ));
+
+    // Loop prompt only on the back-edge (from side); to side keeps its own block prompt
+    let prompt = if is_from && !loop_prompt.is_empty() {
+        loop_prompt
+    } else {
+        &block.prompt
+    };
+    if !prompt.is_empty() {
+        message.push_str(prompt);
+        message.push_str("\n\n");
+    }
+
+    // Partner's latest outputs
+    if let Some(partner_rids) = runtime_table.logical_to_runtime.get(&partner_block_id) {
+        if use_cli {
+            message.push_str("Read these loop partner output files:\n");
+            for &rid in partner_rids {
+                let info = &runtime_table.entries[rid as usize];
+                if replica_outputs.contains_key(&rid) {
+                    // Compute partner's file loop_pass:
+                    // from at pass P needs to's output from pass P-1
+                    // to at pass P needs from's output from pass P
+                    let partner_pass = if is_from {
+                        current_pass.saturating_sub(1)
+                    } else {
+                        current_pass
+                    };
+                    let filename = loop_replica_filename(info, iteration, partner_pass);
+                    let path = output.run_dir().join(&filename);
+                    if path.exists() {
+                        message.push_str(&format!("- {}\n", path.display()));
+                    }
+                }
+            }
+            message.push_str("\nRead each file before responding.");
+        } else {
+            message.push_str("--- Loop partner outputs ---\n");
+            for &rid in partner_rids {
+                if let Some(content) = replica_outputs.get(&rid) {
+                    if partner_rids.len() > 1 {
+                        let info = &runtime_table.entries[rid as usize];
+                        message.push_str(&format!(
+                            "--- Output from {} ---\n{}",
+                            info.display_label, content
+                        ));
+                    } else {
+                        message.push_str(content);
+                    }
+                    message.push('\n');
+                }
+            }
+        }
+    }
+
+    prompt_context.augment_prompt_for_agent(&message, use_cli)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1245,6 +1763,7 @@ mod tests {
             blocks,
             connections,
             session_configs: Vec::new(),
+            loop_connections: Vec::new(),
         }
     }
 
@@ -1597,6 +2116,7 @@ to = 1
             }],
             connections: vec![],
             session_configs: Vec::new(),
+            loop_connections: Vec::new(),
         };
         let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
 
@@ -1637,6 +2157,7 @@ to = 1
             }],
             connections: vec![],
             session_configs: Vec::new(),
+            loop_connections: Vec::new(),
         };
         let agent_configs = HashMap::from([(
             "Claude".to_string(),
@@ -1714,6 +2235,7 @@ to = 1
             }],
             connections: vec![],
             session_configs: Vec::new(),
+            loop_connections: Vec::new(),
         };
         let agent_configs = HashMap::from([(
             "Claude".to_string(),
@@ -2452,5 +2974,525 @@ keep_across_iterations = false
 
         // Two blocks share one provider, cleared once before iteration 2
         assert_eq!(clear_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    // -- loop connection helpers --
+
+    fn lconn(from: BlockId, to: BlockId, count: u32) -> LoopConnection {
+        LoopConnection { from, to, count, prompt: String::new() }
+    }
+
+    fn def_with_loops(
+        blocks: Vec<PipelineBlock>,
+        connections: Vec<PipelineConnection>,
+        loops: Vec<LoopConnection>,
+    ) -> PipelineDefinition {
+        PipelineDefinition {
+            initial_prompt: "test".into(),
+            iterations: 1,
+            blocks,
+            connections,
+            session_configs: Vec::new(),
+            loop_connections: loops,
+        }
+    }
+
+    // -- loop validation tests --
+
+    #[test]
+    fn test_validate_rejects_loop_self_edge() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0)],
+            vec![],
+            vec![lconn(1, 1, 2)],
+        );
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("self-edge"), "expected 'self-edge', got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_loop_count_zero() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![LoopConnection { from: 1, to: 2, count: 0, prompt: String::new() }],
+        );
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("1-99"), "expected 'between 1 and 99' range msg, got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_block_in_two_loops() {
+        // Block 2 appears in two different loop connections
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0), block(3, 2, 0)],
+            vec![],
+            vec![lconn(1, 2, 1), lconn(2, 3, 1)],
+        );
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("already in a loop"), "expected 'already in a loop', got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_loop_regular_overlap() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![conn(1, 2)],
+            vec![lconn(1, 2, 1)],
+        );
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("Regular connection exists"), "expected 'Regular connection exists', got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_loop_dangling() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0)],
+            vec![],
+            vec![lconn(1, 99, 1)],
+        );
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("non-existent"), "expected 'dangling' ref msg, got: {err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_loop() {
+        // Same (from, to) pair in two LoopConnections.
+        // The one-loop-per-block check fires before the duplicate-loop check for
+        // identical pairs, so we accept either rejection message.
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![lconn(1, 2, 1), lconn(1, 2, 1)],
+        );
+        let err = validate_pipeline(&def).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Duplicate loop") || msg.contains("already in a loop"),
+            "expected duplicate/overlap rejection, got: {msg}"
+        );
+    }
+
+    // -- loop graph utility tests --
+
+    #[test]
+    fn test_root_excludes_loop_to() {
+        // Loop(A, B) means A->B forward edge, so B has incoming and is NOT a root
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![lconn(1, 2, 1)],
+        );
+        let roots = root_blocks(&def);
+        assert_eq!(roots, vec![1], "B (block 2) should not be a root when loop(A,B) exists");
+    }
+
+    #[test]
+    fn test_terminal_excludes_loop_from() {
+        // Loop(A, B) means A->B forward edge, so A has outgoing and is NOT a terminal
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![lconn(1, 2, 1)],
+        );
+        let terms = terminal_blocks(&def);
+        assert_eq!(terms, vec![2], "A (block 1) should not be terminal when loop(A,B) exists");
+    }
+
+    #[test]
+    fn test_upstream_includes_loop_from() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![lconn(1, 2, 1)],
+        );
+        let ups = upstream_of(&def, 2);
+        assert_eq!(ups, vec![1], "upstream_of(B) should include A when loop(A,B) exists");
+    }
+
+    #[test]
+    fn test_topo_layers_with_loop() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![lconn(1, 2, 1)],
+        );
+        let layers = topological_layers(&def).unwrap();
+        assert_eq!(layers, vec![vec![1], vec![2]], "A should be in layer before B when loop(A,B) exists");
+    }
+
+    #[test]
+    fn test_cycle_via_loop_edge() {
+        // Loop(A, B) creates forward edge A->B. Adding B->A should create a cycle.
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![lconn(1, 2, 1)],
+        );
+        assert!(
+            would_create_cycle(&def, 2, 1),
+            "adding B->A when loop(A,B) exists should detect a cycle"
+        );
+    }
+
+    // -- loop serialization test --
+
+    #[test]
+    fn test_loop_serde_roundtrip() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![LoopConnection {
+                from: 1,
+                to: 2,
+                count: 3,
+                prompt: "review again".into(),
+            }],
+        );
+        let toml_str = toml::to_string(&def).expect("serialize");
+        let loaded: PipelineDefinition = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(loaded.loop_connections.len(), 1);
+        let lc = &loaded.loop_connections[0];
+        assert_eq!(lc.from, 1);
+        assert_eq!(lc.to, 2);
+        assert_eq!(lc.count, 3);
+        assert_eq!(lc.prompt, "review again");
+    }
+
+    // -- loop execution tests --
+
+    #[tokio::test]
+    async fn test_loop_exec_basic() {
+        // Two blocks A(1) and B(2), loop(A, B, count=1).
+        // Expected: pass 0 runs A then B, then loop re-runs A then B (pass 1).
+        // Total BlockFinished events: 4 (2 per block, 2 passes each).
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("loop-exec-basic")).unwrap();
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![lconn(1, 2, 1)],
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let recv_clone = received.clone();
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            move |_kind, _cfg| {
+                Box::new(MockProvider::ok(
+                    ProviderKind::Anthropic,
+                    "loop output",
+                    recv_clone.clone(),
+                ))
+            },
+        )
+        .await
+        .expect("run");
+
+        let events = collect_progress_events(rx);
+
+        // Count BlockFinished events per runtime block_id
+        // Runtime ID 0 = block 1 (A), Runtime ID 1 = block 2 (B)
+        let a_finished = events.iter().filter(|e| matches!(
+            e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 0
+        )).count();
+        let b_finished = events.iter().filter(|e| matches!(
+            e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 1
+        )).count();
+
+        assert_eq!(a_finished, 2, "A should finish twice (pass 0 + pass 1)");
+        assert_eq!(b_finished, 2, "B should finish twice (pass 0 + pass 1)");
+        assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
+    }
+
+    #[tokio::test]
+    async fn test_loop_downstream_waits() {
+        // Three blocks: A(1), B(2), C(3). Loop(A, B, count=1). Connection B->C.
+        // C should only start after the loop completes (after B's final BlockFinished).
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("loop-downstream-waits")).unwrap();
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0), block(3, 2, 0)],
+            vec![conn(2, 3)],
+            vec![lconn(1, 2, 1)],
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let recv_clone = received.clone();
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            move |_kind, _cfg| {
+                Box::new(MockProvider::ok(
+                    ProviderKind::Anthropic,
+                    "output",
+                    recv_clone.clone(),
+                ))
+            },
+        )
+        .await
+        .expect("run");
+
+        let events = collect_progress_events(rx);
+
+        // Runtime IDs: 0=A(block1), 1=B(block2), 2=C(block3)
+        // Find index of C's BlockStarted
+        let c_started_idx = events.iter().position(|e| matches!(
+            e, ProgressEvent::BlockStarted { block_id, .. } if *block_id == 2
+        )).expect("C should have started");
+
+        // Find index of B's LAST BlockFinished (pass 1)
+        let b_last_finished_idx = events.iter().rposition(|e| matches!(
+            e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 1
+        )).expect("B should have finished");
+
+        assert!(
+            c_started_idx > b_last_finished_idx,
+            "C's BlockStarted (idx {c_started_idx}) should come after B's final BlockFinished (idx {b_last_finished_idx})"
+        );
+        assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
+    }
+
+    #[tokio::test]
+    async fn test_loop_mixed_panic_replica_completes() {
+        // Regression: when one replica of the `from` block panics while the
+        // other succeeds, the loop must still advance passes and finish —
+        // the panic completion must increment pass counters just like normal.
+        //
+        // Setup: A(1, replicas=2), B(2, replicas=1). Loop(A, B, count=1).
+        // One of A's replicas panics each pass; the other succeeds.
+        // Expected: loop still completes 2 passes, B finishes twice.
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("loop-mixed-panic")).unwrap();
+        let mut a_block = block(1, 0, 0);
+        a_block.replicas = 2;
+        let def = def_with_loops(
+            vec![a_block, block(2, 1, 0)],
+            vec![],
+            vec![lconn(1, 2, 1)],
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Counter to alternate: odd calls get PanicProvider, even get MockProvider.
+        let call_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let recv_clone = received.clone();
+        let counter_clone = call_counter.clone();
+
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            move |_kind, _cfg| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n % 2 == 1 {
+                    Box::new(PanicProvider::new(ProviderKind::Anthropic, "replica panic"))
+                } else {
+                    Box::new(MockProvider::ok(
+                        ProviderKind::Anthropic,
+                        "mixed output",
+                        recv_clone.clone(),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect("run should complete despite partial panics");
+
+        let events = collect_progress_events(rx);
+
+        // B (runtime_id depends on replica expansion: A gets 0,1; B gets 2)
+        let b_finished = events.iter().filter(|e| matches!(
+            e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 2
+        )).count();
+        assert_eq!(b_finished, 2, "B should finish twice (pass 0 + pass 1)");
+
+        // At least one BlockError from the panicking replica
+        assert!(events.iter().any(|e| matches!(
+            e, ProgressEvent::BlockError { error, .. } if error.contains("panicked")
+        )), "should have a panic error event");
+
+        assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
+    }
+
+    #[tokio::test]
+    async fn test_loop_mixed_panic_on_to_side_completes() {
+        // Regression: same as test_loop_mixed_panic_replica_completes but
+        // the partial panic is on the `to` block instead of `from`.
+        //
+        // Setup: A(1, replicas=1), B(2, replicas=2). Loop(A, B, count=1).
+        // One of B's replicas panics each pass; the other succeeds.
+        // Expected: loop still completes 2 passes, A finishes twice.
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("loop-to-panic")).unwrap();
+        let mut b_block = block(2, 1, 0);
+        b_block.replicas = 2;
+        let def = def_with_loops(
+            vec![block(1, 0, 0), b_block],
+            vec![],
+            vec![lconn(1, 2, 1)],
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Factory calls: 0=A (even→ok), 1=B_r0 (odd→panic), 2=B_r1 (even→ok).
+        let call_counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let recv_clone = received.clone();
+        let counter_clone = call_counter.clone();
+
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            move |_kind, _cfg| {
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n % 2 == 1 {
+                    Box::new(PanicProvider::new(ProviderKind::Anthropic, "to-side panic"))
+                } else {
+                    Box::new(MockProvider::ok(
+                        ProviderKind::Anthropic,
+                        "to output",
+                        recv_clone.clone(),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect("run should complete despite partial to-side panics");
+
+        let events = collect_progress_events(rx);
+
+        // A (runtime_id 0) should finish twice (pass 0 + re-run at pass 1).
+        let a_finished = events.iter().filter(|e| matches!(
+            e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 0
+        )).count();
+        assert_eq!(a_finished, 2, "A should finish twice (pass 0 + pass 1)");
+
+        // At least one BlockError from the panicking B replica
+        assert!(events.iter().any(|e| matches!(
+            e, ProgressEvent::BlockError { error, .. } if error.contains("panicked")
+        )), "should have a panic error event from B replica");
+
+        assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)));
+    }
+
+    #[test]
+    fn test_loop_filename_generation() {
+        let info = RuntimeReplicaInfo {
+            runtime_id: 0,
+            source_block_id: 1,
+            replica_index: 0,
+            agent: "Claude".into(),
+            display_label: "Block#1".into(),
+            session_key: "__block_1".into(),
+            filename_stem: "block1_claude".into(),
+        };
+
+        // pass=0 should produce same as replica_filename
+        let pass0 = loop_replica_filename(&info, 1, 0);
+        let normal = replica_filename(&info, 1);
+        assert_eq!(pass0, normal, "pass 0 should match replica_filename");
+        assert_eq!(pass0, "block1_claude_iter1.md");
+
+        // pass=1 should include _loop1
+        let pass1 = loop_replica_filename(&info, 1, 1);
+        assert_eq!(pass1, "block1_claude_iter1_loop1.md");
+
+        // pass=2 at iteration 3
+        let pass2 = loop_replica_filename(&info, 3, 2);
+        assert_eq!(pass2, "block1_claude_iter3_loop2.md");
     }
 }

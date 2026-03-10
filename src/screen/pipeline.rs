@@ -1,4 +1,4 @@
-use crate::app::{App, PipelineDialogMode, PipelineEditField, PipelineFocus};
+use crate::app::{App, PipelineDialogMode, PipelineEditField, PipelineFocus, PipelineLoopEditField};
 use crate::execution::pipeline::BlockId;
 use crate::execution::truncate_chars;
 use crate::screen::centered_rect;
@@ -38,6 +38,7 @@ struct WireCell {
     color: Color,
     is_arrow: bool,
     arrow_char: char,
+    is_loop: bool,
 }
 
 type WirePoint = (i16, i16);
@@ -96,6 +97,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     if app.pipeline.pipeline_show_session_config {
         draw_session_config_popup(f, app, area);
+    }
+    if app.pipeline.pipeline_show_loop_edit {
+        draw_loop_edit_popup(f, app, area);
     }
     if app.help_popup.active {
         let tab = app.help_popup.tab;
@@ -178,6 +182,7 @@ fn draw_prompt_area(f: &mut Frame, app: &App, area: Rect) {
     let has_overlay = app.pipeline.pipeline_show_edit
         || app.pipeline.pipeline_file_dialog.is_some()
         || app.pipeline.pipeline_show_session_config
+        || app.pipeline.pipeline_show_loop_edit
         || app.error_modal.is_some()
         || app.help_popup.active;
     if prompt_focus && !has_overlay && inner.width > 0 && inner.height > 0 {
@@ -342,6 +347,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
 
         let is_selected = app.pipeline.pipeline_block_cursor == Some(block.id);
         let is_connect_src = app.pipeline.pipeline_connecting_from == Some(block.id);
+        let is_loop_connect_src = app.pipeline.pipeline_loop_connecting_from == Some(block.id);
 
         let border_type = if is_selected {
             BorderType::Double
@@ -350,7 +356,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         };
         let border_color = if is_connect_src {
             Color::Green
-        } else if is_selected {
+        } else if is_loop_connect_src || is_selected {
             Color::Yellow
         } else {
             Color::DarkGray
@@ -493,6 +499,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
                         color,
                         is_arrow: true,
                         arrow_char: arrow_ch,
+                        is_loop: false,
                     },
                 );
             }
@@ -511,6 +518,8 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
             }
             let ch = if cell.is_arrow {
                 cell.arrow_char
+            } else if cell.is_loop {
+                dirs_to_double_char(cell.dirs)
             } else {
                 dirs_to_char(cell.dirs)
             };
@@ -525,8 +534,116 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    // ── Loop connection rendering ──
+    {
+        let loop_conns_as_regular: Vec<crate::execution::pipeline::PipelineConnection> =
+            app.pipeline.pipeline_def.loop_connections.iter()
+                .map(|lc| crate::execution::pipeline::PipelineConnection { from: lc.from, to: lc.to })
+                .collect();
+        if !loop_conns_as_regular.is_empty() {
+            let loop_lanes = assign_lanes(&loop_conns_as_regular, &app.pipeline.pipeline_def.blocks);
+            let loop_ports = assign_ports(&loop_conns_as_regular, &app.pipeline.pipeline_def.blocks);
+
+            for (ci, lc) in app.pipeline.pipeline_def.loop_connections.iter().enumerate() {
+                let fb = app.pipeline.pipeline_def.blocks.iter().find(|b| b.id == lc.from);
+                let tb = app.pipeline.pipeline_def.blocks.iter().find(|b| b.id == lc.to);
+                let (Some(fb), Some(tb)) = (fb, tb) else { continue; };
+
+                let _removing = app.pipeline.pipeline_removing_conn
+                    && is_conn_for_selected(app, lc.from, lc.to);
+                let highlighted = if app.pipeline.pipeline_removing_conn {
+                    let sel = app.pipeline.pipeline_block_cursor.unwrap_or(0);
+                    let regular_count = app.pipeline.pipeline_def.connections.iter()
+                        .filter(|c| c.from == sel || c.to == sel).count();
+                    let loop_offset = app.pipeline.pipeline_def.loop_connections.iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.from == sel || l.to == sel)
+                        .position(|(i, _)| i == ci);
+                    loop_offset.map(|off| app.pipeline.pipeline_conn_cursor == regular_count + off)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let color = if highlighted {
+                    Color::Red
+                } else {
+                    // Loop wires are always yellow (both when removing and normally)
+                    Color::Yellow
+                };
+
+                let (exit_y_off, entry_y_off) = loop_ports[ci];
+                let segs = route_wire(
+                    fb.position, tb.position, &grid_occ,
+                    loop_lanes[ci], exit_y_off, entry_y_off,
+                );
+                let mut conn_map: ConnectionRaster = HashMap::new();
+                for seg in &segs {
+                    rasterize_seg(seg, color, &mut conn_map);
+                }
+                // Mark all cells as loop
+                for cell in conn_map.values_mut() {
+                    cell.is_loop = true;
+                }
+                // Arrow
+                if let Some(last) = segs.last() {
+                    let arrow_ch = arrow_for_seg(last);
+                    if let Some(cell) = conn_map.get_mut(&(last.x2, last.y2)) {
+                        cell.is_arrow = true;
+                        cell.arrow_char = arrow_ch;
+                    } else {
+                        conn_map.insert(
+                            (last.x2, last.y2),
+                            WireCell { dirs: 0, color, is_arrow: true, arrow_char: arrow_ch, is_loop: true },
+                        );
+                    }
+                }
+
+                // Count label at midpoint of longest horizontal segment
+                let mut best_h: Option<(i16, i16, i16)> = None; // (y, x_start, x_end)
+                for seg in &segs {
+                    if seg.y1 == seg.y2 {
+                        let len = (seg.x2 - seg.x1).abs();
+                        if best_h.is_none() || len > (best_h.unwrap().2 - best_h.unwrap().1).abs() {
+                            let (lo, hi) = if seg.x1 <= seg.x2 { (seg.x1, seg.x2) } else { (seg.x2, seg.x1) };
+                            best_h = Some((seg.y1, lo, hi));
+                        }
+                    }
+                }
+                let label = format!("\u{00d7}{}", lc.count);
+
+                // Paint the wire
+                for (&(wx, wy), cell) in &conn_map {
+                    if pixel_hits_block(wx, wy, &app.pipeline.pipeline_def.blocks) {
+                        continue;
+                    }
+                    let ch = if cell.is_arrow {
+                        cell.arrow_char
+                    } else {
+                        dirs_to_double_char(cell.dirs)
+                    };
+                    put_char(f, canvas_inner, wx - ox, wy - oy, ch,
+                        Style::default().fg(cell.color));
+                }
+
+                // Paint the label
+                if let Some((ly, lx_start, lx_end)) = best_h {
+                    let mid_x = (lx_start + lx_end) / 2;
+                    let label_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                    for (i, ch) in label.chars().enumerate() {
+                        put_char(f, canvas_inner, mid_x + i as i16 - ox, ly - oy, ch, label_style);
+                    }
+                }
+            }
+        }
+    }
+
     // Status line for connect/remove modes
-    if app.pipeline.pipeline_connecting_from.is_some() {
+    if app.pipeline.pipeline_loop_connecting_from.is_some() {
+        let status = Paragraph::new("Select target block (Enter=loop, Esc=cancel)")
+            .style(Style::default().fg(Color::Yellow));
+        let sy = canvas_inner.y + canvas_inner.height.saturating_sub(1);
+        f.render_widget(status, Rect::new(canvas_inner.x, sy, canvas_inner.width, 1));
+    } else if app.pipeline.pipeline_connecting_from.is_some() {
         let status = Paragraph::new("Select target block (Enter=connect, Esc=cancel)")
             .style(Style::default().fg(Color::Yellow));
         let sy = canvas_inner.y + canvas_inner.height.saturating_sub(1);
@@ -788,6 +905,7 @@ fn rasterize_seg(seg: &WireSeg, color: Color, map: &mut HashMap<(i16, i16), Wire
                 color,
                 is_arrow: false,
                 arrow_char: ' ',
+                is_loop: false,
             });
             if x > lo {
                 c.dirs |= DIR_W;
@@ -812,6 +930,7 @@ fn rasterize_seg(seg: &WireSeg, color: Color, map: &mut HashMap<(i16, i16), Wire
                 color,
                 is_arrow: false,
                 arrow_char: ' ',
+                is_loop: false,
             });
             if y > lo {
                 c.dirs |= DIR_N;
@@ -845,6 +964,25 @@ fn dirs_to_char(d: u8) -> char {
     }
 }
 
+fn dirs_to_double_char(d: u8) -> char {
+    match d {
+        d if d == DIR_E | DIR_W => '═',
+        d if d == DIR_N | DIR_S => '║',
+        d if d == DIR_S | DIR_E => '╔',
+        d if d == DIR_S | DIR_W => '╗',
+        d if d == DIR_N | DIR_E => '╚',
+        d if d == DIR_N | DIR_W => '╝',
+        d if d == DIR_E | DIR_W | DIR_S => '╦',
+        d if d == DIR_E | DIR_W | DIR_N => '╩',
+        d if d == DIR_N | DIR_S | DIR_E => '╠',
+        d if d == DIR_N | DIR_S | DIR_W => '╣',
+        d if d == DIR_N | DIR_S | DIR_E | DIR_W => '╬',
+        d if d & (DIR_E | DIR_W) != 0 => '═',
+        d if d & (DIR_N | DIR_S) != 0 => '║',
+        _ => '·',
+    }
+}
+
 fn put_char(f: &mut Frame, canvas: Rect, x: i16, y: i16, ch: char, style: Style) {
     let ax = canvas.x as i16 + x;
     let ay = canvas.y as i16 + y;
@@ -865,6 +1003,7 @@ pub(crate) fn render_dag_readonly(
     area: Rect,
     blocks: &[crate::execution::pipeline::PipelineBlock],
     connections: &[crate::execution::pipeline::PipelineConnection],
+    loop_connections: &[crate::execution::pipeline::LoopConnection],
     block_style_fn: &dyn Fn(crate::execution::pipeline::BlockId) -> (Color, BorderType),
 ) {
     if area.width == 0 || area.height == 0 || blocks.is_empty() {
@@ -999,6 +1138,7 @@ pub(crate) fn render_dag_readonly(
                         color,
                         is_arrow: true,
                         arrow_char: arrow_ch,
+                        is_loop: false,
                     },
                 );
             }
@@ -1015,6 +1155,8 @@ pub(crate) fn render_dag_readonly(
             }
             let ch = if cell.is_arrow {
                 cell.arrow_char
+            } else if cell.is_loop {
+                dirs_to_double_char(cell.dirs)
             } else {
                 dirs_to_char(cell.dirs)
             };
@@ -1028,10 +1170,91 @@ pub(crate) fn render_dag_readonly(
             );
         }
     }
+
+    // ── Loop connection rendering (readonly) ──
+    {
+        let loop_conns_as_regular: Vec<crate::execution::pipeline::PipelineConnection> =
+            loop_connections.iter()
+                .map(|lc| crate::execution::pipeline::PipelineConnection { from: lc.from, to: lc.to })
+                .collect();
+        if !loop_conns_as_regular.is_empty() {
+            let loop_lanes = assign_lanes(&loop_conns_as_regular, blocks);
+            let loop_ports = assign_ports(&loop_conns_as_regular, blocks);
+
+            for (ci, lc) in loop_connections.iter().enumerate() {
+                let fb = blocks.iter().find(|b| b.id == lc.from);
+                let tb = blocks.iter().find(|b| b.id == lc.to);
+                let (Some(fb), Some(tb)) = (fb, tb) else { continue; };
+
+                let color = Color::Yellow;
+
+                let (exit_y_off, entry_y_off) = loop_ports[ci];
+                let segs = route_wire(
+                    fb.position, tb.position, &grid_occ,
+                    loop_lanes[ci], exit_y_off, entry_y_off,
+                );
+                let mut conn_map: ConnectionRaster = HashMap::new();
+                for seg in &segs {
+                    rasterize_seg(seg, color, &mut conn_map);
+                }
+                for cell in conn_map.values_mut() {
+                    cell.is_loop = true;
+                }
+                if let Some(last) = segs.last() {
+                    let arrow_ch = arrow_for_seg(last);
+                    if let Some(cell) = conn_map.get_mut(&(last.x2, last.y2)) {
+                        cell.is_arrow = true;
+                        cell.arrow_char = arrow_ch;
+                    } else {
+                        conn_map.insert(
+                            (last.x2, last.y2),
+                            WireCell { dirs: 0, color, is_arrow: true, arrow_char: arrow_ch, is_loop: true },
+                        );
+                    }
+                }
+
+                // Count label at midpoint of longest horizontal segment
+                let mut best_h: Option<(i16, i16, i16)> = None;
+                for seg in &segs {
+                    if seg.y1 == seg.y2 {
+                        let len = (seg.x2 - seg.x1).abs();
+                        if best_h.is_none() || len > (best_h.unwrap().2 - best_h.unwrap().1).abs() {
+                            let (lo, hi) = if seg.x1 <= seg.x2 { (seg.x1, seg.x2) } else { (seg.x2, seg.x1) };
+                            best_h = Some((seg.y1, lo, hi));
+                        }
+                    }
+                }
+                let label = format!("\u{00d7}{}", lc.count);
+
+                for (&(wx, wy), cell) in &conn_map {
+                    if pixel_hits_block(wx, wy, blocks) {
+                        continue;
+                    }
+                    let ch = if cell.is_arrow {
+                        cell.arrow_char
+                    } else {
+                        dirs_to_double_char(cell.dirs)
+                    };
+                    put_char(f, area, wx - ox, wy - oy, ch,
+                        Style::default().fg(cell.color));
+                }
+
+                if let Some((ly, lx_start, lx_end)) = best_h {
+                    let mid_x = (lx_start + lx_end) / 2;
+                    let label_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                    for (i, ch) in label.chars().enumerate() {
+                        put_char(f, area, mid_x + i as i16 - ox, ly - oy, ch, label_style);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
-    let help = if app.pipeline.pipeline_connecting_from.is_some() {
+    let help = if app.pipeline.pipeline_loop_connecting_from.is_some() {
+        "Arrows: navigate | Enter: loop | Esc: cancel"
+    } else if app.pipeline.pipeline_connecting_from.is_some() {
         "Arrows: navigate | Enter: connect | Esc: cancel"
     } else if app.pipeline.pipeline_removing_conn {
         "j/k: cycle | Enter: remove | Esc: cancel"
@@ -1041,7 +1264,7 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
     ) {
         "Tab: next field | F5: run | Esc: back"
     } else {
-        "Arrows/hjkl: select | Shift+Arrows/HJKL: move block | Ctrl+Arrows: scroll | a: add | d: delete | e: edit | c: connect | x: disconnect | s: sessions | Ctrl+S: save | Ctrl+L: load | F5: run | ?: help | Esc: back"
+        "Arrows/hjkl: select | Shift+Arrows/HJKL: move block | Ctrl+Arrows: scroll | a: add | d: delete | e: edit | c: connect | x: disconnect | o: loop | s: sessions | Ctrl+S: save | Ctrl+L: load | F5: run | ?: help | Esc: back"
     };
     let help_p = Paragraph::new(help)
         .style(Style::default().fg(Color::DarkGray))
@@ -1401,6 +1624,109 @@ fn draw_session_config_popup(f: &mut Frame, app: &App, area: Rect) {
         let row_y = inner.y + 1 + vi as u16; // +1 for header
         f.render_widget(Paragraph::new(row), Rect::new(inner.x, row_y, inner.width, 1));
     }
+}
+
+fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(50, 40, area);
+    f.render_widget(Clear, popup);
+
+    let (from_name, to_name) = if let Some((from_id, to_id)) = app.pipeline.pipeline_loop_edit_target {
+        let fname = app.pipeline.pipeline_def.blocks.iter()
+            .find(|b| b.id == from_id)
+            .map(|b| if b.name.is_empty() { format!("Block {}", b.id) } else { b.name.clone() })
+            .unwrap_or_else(|| format!("#{from_id}"));
+        let tname = app.pipeline.pipeline_def.blocks.iter()
+            .find(|b| b.id == to_id)
+            .map(|b| if b.name.is_empty() { format!("Block {}", b.id) } else { b.name.clone() })
+            .unwrap_or_else(|| format!("#{to_id}"));
+        (fname, tname)
+    } else {
+        ("?".into(), "?".into())
+    };
+
+    let title = format!(" Loop: {} \u{2192} {} ", from_name, to_name);
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.width < 10 || inner.height < 6 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Count
+            Constraint::Length(1), // spacer
+            Constraint::Min(4),    // Prompt
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    // Count field
+    let count_focus = app.pipeline.pipeline_loop_edit_field == PipelineLoopEditField::Count;
+    let count_style = if count_focus {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let count_line = Line::from(vec![
+        Span::styled("Count: ", Style::default().fg(Color::White)),
+        Span::styled("[", count_style),
+        Span::raw(&app.pipeline.pipeline_loop_edit_count_buf),
+        Span::styled("]", count_style),
+        Span::styled(" (1-99, returns from target to source)", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(count_line), chunks[0]);
+
+    // Prompt textarea
+    let prompt_focus = app.pipeline.pipeline_loop_edit_field == PipelineLoopEditField::Prompt;
+    let prompt_style = if prompt_focus {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let prompt_block = Block::default()
+        .title(" Loop Prompt ")
+        .borders(Borders::ALL)
+        .border_style(prompt_style);
+    let prompt_inner = prompt_block.inner(chunks[2]);
+    f.render_widget(prompt_block, chunks[2]);
+
+    let (prompt_scroll, prompt_cursor_col, prompt_cursor_row) = if prompt_focus {
+        prompt_cursor_layout(
+            &app.pipeline.pipeline_loop_edit_prompt_buf,
+            app.pipeline.pipeline_loop_edit_prompt_cursor,
+            prompt_inner.width as usize,
+            prompt_inner.height as usize,
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    let edit_wrapped = char_wrap_text(
+        &app.pipeline.pipeline_loop_edit_prompt_buf,
+        prompt_inner.width as usize,
+    );
+    let prompt_p = Paragraph::new(edit_wrapped.as_str()).scroll((prompt_scroll, 0));
+    f.render_widget(prompt_p, prompt_inner);
+
+    if prompt_focus && prompt_inner.width > 0 && prompt_inner.height > 0 {
+        let visible_row = prompt_cursor_row.saturating_sub(prompt_scroll as usize);
+        let cx = prompt_inner.x
+            + (prompt_cursor_col.min(prompt_inner.width.saturating_sub(1) as usize) as u16);
+        let cy = prompt_inner.y
+            + (visible_row.min(prompt_inner.height.saturating_sub(1) as usize) as u16);
+        f.set_cursor_position((cx, cy));
+    }
+
+    // Hint
+    let hint = Paragraph::new("  Tab: switch field  Enter: save (from Count) / newline (from Prompt)  Esc: cancel")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(hint, chunks[3]);
 }
 
 fn draw_error_modal(f: &mut Frame, message: &str) {

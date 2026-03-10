@@ -478,6 +478,7 @@ impl OutputManager {
         &self,
         block_count: usize,
         connection_count: usize,
+        loop_connection_count: usize,
         iterations: u32,
         total_runtime_tasks: usize,
         pipeline_source: Option<&str>,
@@ -488,6 +489,10 @@ impl OutputManager {
         root.insert(
             "connections".into(),
             Value::Integer(connection_count as i64),
+        );
+        root.insert(
+            "loop_connections".into(),
+            Value::Integer(loop_connection_count as i64),
         );
         root.insert("iterations".into(), Value::Integer(iterations as i64));
         root.insert(
@@ -853,7 +858,7 @@ mod tests {
     fn read_agent_session_info_rejects_pipeline_shape_without_agents() {
         let base = tempdir().expect("tempdir");
         let mgr = OutputManager::new(base.path(), Some("pipeline")).expect("new");
-        mgr.write_pipeline_session_info(1, 0, 1, 1, None)
+        mgr.write_pipeline_session_info(1, 0, 0, 1, 1, None)
             .expect("write");
 
         let err = OutputManager::read_agent_session_info(mgr.run_dir()).expect_err("should fail");

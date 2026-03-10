@@ -35,7 +35,7 @@ Each agent can run in API mode or CLI mode (`use_cli = true`). Mix and match fre
 
 - **Terminal UI** — select agents, mode, prompt, iterations, run count, and concurrency from an interactive TUI
 - **Named agents** — define multiple agents per provider with independent configs
-- **Pipeline builder** — visual DAG editor for wiring arbitrary agent blocks with dependency-driven execution and independent per-connection routing
+- **Pipeline builder** — visual DAG editor for wiring arbitrary agent blocks with dependency-driven execution, independent per-connection routing, and loop connections for iterative refinement between blocks
 - **Multiple runs** — launch N independent copies of the same setup in parallel with bounded concurrency
 - **Resume runs** — pick up where you left off in relay or swarm sessions
 - **Forward Prompt** — relay mode option to include the original prompt in every handoff
@@ -245,6 +245,7 @@ Fields vary by mode for options, but every prompt flow includes Prompt, Session 
 | `e` | Edit selected block (name, agent, prompt, session ID, replicas) |
 | `c` | Enter connect mode — select a second block to create a connection |
 | `x` | Enter remove-connection mode — pick a connection to delete |
+| `o` | Create loop connection — select target block, set count and prompt; press on existing loop to edit |
 | `s` | Open session configuration popup — toggle per-session history persistence |
 | `Arrow keys` / `h j k l` | Navigate/select blocks spatially without moving |
 | `Shift+Arrow keys` / `Shift+H J K L` | Move selected block (swap with occupied target cell, otherwise move) |
@@ -326,8 +327,22 @@ output_dir/
       Worker_b3_Claude_r1_iter1.md         # Block "Worker" (id 3), replicas=3, replica 1
       Worker_b3_Claude_r2_iter1.md         # replica 2
       Worker_b3_Claude_r3_iter1.md         # replica 3
+      Analyzer_b1_Claude_iter1_loop1.md   # loop pass 1 (from loop connection)
+      Analyzer_b1_Claude_iter1_loop2.md   # loop pass 2
       _errors.log
 ```
+
+Loop connections create iterative feedback loops between two blocks. In saved pipeline TOML files they appear as:
+
+```toml
+[[loop_connections]]
+from = 2
+to = 1
+count = 3
+prompt = "Refine based on feedback"
+```
+
+`count` is the number of returns from `to` back to `from`. Each block in the loop runs `count + 1` times total. Loop wires are drawn as double-line in yellow on the canvas.
 
 Runs are grouped by date: `YYYY-MM-DD/<session_name>`. When no session name is provided, a random two-word name (`adjective-noun`) is generated. Duplicate user-defined session names within the same date are rejected.
 

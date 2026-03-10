@@ -32,13 +32,7 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
     }
     app.pipeline.pipeline_def.iterations = iterations;
 
-    if pipeline_mod::topological_layers(&app.pipeline.pipeline_def).is_err() {
-        app.error_modal = Some("Pipeline contains a cycle".into());
-        return;
-    }
-
-    // Replica validation
-    if let Err(e) = pipeline_mod::validate_replicas(&app.pipeline.pipeline_def) {
+    if let Err(e) = pipeline_mod::validate_pipeline(&app.pipeline.pipeline_def) {
         app.error_modal = Some(e.to_string());
         return;
     }
@@ -126,6 +120,13 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
         })
         .collect();
 
+    let loop_extra: usize = app.pipeline.pipeline_def.loop_connections.iter().map(|lc| {
+        let fr = app.pipeline.pipeline_def.blocks.iter().find(|b| b.id == lc.from).map(|b| b.replicas).unwrap_or(1);
+        let tr = app.pipeline.pipeline_def.blocks.iter().find(|b| b.id == lc.to).map(|b| b.replicas).unwrap_or(1);
+        lc.count as usize * (fr as usize + tr as usize)
+    }).sum();
+    app.running.expected_total_steps = (rt.entries.len() + loop_extra) * iterations as usize;
+
     // HTTP client
     let timeout_secs = app.effective_http_timeout_seconds().max(1);
     let client = match reqwest::Client::builder()
@@ -173,8 +174,9 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
     if let Err(e) = output.write_pipeline_session_info(
         app.pipeline.pipeline_def.blocks.len(),
         app.pipeline.pipeline_def.connections.len(),
+        app.pipeline.pipeline_def.loop_connections.len(),
         iterations,
-        rt.entries.len(),
+        rt.entries.len() + loop_extra,
         app.pipeline
             .pipeline_save_path
             .as_ref()
@@ -252,10 +254,34 @@ pub(super) fn resolve_selected_agent_configs(
 
 pub(super) fn pipeline_step_labels(def: &pipeline_mod::PipelineDefinition) -> Vec<String> {
     let rt = pipeline_mod::build_runtime_table(def);
-    rt.entries
-        .iter()
-        .map(|info| format_block_step_label(info.runtime_id, &info.display_label, &info.agent))
-        .collect()
+    // Build set of block IDs participating in loops and their total passes
+    let mut loop_passes: std::collections::HashMap<pipeline_mod::BlockId, u32> =
+        std::collections::HashMap::new();
+    for lc in &def.loop_connections {
+        loop_passes.insert(lc.from, lc.count + 1);
+        loop_passes.insert(lc.to, lc.count + 1);
+    }
+    let mut labels = Vec::new();
+    for info in &rt.entries {
+        let total_passes = loop_passes.get(&info.source_block_id).copied().unwrap_or(1);
+        if total_passes > 1 {
+            for pass in 0..total_passes {
+                labels.push(format_block_step_label_with_pass(
+                    info.runtime_id,
+                    &info.display_label,
+                    &info.agent,
+                    pass,
+                ));
+            }
+        } else {
+            labels.push(format_block_step_label(
+                info.runtime_id,
+                &info.display_label,
+                &info.agent,
+            ));
+        }
+    }
+    labels
 }
 
 pub(super) struct MultiExecutionParams {
@@ -594,11 +620,17 @@ pub(super) fn start_multi_pipeline_execution(
                         );
                     }
                     let run_rt = crate::execution::pipeline::build_runtime_table(&pipeline_def);
+                    let run_loop_extra: usize = pipeline_def.loop_connections.iter().map(|lc| {
+                        let fr = pipeline_def.blocks.iter().find(|b| b.id == lc.from).map(|b| b.replicas).unwrap_or(1);
+                        let tr = pipeline_def.blocks.iter().find(|b| b.id == lc.to).map(|b| b.replicas).unwrap_or(1);
+                        lc.count as usize * (fr as usize + tr as usize)
+                    }).sum();
                     if let Err(e) = output.write_pipeline_session_info(
                         pipeline_def.blocks.len(),
                         pipeline_def.connections.len(),
+                        pipeline_def.loop_connections.len(),
                         iterations,
-                        run_rt.entries.len(),
+                        run_rt.entries.len() + run_loop_extra,
                         pipeline_source.as_deref(),
                     ) {
                         let _ = output.append_error(&format!("Failed to write session info: {e}"));
@@ -1176,6 +1208,22 @@ pub(super) fn handle_batch_progress(app: &mut App, event: BatchProgressEvent) {
                         state.push_log("cancelled".into());
                     }
                 }
+                // Mark any remaining Queued/Pending steps as terminal so
+                // abandoned loop passes don't look perpetually unfinished.
+                // Use state.status (which preserves Failed from BlockError
+                // events) rather than outcome (which may be Done even when
+                // blocks failed).
+                let terminal_status = match state.status {
+                    RunStatus::Done => RunStepStatus::Done,
+                    RunStatus::Failed | RunStatus::Cancelled => RunStepStatus::Error,
+                    // Queued/Running shouldn't happen here, but be safe.
+                    RunStatus::Queued | RunStatus::Running => RunStepStatus::Done,
+                };
+                for step in &mut state.steps {
+                    if matches!(step.status, RunStepStatus::Queued | RunStepStatus::Pending) {
+                        step.status = terminal_status;
+                    }
+                }
             }
         }
         BatchProgressEvent::AllRunsDone => {
@@ -1244,9 +1292,10 @@ pub(super) fn update_multi_run_state(app: &mut App, run_id: u32, event: &Progres
             block_id,
             agent_name,
             label,
+            loop_pass,
             ..
         } => {
-            let step = format_block_step_label(*block_id, label, agent_name);
+            let step = resolve_block_step(state, *block_id, label, agent_name, *loop_pass);
             state.status = RunStatus::Running;
             update_step_status(state, &step, RunStepStatus::Running);
             state.push_log(format!("{step}: started"));
@@ -1254,19 +1303,21 @@ pub(super) fn update_multi_run_state(app: &mut App, run_id: u32, event: &Progres
         ProgressEvent::BlockLog {
             block_id,
             agent_name,
+            loop_pass,
             message,
             ..
         } => {
-            let step = format_block_step_label(*block_id, "", agent_name);
+            let step = resolve_block_step(state, *block_id, "", agent_name, *loop_pass);
             state.push_log(format!("{step}: {message}"));
         }
         ProgressEvent::BlockFinished {
             block_id,
             agent_name,
             label,
+            loop_pass,
             ..
         } => {
-            let step = format_block_step_label(*block_id, label, agent_name);
+            let step = resolve_block_step(state, *block_id, label, agent_name, *loop_pass);
             update_step_status(state, &step, RunStepStatus::Done);
             state.push_log(format!("{step}: finished"));
         }
@@ -1274,6 +1325,7 @@ pub(super) fn update_multi_run_state(app: &mut App, run_id: u32, event: &Progres
             block_id,
             agent_name,
             label,
+            loop_pass,
             error,
             ..
         }
@@ -1281,10 +1333,11 @@ pub(super) fn update_multi_run_state(app: &mut App, run_id: u32, event: &Progres
             block_id,
             agent_name,
             label,
+            loop_pass,
             reason: error,
             ..
         } => {
-            let step = format_block_step_label(*block_id, label, agent_name);
+            let step = resolve_block_step(state, *block_id, label, agent_name, *loop_pass);
             state.status = RunStatus::Failed;
             state.error = Some(error.clone());
             update_step_status(state, &step, RunStepStatus::Error);
@@ -1307,5 +1360,32 @@ pub(super) fn format_block_step_label(block_id: u32, label: &str, agent_name: &s
         format!("Block {block_id} ({agent_name})")
     } else {
         format!("{label} ({agent_name})")
+    }
+}
+
+fn format_block_step_label_with_pass(
+    block_id: u32,
+    label: &str,
+    agent_name: &str,
+    pass: u32,
+) -> String {
+    let base = format_block_step_label(block_id, label, agent_name);
+    format!("{base} [pass {pass}]")
+}
+
+/// Resolve the step label for a block event, preferring the pass-specific
+/// label when available (loop blocks) and falling back to the base label.
+fn resolve_block_step(
+    state: &crate::app::RunState,
+    block_id: u32,
+    label: &str,
+    agent_name: &str,
+    loop_pass: u32,
+) -> String {
+    let pass_label = format_block_step_label_with_pass(block_id, label, agent_name, loop_pass);
+    if state.steps.iter().any(|s| s.label == pass_label) {
+        pass_label
+    } else {
+        format_block_step_label(block_id, label, agent_name)
     }
 }

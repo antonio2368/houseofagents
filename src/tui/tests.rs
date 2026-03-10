@@ -1795,6 +1795,7 @@ fn pipeline_step_labels_expands_replicas() {
         ],
         connections: vec![],
         session_configs: vec![],
+        loop_connections: vec![],
     };
     let labels = pipeline_step_labels(&def);
     assert_eq!(labels.len(), 4); // 3 replicas + 1
@@ -1821,8 +1822,302 @@ fn pipeline_step_labels_unnamed_blocks_no_agent_duplication() {
         }],
         connections: vec![],
         session_configs: vec![],
+        loop_connections: vec![],
     };
     let labels = pipeline_step_labels(&def);
     assert_eq!(labels.len(), 1);
     assert_eq!(labels[0], "Block 5 (Claude)");
+}
+
+// ---------------------------------------------------------------------------
+// Loop connection tests
+// ---------------------------------------------------------------------------
+
+fn pipeline_app_with_two_blocks() -> App {
+    use crate::execution::pipeline::PipelineBlock;
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+    app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+        id: 1,
+        name: "A".into(),
+        agent: "Claude".into(),
+        prompt: String::new(),
+        session_id: None,
+        position: (0, 0),
+        replicas: 1,
+    });
+    app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+        id: 2,
+        name: "B".into(),
+        agent: "GPT".into(),
+        prompt: String::new(),
+        session_id: None,
+        position: (1, 0),
+        replicas: 1,
+    });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    app.pipeline.pipeline_next_id = 3;
+    app
+}
+
+#[test]
+fn test_o_enters_loop_connect_mode() {
+    let mut app = pipeline_app_with_two_blocks();
+    assert!(app.pipeline.pipeline_loop_connecting_from.is_none());
+    handle_key(&mut app, key(KeyCode::Char('o')));
+    assert_eq!(app.pipeline.pipeline_loop_connecting_from, Some(1));
+}
+
+#[test]
+fn test_o_opens_edit_on_existing_loop() {
+    use crate::execution::pipeline::LoopConnection;
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 3,
+            prompt: "review again".into(),
+        });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('o')));
+    assert!(app.pipeline.pipeline_show_loop_edit);
+    assert_eq!(app.pipeline.pipeline_loop_edit_count_buf, "3");
+    assert_eq!(app.pipeline.pipeline_loop_edit_prompt_buf, "review again");
+    assert_eq!(
+        app.pipeline.pipeline_loop_edit_target,
+        Some((1, 2))
+    );
+}
+
+#[test]
+fn test_loop_connect_rejects_self_edge() {
+    let mut app = pipeline_app_with_two_blocks();
+    // Enter loop connect mode from block 1
+    app.pipeline.pipeline_loop_connecting_from = Some(1);
+    // Cursor is already on block 1
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.error_modal.is_some());
+    assert!(app.pipeline.pipeline_def.loop_connections.is_empty());
+}
+
+#[test]
+fn test_loop_connect_creates_loop() {
+    let mut app = pipeline_app_with_two_blocks();
+    // Enter loop connect mode from block 1
+    app.pipeline.pipeline_loop_connecting_from = Some(1);
+    // Navigate cursor to block 2
+    app.pipeline.pipeline_block_cursor = Some(2);
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(app.pipeline.pipeline_def.loop_connections.len(), 1);
+    let lc = &app.pipeline.pipeline_def.loop_connections[0];
+    assert_eq!(lc.from, 1);
+    assert_eq!(lc.to, 2);
+    assert_eq!(lc.count, 1);
+    assert!(app.pipeline.pipeline_loop_connecting_from.is_none());
+}
+
+#[test]
+fn test_delete_block_cleans_loops() {
+    use crate::execution::pipeline::LoopConnection;
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 2,
+            prompt: String::new(),
+        });
+    // Delete block 1
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(app.pipeline.pipeline_def.loop_connections.is_empty());
+}
+
+#[test]
+fn test_x_includes_loop_connections() {
+    use crate::execution::pipeline::LoopConnection;
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 1,
+            prompt: String::new(),
+        });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('x')));
+    assert!(app.pipeline.pipeline_removing_conn);
+}
+
+#[test]
+fn test_regular_c_rejects_when_loop_exists() {
+    use crate::execution::pipeline::LoopConnection;
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 1,
+            prompt: String::new(),
+        });
+    // Enter regular connect mode from block 1
+    app.pipeline.pipeline_connecting_from = Some(1);
+    app.pipeline.pipeline_block_cursor = Some(2);
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.error_modal.is_some());
+    assert!(app.pipeline.pipeline_def.connections.is_empty());
+}
+
+#[test]
+fn test_loop_edit_saves_on_enter() {
+    use crate::execution::pipeline::LoopConnection;
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 1,
+            prompt: String::new(),
+        });
+    // Open loop edit popup via 'o' on block 1
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('o')));
+    assert!(app.pipeline.pipeline_show_loop_edit);
+    // Modify count buffer
+    app.pipeline.pipeline_loop_edit_count_buf = "5".to_string();
+    // Press Enter on Count field to save
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(!app.pipeline.pipeline_show_loop_edit);
+    assert_eq!(app.pipeline.pipeline_def.loop_connections[0].count, 5);
+}
+
+#[test]
+fn test_loop_edit_esc_discards() {
+    use crate::execution::pipeline::LoopConnection;
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 3,
+            prompt: String::new(),
+        });
+    // Open loop edit popup via 'o' on block 1
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('o')));
+    assert!(app.pipeline.pipeline_show_loop_edit);
+    // Modify count buffer but discard via Esc
+    app.pipeline.pipeline_loop_edit_count_buf = "99".to_string();
+    handle_key(&mut app, key(KeyCode::Esc));
+    assert!(!app.pipeline.pipeline_show_loop_edit);
+    // Original count should be unchanged
+    assert_eq!(app.pipeline.pipeline_def.loop_connections[0].count, 3);
+}
+
+#[test]
+fn terminal_sweep_uses_effective_status_not_outcome() {
+    // Regression: when run_pipeline returns Ok (RunOutcome::Done) but
+    // BlockError events already marked state.status = Failed, leftover
+    // Queued steps must become Error, not Done.
+    use crate::app::{RunState, RunStatus, RunStepStatus};
+    use crate::execution::{BatchProgressEvent, RunOutcome};
+
+    let mut app = test_app();
+    app.running.is_running = true;
+
+    let labels: Vec<String> = vec![
+        "A (Claude)".into(),
+        "B (GPT)".into(),
+        "B [pass 1] (GPT)".into(),
+    ];
+    let mut run = RunState::new(1, &labels);
+    // Simulate: A finished OK, B finished with error (setting run status),
+    // B [pass 1] never ran (still Queued).
+    run.status = RunStatus::Failed;
+    run.steps[0].status = RunStepStatus::Done;
+    run.steps[1].status = RunStepStatus::Error;
+    // steps[2] stays Queued — the abandoned loop pass
+
+    app.running.multi_run_states.push(run);
+
+    // Deliver RunFinished with outcome=Done (as run_pipeline returns Ok)
+    super::execution::handle_batch_progress(
+        &mut app,
+        BatchProgressEvent::RunFinished {
+            run_id: 1,
+            outcome: RunOutcome::Done,
+            error: None,
+        },
+    );
+
+    let steps = &app.running.multi_run_states[0].steps;
+    assert_eq!(steps[0].status, RunStepStatus::Done, "A completed OK");
+    assert_eq!(steps[1].status, RunStepStatus::Error, "B failed");
+    assert_eq!(
+        steps[2].status,
+        RunStepStatus::Error,
+        "abandoned loop pass should be Error, not Done, because run has failures"
+    );
+}
+
+#[test]
+fn terminal_sweep_cancelled_marks_leftover_as_error() {
+    // When a run is cancelled, all leftover Queued/Pending steps must become
+    // Error (not Done), regardless of any earlier successful steps.
+    use crate::app::{RunState, RunStatus, RunStepStatus};
+    use crate::execution::{BatchProgressEvent, RunOutcome};
+
+    let mut app = test_app();
+    app.running.is_running = true;
+
+    let labels: Vec<String> = vec![
+        "A (Claude)".into(),
+        "B (GPT)".into(),
+        "C (Claude)".into(),
+    ];
+    let mut run = RunState::new(1, &labels);
+    // A completed, B was in-flight, C never started.
+    run.status = RunStatus::Running;
+    run.steps[0].status = RunStepStatus::Done;
+    run.steps[1].status = RunStepStatus::Pending;
+    // steps[2] stays Queued
+
+    app.running.multi_run_states.push(run);
+
+    super::execution::handle_batch_progress(
+        &mut app,
+        BatchProgressEvent::RunFinished {
+            run_id: 1,
+            outcome: RunOutcome::Cancelled,
+            error: None,
+        },
+    );
+
+    let steps = &app.running.multi_run_states[0].steps;
+    assert_eq!(steps[0].status, RunStepStatus::Done, "A completed before cancel");
+    assert_eq!(
+        steps[1].status,
+        RunStepStatus::Error,
+        "in-flight B should become Error on cancel"
+    );
+    assert_eq!(
+        steps[2].status,
+        RunStepStatus::Error,
+        "queued C should become Error on cancel"
+    );
 }

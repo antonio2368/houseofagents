@@ -11,7 +11,8 @@ mod tests;
 
 use crate::app::{
     App, BatchRunGroup, ConsolidationPhase, ConsolidationTarget, EditField, EditPopupSection,
-    HomeSection, PipelineDialogMode, PipelineEditField, PipelineFocus, PromptFocus, RunState,
+    HomeSection, PipelineDialogMode, PipelineEditField, PipelineFocus, PipelineLoopEditField,
+    PromptFocus, RunState,
     RunStatus, RunStepStatus, Screen,
 };
 use crate::config::{AgentConfig, AppConfig, ProviderConfig};

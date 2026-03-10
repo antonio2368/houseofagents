@@ -305,6 +305,19 @@ pub fn pipeline_help_lines(tab: usize) -> &'static [Line<'static>] {
                 Line::from("  Wires are drawn as orthogonal lines with directional"),
                 Line::from("  arrows showing data flow."),
                 Line::from(""),
+                Line::from(vec![
+                    Span::styled("  o", k),
+                    Span::raw(": Create loop connection (select target, Enter)"),
+                ]),
+                Line::from("    Press o on a block already in a loop to edit"),
+                Line::from("    count and prompt"),
+                Line::from(""),
+                Line::from("  Loop wires are drawn as double-line (\u{2550}\u{2551}) in yellow"),
+                Line::from("  with \u{00d7}N count label. Delete with x (same as regular)."),
+                Line::from(""),
+                Line::from("  Loop count = returns from target to source."),
+                Line::from("  Each block runs count+1 times total."),
+                Line::from(""),
             ],
             // Tab 4: Sessions
             vec![

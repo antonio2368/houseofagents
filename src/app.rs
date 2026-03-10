@@ -199,7 +199,8 @@ pub(crate) struct RunningState {
     last_error: Option<(String, String)>,
     completed_steps: usize,
     completed_agent_steps: HashSet<(String, u32)>,
-    completed_block_steps: HashSet<(u32, u32)>,
+    completed_block_steps: HashSet<(u32, u32, u32)>,
+    pub(crate) expected_total_steps: usize,
     active_agents: HashSet<String>,
     active_blocks: Vec<(u32, String)>,
     pub(crate) is_running: bool,
@@ -307,6 +308,13 @@ pub(crate) struct PipelineState {
     pub(crate) pipeline_save_path: Option<PathBuf>,
     pub(crate) pipeline_show_session_config: bool,
     pub(crate) pipeline_session_config_cursor: usize,
+    pub(crate) pipeline_loop_connecting_from: Option<BlockId>,
+    pub(crate) pipeline_show_loop_edit: bool,
+    pub(crate) pipeline_loop_edit_field: PipelineLoopEditField,
+    pub(crate) pipeline_loop_edit_target: Option<(BlockId, BlockId)>,
+    pub(crate) pipeline_loop_edit_count_buf: String,
+    pub(crate) pipeline_loop_edit_prompt_buf: String,
+    pub(crate) pipeline_loop_edit_prompt_cursor: usize,
 }
 
 pub(crate) struct PendingSingleExecution {
@@ -449,6 +457,12 @@ pub enum PipelineEditField {
     Prompt,
     SessionId,
     Replicas,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipelineLoopEditField {
+    Count,
+    Prompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -755,6 +769,7 @@ impl RunningState {
             completed_steps: 0,
             completed_agent_steps: HashSet::new(),
             completed_block_steps: HashSet::new(),
+            expected_total_steps: 0,
             active_agents: HashSet::new(),
             active_blocks: Vec::new(),
             is_running: false,
@@ -974,10 +989,11 @@ impl RunningState {
             ProgressEvent::BlockFinished {
                 block_id,
                 iteration,
+                loop_pass,
                 ..
             } => {
                 self.remove_active_block(*block_id);
-                if self.completed_block_steps.insert((*block_id, *iteration)) {
+                if self.completed_block_steps.insert((*block_id, *iteration, *loop_pass)) {
                     self.completed_steps += 1;
                 }
                 if let Some(t) = self.block_timers.get_mut(block_id) {
@@ -991,13 +1007,14 @@ impl RunningState {
                 block_id,
                 agent_name,
                 iteration,
+                loop_pass,
                 error,
                 details,
                 label,
                 ..
             } => {
                 self.remove_active_block(*block_id);
-                if self.completed_block_steps.insert((*block_id, *iteration)) {
+                if self.completed_block_steps.insert((*block_id, *iteration, *loop_pass)) {
                     self.completed_steps += 1;
                 }
                 let body = details.as_deref().unwrap_or(error);
@@ -1017,11 +1034,12 @@ impl RunningState {
             ProgressEvent::BlockSkipped {
                 block_id,
                 iteration,
+                loop_pass,
                 reason,
                 ..
             } => {
                 self.remove_active_block(*block_id);
-                if self.completed_block_steps.insert((*block_id, *iteration)) {
+                if self.completed_block_steps.insert((*block_id, *iteration, *loop_pass)) {
                     self.completed_steps += 1;
                 }
                 if let Some(t) = self.block_timers.get_mut(block_id) {
@@ -1170,6 +1188,13 @@ impl PipelineState {
             pipeline_save_path: None,
             pipeline_show_session_config: false,
             pipeline_session_config_cursor: 0,
+            pipeline_loop_connecting_from: None,
+            pipeline_show_loop_edit: false,
+            pipeline_loop_edit_field: PipelineLoopEditField::Count,
+            pipeline_loop_edit_target: None,
+            pipeline_loop_edit_count_buf: String::new(),
+            pipeline_loop_edit_prompt_buf: String::new(),
+            pipeline_loop_edit_prompt_cursor: 0,
         }
     }
 }
@@ -1671,6 +1696,7 @@ mod tests {
             agent_name: "Claude".into(),
             label: "Writer (r1)".into(),
             iteration: 2,
+            loop_pass: 0,
             error: "timeout".into(),
             details: Some("provider timed out".into()),
         });
@@ -1692,6 +1718,7 @@ mod tests {
             agent_name: "Claude".into(),
             label: "Block 1".into(),
             iteration: 1,
+            loop_pass: 0,
             error: "fail".into(),
             details: None,
         });

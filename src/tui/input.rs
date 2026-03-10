@@ -418,6 +418,14 @@ pub(super) fn handle_pipeline_paste(app: &mut App, text: &str) {
                 app.pipeline.pipeline_edit_replicas_buf.push_str(&clean);
             }
         }
+    } else if app.pipeline.pipeline_show_loop_edit {
+        if app.pipeline.pipeline_loop_edit_field == PipelineLoopEditField::Prompt {
+            insert_text(
+                &mut app.pipeline.pipeline_loop_edit_prompt_buf,
+                &mut app.pipeline.pipeline_loop_edit_prompt_cursor,
+                text,
+            );
+        }
     } else if let Some(PipelineDialogMode::Save) = app.pipeline.pipeline_file_dialog {
         app.pipeline.pipeline_file_input.push_str(text);
     } else {
@@ -484,8 +492,16 @@ pub(super) fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
         handle_pipeline_session_config_key(app, key);
         return;
     }
+    if app.pipeline.pipeline_show_loop_edit {
+        handle_pipeline_loop_edit_key(app, key);
+        return;
+    }
     if app.pipeline.pipeline_removing_conn {
         handle_pipeline_remove_conn_key(app, key);
+        return;
+    }
+    if app.pipeline.pipeline_loop_connecting_from.is_some() {
+        handle_pipeline_loop_connect_key(app, key);
         return;
     }
 
@@ -515,6 +531,10 @@ pub(super) fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
                     } else if pipeline_mod::would_create_cycle(&app.pipeline.pipeline_def, from, to)
                     {
                         app.error_modal = Some("Would create a cycle".into());
+                    } else if app.pipeline.pipeline_def.loop_connections.iter()
+                        .any(|lc| (lc.from == from && lc.to == to) || (lc.from == to && lc.to == from))
+                    {
+                        app.error_modal = Some("A loop connection exists between these blocks".into());
                     } else {
                         app.pipeline
                             .pipeline_def
@@ -762,6 +782,10 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     .pipeline_def
                     .connections
                     .retain(|c| c.from != sel && c.to != sel);
+                app.pipeline
+                    .pipeline_def
+                    .loop_connections
+                    .retain(|lc| lc.from != sel && lc.to != sel);
                 app.pipeline.pipeline_def.normalize_session_configs();
                 if app.pipeline.pipeline_def.blocks.is_empty() {
                     app.pipeline.pipeline_block_cursor = None;
@@ -810,18 +834,47 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('x') => {
             if let Some(sel) = app.pipeline.pipeline_block_cursor {
-                let conn_count = app
+                let regular_count = app
                     .pipeline
                     .pipeline_def
                     .connections
                     .iter()
                     .filter(|c| c.from == sel || c.to == sel)
                     .count();
-                if conn_count == 0 {
+                let loop_count = app
+                    .pipeline
+                    .pipeline_def
+                    .loop_connections
+                    .iter()
+                    .filter(|lc| lc.from == sel || lc.to == sel)
+                    .count();
+                if regular_count + loop_count == 0 {
                     app.error_modal = Some("No connections on this block".into());
                 } else {
                     app.pipeline.pipeline_removing_conn = true;
                     app.pipeline.pipeline_conn_cursor = 0;
+                }
+            }
+        }
+        KeyCode::Char('o') => {
+            if let Some(sel) = app.pipeline.pipeline_block_cursor {
+                if let Some(lc) = app
+                    .pipeline
+                    .pipeline_def
+                    .loop_connections
+                    .iter()
+                    .find(|lc| lc.from == sel || lc.to == sel)
+                {
+                    // Open loop edit popup
+                    app.pipeline.pipeline_show_loop_edit = true;
+                    app.pipeline.pipeline_loop_edit_field = PipelineLoopEditField::Count;
+                    app.pipeline.pipeline_loop_edit_target = Some((lc.from, lc.to));
+                    app.pipeline.pipeline_loop_edit_count_buf = lc.count.to_string();
+                    app.pipeline.pipeline_loop_edit_prompt_buf = lc.prompt.clone();
+                    app.pipeline.pipeline_loop_edit_prompt_cursor = lc.prompt.len();
+                } else {
+                    // Enter loop connect mode
+                    app.pipeline.pipeline_loop_connecting_from = Some(sel);
                 }
             }
         }
@@ -1312,15 +1365,22 @@ pub(super) fn handle_pipeline_dialog_key(app: &mut App, key: KeyEvent) {
 
 pub(super) fn handle_pipeline_remove_conn_key(app: &mut App, key: KeyEvent) {
     let sel = app.pipeline.pipeline_block_cursor.unwrap_or(0);
-    let conns: Vec<usize> = app
-        .pipeline
-        .pipeline_def
-        .connections
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.from == sel || c.to == sel)
-        .map(|(i, _)| i)
-        .collect();
+
+    enum ConnRef {
+        Regular(usize),
+        Loop(usize),
+    }
+    let mut refs: Vec<ConnRef> = Vec::new();
+    for (i, c) in app.pipeline.pipeline_def.connections.iter().enumerate() {
+        if c.from == sel || c.to == sel {
+            refs.push(ConnRef::Regular(i));
+        }
+    }
+    for (i, lc) in app.pipeline.pipeline_def.loop_connections.iter().enumerate() {
+        if lc.from == sel || lc.to == sel {
+            refs.push(ConnRef::Loop(i));
+        }
+    }
 
     match key.code {
         KeyCode::Esc => {
@@ -1330,17 +1390,185 @@ pub(super) fn handle_pipeline_remove_conn_key(app: &mut App, key: KeyEvent) {
             app.pipeline.pipeline_conn_cursor = app.pipeline.pipeline_conn_cursor.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.pipeline.pipeline_conn_cursor + 1 < conns.len() {
+            if app.pipeline.pipeline_conn_cursor + 1 < refs.len() {
                 app.pipeline.pipeline_conn_cursor += 1;
             }
         }
         KeyCode::Enter => {
-            if let Some(&conn_idx) = conns.get(app.pipeline.pipeline_conn_cursor) {
-                app.pipeline.pipeline_def.connections.remove(conn_idx);
+            if let Some(conn_ref) = refs.get(app.pipeline.pipeline_conn_cursor) {
+                match conn_ref {
+                    ConnRef::Regular(idx) => {
+                        app.pipeline.pipeline_def.connections.remove(*idx);
+                    }
+                    ConnRef::Loop(idx) => {
+                        app.pipeline.pipeline_def.loop_connections.remove(*idx);
+                    }
+                }
             }
             app.pipeline.pipeline_removing_conn = false;
         }
         _ => {}
+    }
+}
+
+fn handle_pipeline_loop_connect_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.pipeline.pipeline_loop_connecting_from = None;
+        }
+        KeyCode::Enter => {
+            if let (Some(from), Some(to)) = (
+                app.pipeline.pipeline_loop_connecting_from,
+                app.pipeline.pipeline_block_cursor,
+            ) {
+                if from == to {
+                    app.error_modal = Some("Cannot loop a block to itself".into());
+                } else if app
+                    .pipeline
+                    .pipeline_def
+                    .loop_connections
+                    .iter()
+                    .any(|lc| {
+                        lc.from == from || lc.to == from || lc.from == to || lc.to == to
+                    })
+                {
+                    app.error_modal = Some("Block already in a loop connection".into());
+                } else if app
+                    .pipeline
+                    .pipeline_def
+                    .connections
+                    .iter()
+                    .any(|c| {
+                        (c.from == from && c.to == to) || (c.from == to && c.to == from)
+                    })
+                {
+                    app.error_modal =
+                        Some("A regular connection exists between these blocks".into());
+                } else if pipeline_mod::would_create_cycle(
+                    &app.pipeline.pipeline_def,
+                    from,
+                    to,
+                ) {
+                    app.error_modal = Some("Would create a cycle".into());
+                } else {
+                    app.pipeline
+                        .pipeline_def
+                        .loop_connections
+                        .push(pipeline_mod::LoopConnection {
+                            from,
+                            to,
+                            count: 1,
+                            prompt: String::new(),
+                        });
+                    app.pipeline.pipeline_loop_connecting_from = None;
+                }
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => pipeline_spatial_nav(app, NavAxis::Vertical, true),
+        KeyCode::Down | KeyCode::Char('j') => {
+            pipeline_spatial_nav(app, NavAxis::Vertical, false)
+        }
+        KeyCode::Left | KeyCode::Char('h') => {
+            pipeline_spatial_nav(app, NavAxis::Horizontal, true)
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            pipeline_spatial_nav(app, NavAxis::Horizontal, false)
+        }
+        _ => {}
+    }
+}
+
+fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.pipeline.pipeline_show_loop_edit = false;
+        }
+        KeyCode::Tab => {
+            app.pipeline.pipeline_loop_edit_field = match app.pipeline.pipeline_loop_edit_field {
+                PipelineLoopEditField::Count => PipelineLoopEditField::Prompt,
+                PipelineLoopEditField::Prompt => PipelineLoopEditField::Count,
+            };
+        }
+        KeyCode::Enter => {
+            match app.pipeline.pipeline_loop_edit_field {
+                PipelineLoopEditField::Count => {
+                    // Save and close
+                    let count: u32 = app
+                        .pipeline
+                        .pipeline_loop_edit_count_buf
+                        .parse()
+                        .unwrap_or(1)
+                        .clamp(1, 99);
+                    if let Some((from, to)) = app.pipeline.pipeline_loop_edit_target {
+                        if let Some(lc) = app
+                            .pipeline
+                            .pipeline_def
+                            .loop_connections
+                            .iter_mut()
+                            .find(|lc| lc.from == from && lc.to == to)
+                        {
+                            lc.count = count;
+                            lc.prompt = app.pipeline.pipeline_loop_edit_prompt_buf.clone();
+                        }
+                    }
+                    app.pipeline.pipeline_show_loop_edit = false;
+                }
+                PipelineLoopEditField::Prompt => {
+                    // Insert newline in prompt field
+                    insert_text(
+                        &mut app.pipeline.pipeline_loop_edit_prompt_buf,
+                        &mut app.pipeline.pipeline_loop_edit_prompt_cursor,
+                        "\n",
+                    );
+                }
+            }
+        }
+        _ => match app.pipeline.pipeline_loop_edit_field {
+            PipelineLoopEditField::Count => match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.pipeline.pipeline_loop_edit_count_buf.push(c);
+                    let v: u32 = app
+                        .pipeline
+                        .pipeline_loop_edit_count_buf
+                        .parse()
+                        .unwrap_or(1)
+                        .clamp(1, 99);
+                    app.pipeline.pipeline_loop_edit_count_buf = v.to_string();
+                }
+                KeyCode::Backspace => {
+                    app.pipeline.pipeline_loop_edit_count_buf.pop();
+                    if app.pipeline.pipeline_loop_edit_count_buf.is_empty() {
+                        app.pipeline.pipeline_loop_edit_count_buf = "1".into();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('+') => {
+                    let cur: u32 = app
+                        .pipeline
+                        .pipeline_loop_edit_count_buf
+                        .parse()
+                        .unwrap_or(1);
+                    let next = (cur + 1).min(99);
+                    app.pipeline.pipeline_loop_edit_count_buf = next.to_string();
+                }
+                KeyCode::Down | KeyCode::Char('-') => {
+                    let cur: u32 = app
+                        .pipeline
+                        .pipeline_loop_edit_count_buf
+                        .parse()
+                        .unwrap_or(1);
+                    let next = cur.saturating_sub(1).max(1);
+                    app.pipeline.pipeline_loop_edit_count_buf = next.to_string();
+                }
+                _ => {}
+            },
+            PipelineLoopEditField::Prompt => {
+                handle_text_key(
+                    &mut app.pipeline.pipeline_loop_edit_prompt_buf,
+                    &mut app.pipeline.pipeline_loop_edit_prompt_cursor,
+                    key,
+                );
+            }
+        },
     }
 }
 

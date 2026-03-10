@@ -468,7 +468,7 @@ fn draw_pipeline_dag(f: &mut Frame, app: &App, area: Rect) {
         (color, BorderType::Plain)
     };
 
-    super::pipeline::render_dag_readonly(f, inner, blocks, connections, &block_style_fn);
+    super::pipeline::render_dag_readonly(f, inner, blocks, connections, &app.pipeline.pipeline_def.loop_connections, &block_style_fn);
 }
 
 fn draw_multi_run(f: &mut Frame, app: &App) {
@@ -1132,7 +1132,11 @@ fn compute_total_steps(app: &App) -> usize {
         crate::execution::ExecutionMode::Relay => agents * app.prompt.iterations as usize,
         crate::execution::ExecutionMode::Swarm => agents * app.prompt.iterations as usize,
         crate::execution::ExecutionMode::Pipeline => {
-            app.running.block_rows.len() * app.pipeline.pipeline_def.iterations as usize
+            if app.running.expected_total_steps > 0 {
+                app.running.expected_total_steps
+            } else {
+                app.running.block_rows.len() * app.pipeline.pipeline_def.iterations as usize
+            }
         }
     }
 }
@@ -1412,12 +1416,14 @@ mod tests {
                     agent_name: "Claude".into(),
                     label: "Block 1".into(),
                     iteration: 1,
+                    loop_pass: 0,
                 },
                 ProgressEvent::BlockStarted {
                     block_id: 2,
                     agent_name: "OpenAI".into(),
                     label: "Block 2".into(),
                     iteration: 1,
+                    loop_pass: 0,
                 },
             ],
         );
@@ -1440,18 +1446,21 @@ mod tests {
                     agent_name: "Claude".into(),
                     label: "Block 1".into(),
                     iteration: 1,
+                    loop_pass: 0,
                 },
                 ProgressEvent::BlockFinished {
                     block_id: 1,
                     agent_name: "Claude".into(),
                     label: "Block 1".into(),
                     iteration: 1,
+                    loop_pass: 0,
                 },
                 ProgressEvent::BlockStarted {
                     block_id: 2,
                     agent_name: "OpenAI".into(),
                     label: "Block 2".into(),
                     iteration: 1,
+                    loop_pass: 0,
                 },
             ],
         );
@@ -1472,6 +1481,7 @@ mod tests {
                 agent_name: "Claude".into(),
                 label: "Block 1".into(),
                 iteration: 1,
+                loop_pass: 0,
             }],
         );
         assert_eq!(current_status(&a), "Waiting...");
@@ -1571,6 +1581,7 @@ mod tests {
                 agent_name: "Claude".into(),
                 label: "Block 1".into(),
                 iteration: 1,
+                loop_pass: 0,
             }],
         );
         let items = build_event_items(&a);
