@@ -122,7 +122,7 @@ pub(super) fn session_matches_resume(
             let requested: std::collections::HashSet<&String> = agents.iter().collect();
             stored == requested
         }
-        ExecutionMode::Solo | ExecutionMode::Pipeline => session.agents == agents,
+        ExecutionMode::Pipeline => session.agents == agents,
     }
 }
 

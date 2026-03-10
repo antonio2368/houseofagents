@@ -428,17 +428,6 @@ pub(super) fn start_multi_execution(app: &mut App, params: MultiExecutionParams)
                     }
 
                     let result = match mode {
-                        ExecutionMode::Solo => {
-                            run_solo(
-                                &prompt_context,
-                                agents,
-                                use_cli_by_agent,
-                                &output,
-                                progress_tx,
-                                cancel.clone(),
-                            )
-                            .await
-                        }
                         ExecutionMode::Relay => {
                             run_relay(
                                 &prompt_context,
@@ -678,11 +667,7 @@ pub(super) fn start_execution(app: &mut App) {
         PromptRuntimeContext::new(raw_prompt.clone(), app.config.diagnostic_provider.is_some());
     let agent_names = app.selected_agents.clone();
     let mode = app.selected_mode;
-    let iterations = if mode == ExecutionMode::Solo {
-        1
-    } else {
-        app.prompt.iterations
-    };
+    let iterations = app.prompt.iterations;
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(http_timeout_secs))
@@ -888,17 +873,6 @@ fn continue_single_execution(
 
     tokio::spawn(async move {
         let result = match mode {
-            ExecutionMode::Solo => {
-                run_solo(
-                    &prompt_context,
-                    agents,
-                    use_cli_by_agent,
-                    &output,
-                    tx.clone(),
-                    cancel,
-                )
-                .await
-            }
             ExecutionMode::Relay => {
                 run_relay(
                     &prompt_context,
@@ -1036,7 +1010,7 @@ fn prepare_resume_execution(
                 return Err("No previous swarm outputs found to resume".into());
             }
         }
-        ExecutionMode::Solo | ExecutionMode::Pipeline => {}
+        ExecutionMode::Pipeline => {}
     }
 
     Ok(crate::app::ResumePreparation {

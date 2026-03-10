@@ -19,7 +19,6 @@ Run Claude, OpenAI, and Gemini in collaborative execution modes and save all art
 |------|-------------|
 | **Relay** | Sequential handoff — each agent builds on the previous agent's output |
 | **Swarm** | Parallel rounds with cross-agent context injected between rounds |
-| **Solo** | Independent one-shot runs per selected agent (forced to 1 iteration) |
 | **Pipeline** | Custom DAG builder — wire arbitrary blocks of agents into a dependency graph |
 
 ## Supported Providers
@@ -232,7 +231,7 @@ Anthropic `thinking_effort = "max"` is rejected in API mode. In CLI mode, House 
 | `Enter` / `F5` | Start run |
 | `Esc` | Back |
 
-Fields vary by mode for options, but every prompt flow now includes Prompt, Session Name, Iterations, Runs, and Concurrency. Solo still forces execution to one iteration, but multi-run batching is available there too.
+Fields vary by mode for options, but every prompt flow includes Prompt, Session Name, Iterations, Runs, and Concurrency.
 
 ### Pipeline Builder Screen
 
@@ -354,6 +353,6 @@ Legacy directories (`YYYYMMDD_HHMMSS_NNN[_session]` and `YYYY-MM-DD/HH-MM-SS[_se
   - Batch roots are excluded from resume lookup; resume is currently single-run only
 - **Forward Prompt** (toggle with `Space` on Prompt screen) — relay mode only; when enabled, downstream agents receive the original prompt alongside the previous agent's output, preventing context loss in the handoff chain
 - **Consolidation**
-  - Single-run: offered after non-cancelled swarm/solo/pipeline runs with 2+ final outputs
+  - Single-run: offered after non-cancelled swarm/pipeline runs with 2+ final outputs
   - Batch: first offers per-run consolidation, then optional cross-run consolidation across successful runs
 - **Diagnostics** — when `diagnostic_provider` is set to an agent name, a final analysis pass writes `errors.md`

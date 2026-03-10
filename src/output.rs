@@ -814,6 +814,23 @@ mod tests {
     }
 
     #[test]
+    fn read_agent_session_info_maps_legacy_solo_to_swarm() {
+        let base = tempdir().expect("tempdir");
+        let mgr = OutputManager::new(base.path(), Some("legacy-solo")).expect("new");
+        // Write a session.toml with mode = "solo" to simulate a pre-removal session
+        let content = "mode = \"solo\"\nagents = [\"Claude\", \"OpenAI\"]\niterations = 1\n";
+        std::fs::write(mgr.run_dir().join("session.toml"), content).expect("write");
+
+        let session = OutputManager::read_agent_session_info(mgr.run_dir()).expect("session");
+        assert_eq!(session.mode, ExecutionMode::Swarm);
+        assert_eq!(
+            session.agents,
+            vec!["Claude".to_string(), "OpenAI".to_string()]
+        );
+        assert_eq!(session.iterations, 1);
+    }
+
+    #[test]
     fn read_agent_session_info_rejects_pipeline_shape_without_agents() {
         let base = tempdir().expect("tempdir");
         let mgr = OutputManager::new(base.path(), Some("pipeline")).expect("new");

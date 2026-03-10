@@ -17,7 +17,7 @@ pub(super) fn should_offer_consolidation(app: &App) -> bool {
     }
     if !matches!(
         app.selected_mode,
-        ExecutionMode::Swarm | ExecutionMode::Solo | ExecutionMode::Pipeline
+        ExecutionMode::Swarm | ExecutionMode::Pipeline
     ) {
         return false;
     }

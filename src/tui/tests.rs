@@ -788,7 +788,7 @@ async fn per_run_consolidation_recreates_provider_each_run() {
         ConsolidationRequest::new(
             batch_root.run_dir().clone(),
             ConsolidationTarget::PerRun,
-            ExecutionMode::Solo,
+            ExecutionMode::Swarm,
             vec!["Claude".to_string(), "OpenAI".to_string()],
             vec![1, 2],
             false,
@@ -1074,35 +1074,6 @@ fn batch_result_entry_helpers_respect_expansion_state() {
         Some(BatchResultEntry::File(path)) if path.ends_with("root.md")
     ));
     assert!(batch_result_entry_at(&app, 5).is_none());
-}
-
-#[test]
-fn prompt_focus_cycle_solo_tab_and_backtab() {
-    let mut app = test_app();
-    app.selected_mode = ExecutionMode::Solo;
-    app.prompt.prompt_focus = PromptFocus::Text;
-
-    handle_prompt_key(&mut app, key(KeyCode::Tab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::SessionName);
-    handle_prompt_key(&mut app, key(KeyCode::Tab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::Iterations);
-    handle_prompt_key(&mut app, key(KeyCode::Tab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::Runs);
-    handle_prompt_key(&mut app, key(KeyCode::Tab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::Concurrency);
-    handle_prompt_key(&mut app, key(KeyCode::Tab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::Text);
-
-    handle_prompt_key(&mut app, key(KeyCode::BackTab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::Concurrency);
-    handle_prompt_key(&mut app, key(KeyCode::BackTab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::Runs);
-    handle_prompt_key(&mut app, key(KeyCode::BackTab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::Iterations);
-    handle_prompt_key(&mut app, key(KeyCode::BackTab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::SessionName);
-    handle_prompt_key(&mut app, key(KeyCode::BackTab));
-    assert_eq!(app.prompt.prompt_focus, PromptFocus::Text);
 }
 
 #[test]

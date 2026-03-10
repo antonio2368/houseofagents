@@ -19,7 +19,6 @@ use crate::event::{Event, EventHandler};
 use crate::execution::multi::run_multi;
 use crate::execution::pipeline::{self as pipeline_mod, BlockId};
 use crate::execution::relay::run_relay;
-use crate::execution::solo::run_solo;
 use crate::execution::swarm::run_swarm;
 use crate::execution::{
     BatchProgressEvent, ExecutionMode, ProgressEvent, PromptRuntimeContext, RunOutcome,

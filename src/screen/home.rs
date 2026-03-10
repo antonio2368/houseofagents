@@ -211,20 +211,6 @@ fn help_lines() -> &'static [Line<'static>] {
             Line::from(""),
             Line::from(""),
             Line::from(Span::styled(
-                "Solo",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from("  Each selected agent runs independently in parallel on"),
-            Line::from("  the same prompt. No context is shared between agents."),
-            Line::from("  Always runs exactly one iteration."),
-            Line::from(""),
-            Line::from("  Best for: comparing models head-to-head, getting"),
-            Line::from("  diverse independent answers to the same question."),
-            Line::from(""),
-            Line::from(Span::styled(
                 "Pipeline",
                 Style::default()
                     .fg(Color::Cyan)
@@ -827,7 +813,6 @@ mod tests {
             .join("\n");
         assert!(joined.contains("Relay"));
         assert!(joined.contains("Swarm"));
-        assert!(joined.contains("Solo"));
         assert!(joined.contains("Pipeline"));
     }
 

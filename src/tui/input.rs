@@ -200,7 +200,6 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                     app.prompt.concurrency_buf = app.prompt.concurrency.to_string();
                     PromptFocus::Concurrency
                 }
-                (PromptFocus::Concurrency, ExecutionMode::Solo) => PromptFocus::Text,
                 (PromptFocus::Concurrency, _) => {
                     sync_concurrency_buf(app);
                     PromptFocus::Resume
@@ -212,7 +211,6 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::BackTab => {
             app.prompt.prompt_focus = match (&app.prompt.prompt_focus, app.selected_mode) {
-                (PromptFocus::Text, ExecutionMode::Solo) => PromptFocus::Concurrency,
                 (PromptFocus::Text, ExecutionMode::Relay) => PromptFocus::ForwardPrompt,
                 (PromptFocus::Text, _) => PromptFocus::Resume,
                 (PromptFocus::SessionName, _) => PromptFocus::Text,
@@ -281,38 +279,32 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                 }
                 _ => {}
             },
-            PromptFocus::Iterations => {
-                if app.selected_mode == ExecutionMode::Solo {
-                    return;
+            PromptFocus::Iterations => match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.prompt.iterations_buf.push(c);
+                    app.prompt.iterations =
+                        app.prompt.iterations_buf.parse().unwrap_or(1).clamp(1, 99);
+                    app.prompt.iterations_buf = app.prompt.iterations.to_string();
                 }
-                match key.code {
-                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                        app.prompt.iterations_buf.push(c);
+                KeyCode::Backspace => {
+                    app.prompt.iterations_buf.pop();
+                    if app.prompt.iterations_buf.is_empty() {
+                        app.prompt.iterations = 1;
+                    } else {
                         app.prompt.iterations =
                             app.prompt.iterations_buf.parse().unwrap_or(1).clamp(1, 99);
-                        // Re-sync buf in case clamp changed the value
-                        app.prompt.iterations_buf = app.prompt.iterations.to_string();
                     }
-                    KeyCode::Backspace => {
-                        app.prompt.iterations_buf.pop();
-                        if app.prompt.iterations_buf.is_empty() {
-                            app.prompt.iterations = 1;
-                        } else {
-                            app.prompt.iterations =
-                                app.prompt.iterations_buf.parse().unwrap_or(1).clamp(1, 99);
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('+') => {
-                        app.prompt.iterations = (app.prompt.iterations + 1).min(99);
-                        app.prompt.iterations_buf = app.prompt.iterations.to_string();
-                    }
-                    KeyCode::Down | KeyCode::Char('-') => {
-                        app.prompt.iterations = app.prompt.iterations.saturating_sub(1).max(1);
-                        app.prompt.iterations_buf = app.prompt.iterations.to_string();
-                    }
-                    _ => {}
                 }
-            }
+                KeyCode::Up | KeyCode::Char('+') => {
+                    app.prompt.iterations = (app.prompt.iterations + 1).min(99);
+                    app.prompt.iterations_buf = app.prompt.iterations.to_string();
+                }
+                KeyCode::Down | KeyCode::Char('-') => {
+                    app.prompt.iterations = app.prompt.iterations.saturating_sub(1).max(1);
+                    app.prompt.iterations_buf = app.prompt.iterations.to_string();
+                }
+                _ => {}
+            },
             PromptFocus::Runs => match key.code {
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     app.prompt.runs_buf.push(c);
