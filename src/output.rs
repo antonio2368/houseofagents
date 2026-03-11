@@ -70,6 +70,37 @@ fn is_legacy_flat(dir_name: &str) -> bool {
     true
 }
 
+/// Extract a sortable timestamp key from a run directory path.
+///
+/// Grouped: `.../YYYY-MM-DD/HH-MM-SS` → `"YYYYMMDDHHMMSS"`
+/// Legacy:  `.../YYYYMMDD_HHMMSS[_suffix]` → `"YYYYMMDDHHMMSS"`
+/// Fallback: empty string (sorts before any real timestamp).
+fn path_sort_key(path: &Path) -> String {
+    // Try grouped: parent is date dir, leaf is time
+    if let (Some(parent), Some(leaf)) = (path.parent(), path.file_name()) {
+        let leaf = leaf.to_string_lossy();
+        if let Some(date_dir) = parent.file_name() {
+            let date_dir = date_dir.to_string_lossy();
+            if is_date_dir(&date_dir) && leaf.len() >= 8 {
+                // "YYYY-MM-DD" + "HH-MM-SS" → "YYYYMMDDHHMMSS"
+                let d: String = date_dir.chars().filter(|c| c.is_ascii_digit()).collect();
+                let t: String = leaf[..8].chars().filter(|c| c.is_ascii_digit()).collect();
+                if d.len() == 8 && t.len() == 6 {
+                    return format!("{d}{t}");
+                }
+            }
+        }
+        // Try legacy flat
+        if is_legacy_flat(&leaf) {
+            let digits: String = leaf[..15].chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits.len() == 14 {
+                return digits;
+            }
+        }
+    }
+    String::new()
+}
+
 /// Approximate the creation time of a run directory.
 ///
 /// Uses the mtime of `session.toml` or `batch.toml` (written once at run
@@ -266,7 +297,12 @@ impl OutputManager {
             }
         }
 
-        entries.sort_by(|a, b| b.0.cmp(&a.0)); // newest-first
+        // Sort newest-first by mtime, breaking ties by the timestamp embedded
+        // in the directory name (reverse order so later dates come first).
+        entries.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| path_sort_key(&b.1).cmp(&path_sort_key(&a.1)))
+        });
         Ok(entries.into_iter().map(|(_, p)| p).collect())
     }
 
