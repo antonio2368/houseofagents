@@ -834,6 +834,13 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     .pipeline_def
                     .loop_connections
                     .retain(|lc| lc.from != sel && lc.to != sel);
+                // Prune loops whose sub-DAG lost an internal node
+                let warnings = pipeline_mod::prune_invalid_loops(
+                    &mut app.pipeline.pipeline_def,
+                );
+                if !warnings.is_empty() {
+                    app.error_modal = Some(warnings.join("\n"));
+                }
                 app.pipeline.pipeline_def.normalize_session_configs();
                 if app.pipeline.pipeline_def.blocks.is_empty() {
                     app.pipeline.pipeline_block_cursor = None;

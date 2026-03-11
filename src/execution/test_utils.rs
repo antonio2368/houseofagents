@@ -103,6 +103,47 @@ impl Provider for PanicProvider {
     }
 }
 
+/// Succeeds with a given response on the first call, then panics on all subsequent calls.
+/// Useful for testing stale-output cleanup when a replica succeeds on pass N then panics on pass N+1.
+pub(crate) struct SuccessThenPanicProvider {
+    kind: ProviderKind,
+    first_response: Mutex<Option<String>>,
+    panic_message: &'static str,
+}
+
+impl SuccessThenPanicProvider {
+    pub(crate) fn new(kind: ProviderKind, first_content: &str, panic_message: &'static str) -> Self {
+        Self {
+            kind,
+            first_response: Mutex::new(Some(first_content.to_string())),
+            panic_message,
+        }
+    }
+}
+
+impl Provider for SuccessThenPanicProvider {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    fn clear_history(&mut self) {}
+
+    fn send(&mut self, _message: &str) -> SendFuture<'_> {
+        let maybe_content = self.first_response.lock().expect("lock").take();
+        let panic_msg = self.panic_message;
+        Box::pin(async move {
+            if let Some(content) = maybe_content {
+                Ok(CompletionResponse {
+                    content,
+                    debug_logs: Vec::new(),
+                })
+            } else {
+                panic!("{}", panic_msg);
+            }
+        })
+    }
+}
+
 pub(crate) fn ok_response(content: &str) -> Result<CompletionResponse, AppError> {
     Ok(CompletionResponse {
         content: content.to_string(),

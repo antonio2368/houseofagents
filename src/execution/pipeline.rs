@@ -1667,6 +1667,9 @@ where
                                     error
                                 ));
                                 failed_replicas.insert(metadata.runtime_id);
+                                // Remove stale output so a previous pass's content
+                                // is not mistaken for current-pass feedback.
+                                replica_outputs.remove(&metadata.runtime_id);
                                 let src = metadata.source_block_id;
                                 if let Some(rids) = rt.logical_to_runtime.get(&src) {
                                     if rids.iter().all(|r| failed_replicas.contains(r)) {
@@ -2145,7 +2148,7 @@ fn build_loop_rerun_message_v2(
 mod tests {
     use super::*;
     use crate::config::ProviderConfig;
-    use crate::execution::test_utils::{collect_progress_events, MockProvider, PanicProvider};
+    use crate::execution::test_utils::{collect_progress_events, MockProvider, PanicProvider, SuccessThenPanicProvider};
     use crate::output::OutputManager;
     use crate::provider::ProviderKind;
     use std::collections::HashMap;
@@ -4332,5 +4335,155 @@ keep_across_iterations = false
         // Must reach AllDone (no hang from double-release)
         assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)),
             "pipeline should reach AllDone after loop abort");
+    }
+
+    #[tokio::test]
+    async fn test_panic_after_success_evicts_stale_output() {
+        // Regression: a replica that succeeds on pass N and panics on pass N+1
+        // must have its stale output removed from replica_outputs so that
+        // subsequent loop-pass feedback doesn't include the stale content.
+        //
+        // Setup: A(1)→B(2, replicas=2), loop_back(B, A, count=2) → 3 passes.
+        // B-r2 (runtime 2) succeeds on pass 0 with "STALE_MARKER", then panics
+        // on passes 1+. B-r1 (runtime 1) always succeeds with "fresh-B1".
+        //
+        // The provider factory is called once per unique (agent, session_key)
+        // during pool init. Each replica has a distinct session_key, so each
+        // gets its own factory call. The returned provider is reused for all
+        // send() calls across loop passes.
+        //
+        // On pass 2, A's re-run feedback is assembled from B's replica_outputs.
+        // With the fix, B-r2's entry was removed when it panicked on pass 1,
+        // so A's pass-2 prompt must NOT contain "STALE_MARKER".
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("panic-stale")).unwrap();
+        let mut b_block = block(2, 1, 0);
+        b_block.replicas = 2;
+        let def = def_with_loops(
+            vec![block(1, 0, 0), b_block],
+            vec![conn(1, 2)],
+            vec![lconn(2, 1, 2)], // count=2 → 3 passes
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        // Pool init iterates rt.entries in order:
+        //   n=0 → A (runtime 0): MockProvider with 3 Ok responses, captures prompts
+        //   n=1 → B-r1 (runtime 1): MockProvider with 3 Ok responses ("fresh-B1")
+        //   n=2 → B-r2 (runtime 2): SuccessThenPanicProvider — succeeds once, panics after
+        let received_a = Arc::new(Mutex::new(Vec::new()));
+        let recv_clone = received_a.clone();
+        let call_counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = call_counter.clone();
+
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            move |_kind, _cfg| {
+                use crate::execution::test_utils::ok_response;
+                let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                match n {
+                    0 => {
+                        // A: succeeds 3 times, captures received prompts
+                        Box::new(MockProvider::with_responses(
+                            ProviderKind::Anthropic,
+                            vec![ok_response("A-p0"), ok_response("A-p1"), ok_response("A-p2")],
+                            recv_clone.clone(),
+                        ))
+                    }
+                    1 => {
+                        // B-r1: always succeeds
+                        Box::new(MockProvider::with_responses(
+                            ProviderKind::Anthropic,
+                            vec![ok_response("fresh-B1"), ok_response("fresh-B1"), ok_response("fresh-B1")],
+                            Arc::new(Mutex::new(Vec::new())),
+                        ))
+                    }
+                    2 => {
+                        // B-r2: succeeds on first send (pass 0), panics on subsequent
+                        Box::new(SuccessThenPanicProvider::new(
+                            ProviderKind::Anthropic,
+                            "STALE_MARKER",
+                            "B-r2 panicked",
+                        ))
+                    }
+                    _ => {
+                        Box::new(MockProvider::ok(
+                            ProviderKind::Anthropic,
+                            "unexpected",
+                            Arc::new(Mutex::new(Vec::new())),
+                        ))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("run should complete");
+
+        let events = collect_progress_events(rx);
+
+        // Pipeline should complete
+        assert!(events.iter().any(|e| matches!(e, ProgressEvent::AllDone)),
+            "pipeline should reach AllDone");
+
+        // B-r2 should have panic errors
+        assert!(events.iter().any(|e| matches!(
+            e, ProgressEvent::BlockError { error, .. } if error.contains("panicked")
+        )), "B-r2 should emit a panic error");
+
+        // Key assertion: A's pass-2 prompt must NOT contain stale B-r2 output.
+        // A is called 3 times (pass 0, 1, 2). The pass-2 prompt is the last.
+        let prompts = received_a.lock().expect("lock");
+        assert!(prompts.len() >= 3, "A should receive at least 3 prompts (passes 0,1,2), got {}", prompts.len());
+        let pass2_prompt = &prompts[2];
+        assert!(
+            !pass2_prompt.contains("STALE_MARKER"),
+            "A's pass-2 feedback must not contain stale B-r2 pass-0 output.\nGot prompt:\n{pass2_prompt}"
+        );
+    }
+
+    #[test]
+    fn test_prune_invalid_loops_internal_block_deletion() {
+        // Regression: deleting a block that is internal to a loop's sub-DAG
+        // (not an endpoint) should invalidate the loop.
+        //
+        // Chain: 1→2→3, loop from 3→1.
+        // Delete block 2 (internal node) → loop 3→1 should be pruned because
+        // the path from 1 to 3 is broken.
+        let mut def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0), block(3, 2, 0)],
+            vec![conn(1, 2), conn(2, 3)],
+            vec![lconn(3, 1, 1)],
+        );
+        // Simulate block deletion: remove block 2 and its connections
+        def.blocks.retain(|b| b.id != 2);
+        def.connections.retain(|c| c.from != 2 && c.to != 2);
+        def.loop_connections.retain(|lc| lc.from != 2 && lc.to != 2);
+        // Now prune loops with broken sub-DAGs
+        let warnings = prune_invalid_loops(&mut def);
+        assert_eq!(warnings.len(), 1, "loop with broken internal path should be pruned");
+        assert!(def.loop_connections.is_empty(), "loop 3→1 should be removed");
     }
 }

@@ -2618,3 +2618,58 @@ fn setup_analysis_result_after_close_discards() {
     assert!(!app.setup_analysis.active);
     assert!(app.setup_analysis.content.is_empty());
 }
+
+#[test]
+fn test_delete_internal_block_prunes_loop() {
+    // Regression: deleting a block that is internal to a loop's sub-DAG
+    // (not an endpoint) must prune the loop through the UI 'd' key handler.
+    //
+    // Chain: 1→2→3, loop 3→1.
+    // Delete block 2 via 'd' key → loop 3→1 should be removed.
+    use crate::execution::pipeline::{
+        LoopConnection, PipelineBlock, PipelineConnection,
+    };
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+    app.pipeline.pipeline_def.blocks = vec![
+        PipelineBlock {
+            id: 1, name: "A".into(), agent: "Claude".into(),
+            prompt: String::new(), session_id: None,
+            position: (0, 0), replicas: 1,
+        },
+        PipelineBlock {
+            id: 2, name: "B".into(), agent: "Claude".into(),
+            prompt: String::new(), session_id: None,
+            position: (1, 0), replicas: 1,
+        },
+        PipelineBlock {
+            id: 3, name: "C".into(), agent: "Claude".into(),
+            prompt: String::new(), session_id: None,
+            position: (2, 0), replicas: 1,
+        },
+    ];
+    app.pipeline.pipeline_def.connections = vec![
+        PipelineConnection { from: 1, to: 2 },
+        PipelineConnection { from: 2, to: 3 },
+    ];
+    app.pipeline.pipeline_def.loop_connections = vec![
+        LoopConnection { from: 3, to: 1, count: 1, prompt: String::new() },
+    ];
+
+    // Select block 2 (internal to the loop sub-DAG) and press 'd'
+    app.pipeline.pipeline_block_cursor = Some(2);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+
+    // Block 2 should be deleted
+    assert!(!app.pipeline.pipeline_def.blocks.iter().any(|b| b.id == 2));
+    // Connections involving block 2 should be removed
+    assert!(app.pipeline.pipeline_def.connections.is_empty());
+    // Loop 3→1 should be pruned because the sub-DAG path is broken
+    assert!(
+        app.pipeline.pipeline_def.loop_connections.is_empty(),
+        "loop 3→1 should be pruned when internal block 2 is deleted"
+    );
+    // User should see a warning about the pruned loop
+    assert!(app.error_modal.is_some(), "user should be warned about pruned loop");
+}
