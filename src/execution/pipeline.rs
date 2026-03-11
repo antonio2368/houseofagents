@@ -520,7 +520,9 @@ pub fn topological_layers(def: &PipelineDefinition) -> Result<Vec<Vec<BlockId>>,
         for &id in &layer {
             if let Some(children) = downstream.get(&id) {
                 for &child in children {
-                    let Some(deg) = in_degree.get_mut(&child) else { continue; };
+                    let Some(deg) = in_degree.get_mut(&child) else {
+                        continue;
+                    };
                     *deg -= 1;
                     if *deg == 0 {
                         next_queue.push(child);
@@ -826,8 +828,20 @@ pub fn next_free_position(def: &PipelineDefinition) -> (u16, u16) {
         return (0, 0);
     }
     let occupied: HashSet<(u16, u16)> = def.blocks.iter().map(|b| b.position).collect();
-    let max_row = def.blocks.iter().map(|b| b.position.1).max().unwrap_or(0).min(99);
-    let max_col = def.blocks.iter().map(|b| b.position.0).max().unwrap_or(0).min(99);
+    let max_row = def
+        .blocks
+        .iter()
+        .map(|b| b.position.1)
+        .max()
+        .unwrap_or(0)
+        .min(99);
+    let max_col = def
+        .blocks
+        .iter()
+        .map(|b| b.position.0)
+        .max()
+        .unwrap_or(0)
+        .min(99);
     // Search within existing bounds + 1 row, capped to prevent hangs on absurd coordinates
     for row in 0..=max_row + 1 {
         for col in 0..=max_col + 1 {
@@ -1269,7 +1283,8 @@ where
 
     // Build adjacency structures with replica-weighted in-degree (regular connections only)
     let graph = RegularGraph::from_def(def);
-    let block_map: HashMap<BlockId, &PipelineBlock> = def.blocks.iter().map(|b| (b.id, b)).collect();
+    let block_map: HashMap<BlockId, &PipelineBlock> =
+        def.blocks.iter().map(|b| (b.id, b)).collect();
     let mut in_degree: HashMap<BlockId, usize> = def.blocks.iter().map(|b| (b.id, 0)).collect();
     let mut downstream: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
     for conn in &def.connections {
@@ -1318,30 +1333,31 @@ where
         let mut completed = 0usize;
 
         // Loop runtime state per iteration (clone from prepared sub_dags)
-        let mut loop_state: HashMap<(BlockId, BlockId), LoopRuntimeState> = if let Some(ref p) = prepared {
-            def.loop_connections
-                .iter()
-                .filter_map(|lc| {
-                    let key = (lc.from, lc.to);
-                    let sub_dag = p.sub_dags.get(&key)?.clone();
-                    let extra = sub_dag.total_replicas * lc.count as usize;
-                    Some((
-                        key,
-                        LoopRuntimeState {
-                            remaining: lc.count,
-                            current_pass: 0,
-                            prompt: lc.prompt.clone(),
-                            sub_dag,
-                            block_completed_this_pass: HashMap::new(),
-                            extra_tasks_remaining: extra,
-                            abandoned: false,
-                        },
-                    ))
-                })
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        let mut loop_state: HashMap<(BlockId, BlockId), LoopRuntimeState> =
+            if let Some(ref p) = prepared {
+                def.loop_connections
+                    .iter()
+                    .filter_map(|lc| {
+                        let key = (lc.from, lc.to);
+                        let sub_dag = p.sub_dags.get(&key)?.clone();
+                        let extra = sub_dag.total_replicas * lc.count as usize;
+                        Some((
+                            key,
+                            LoopRuntimeState {
+                                remaining: lc.count,
+                                current_pass: 0,
+                                prompt: lc.prompt.clone(),
+                                sub_dag,
+                                block_completed_this_pass: HashMap::new(),
+                                extra_tasks_remaining: extra,
+                                abandoned: false,
+                            },
+                        ))
+                    })
+                    .collect()
+            } else {
+                HashMap::new()
+            };
         // Track current loop pass per block for progress events
         let mut block_loop_pass: HashMap<BlockId, u32> = HashMap::new();
 
@@ -5095,10 +5111,7 @@ keep_across_iterations = false
     #[test]
     fn next_free_position_fallback_avoids_occupied_out_of_range() {
         // Fallback row (0, 101) is already occupied — must skip past it
-        let d = def_with(
-            vec![block(1, 60000, 60000), block(2, 0, 101)],
-            vec![],
-        );
+        let d = def_with(vec![block(1, 60000, 60000), block(2, 0, 101)], vec![]);
         let pos = next_free_position(&d);
         assert!(!d.blocks.iter().any(|b| b.position == pos));
     }

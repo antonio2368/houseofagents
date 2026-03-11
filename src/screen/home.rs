@@ -239,12 +239,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
         Line::from(""),
     ];
 
-    if app.edit_popup.editing
-        && matches!(
-            app.edit_popup.field,
-            crate::app::EditField::OutputDir
-        )
-    {
+    if app.edit_popup.editing && matches!(app.edit_popup.field, crate::app::EditField::OutputDir) {
         header_lines.push(Line::from(Span::styled(
             format!(
                 "New output dir: {}_ (Enter: save, Esc: cancel)",
@@ -419,10 +414,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
 
                 if is_selected
                     && app.edit_popup.editing
-                    && !matches!(
-                        app.edit_popup.field,
-                        crate::app::EditField::OutputDir
-                    )
+                    && !matches!(app.edit_popup.field, crate::app::EditField::OutputDir)
                 {
                     let field_name = match app.edit_popup.field {
                         crate::app::EditField::ApiKey => "key",
@@ -511,10 +503,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
 
                 if is_selected
                     && app.edit_popup.editing
-                    && matches!(
-                        app.edit_popup.field,
-                        crate::app::EditField::TimeoutSeconds
-                    )
+                    && matches!(app.edit_popup.field, crate::app::EditField::TimeoutSeconds)
                 {
                     selected_line_start = body_lines.len();
                     body_lines.push(Line::from(Span::styled(
@@ -619,7 +608,11 @@ fn draw_model_picker(f: &mut Frame, app: &App) {
     // Build filtered view on demand from the single model_picker_list source
     let filter_lc = app.edit_popup.model_picker_filter.to_lowercase();
     let filtered: Vec<&str> = if filter_lc.is_empty() {
-        app.edit_popup.model_picker_list.iter().map(|s| s.as_str()).collect()
+        app.edit_popup
+            .model_picker_list
+            .iter()
+            .map(|s| s.as_str())
+            .collect()
     } else {
         app.edit_popup
             .model_picker_list

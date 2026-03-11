@@ -170,7 +170,12 @@ pub async fn run_swarm(
                             kind,
                             iteration: iter,
                         });
-                        (i, agent_name.clone(), provider, Some((agent_name, resp.content)))
+                        (
+                            i,
+                            agent_name.clone(),
+                            provider,
+                            Some((agent_name, resp.content)),
+                        )
                     }
                     Err(e) => {
                         let err_str = e.to_string();

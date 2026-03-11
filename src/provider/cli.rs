@@ -748,7 +748,8 @@ impl Provider for CliProvider {
                     match fs::read_to_string(path).await {
                         Ok(text) => {
                             let _ = fs::remove_file(path).await;
-                            debug_logs.push(format!("codex output chars: {}", text.chars().count()));
+                            debug_logs
+                                .push(format!("codex output chars: {}", text.chars().count()));
                             text
                         }
                         Err(e) => {
@@ -759,10 +760,8 @@ impl Provider for CliProvider {
                             self.session_id = None;
                             self.session_started = false;
                             self.history.pop(); // remove orphaned user turn
-                            let msg = format!(
-                                "failed to read codex output file {}: {e}",
-                                path.display()
-                            );
+                            let msg =
+                                format!("failed to read codex output file {}: {e}", path.display());
                             debug_logs.push(msg.clone());
                             return Err(Self::provider_error_with_debug(bin, msg, &debug_logs));
                         }

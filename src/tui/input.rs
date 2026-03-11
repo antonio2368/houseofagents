@@ -352,8 +352,12 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
             PromptFocus::Iterations => match key.code {
                 KeyCode::Char(c) if c.is_ascii_digit() => {
                     app.prompt.iterations_buf.push(c);
-                    app.prompt.iterations =
-                        app.prompt.iterations_buf.parse().unwrap_or(1).clamp(1, MAX_NUMERIC_FIELD);
+                    app.prompt.iterations = app
+                        .prompt
+                        .iterations_buf
+                        .parse()
+                        .unwrap_or(1)
+                        .clamp(1, MAX_NUMERIC_FIELD);
                     app.prompt.iterations_buf = app.prompt.iterations.to_string();
                 }
                 KeyCode::Backspace => {
@@ -361,8 +365,12 @@ pub(super) fn handle_prompt_key(app: &mut App, key: KeyEvent) {
                     if app.prompt.iterations_buf.is_empty() {
                         app.prompt.iterations = 1;
                     } else {
-                        app.prompt.iterations =
-                            app.prompt.iterations_buf.parse().unwrap_or(1).clamp(1, MAX_NUMERIC_FIELD);
+                        app.prompt.iterations = app
+                            .prompt
+                            .iterations_buf
+                            .parse()
+                            .unwrap_or(1)
+                            .clamp(1, MAX_NUMERIC_FIELD);
                     }
                 }
                 KeyCode::Up | KeyCode::Char('+') => {
@@ -736,7 +744,8 @@ pub(super) fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
                     }
                 }
                 KeyCode::Up | KeyCode::Char('+') => {
-                    app.pipeline.pipeline_runs = (app.pipeline.pipeline_runs + 1).min(MAX_NUMERIC_FIELD);
+                    app.pipeline.pipeline_runs =
+                        (app.pipeline.pipeline_runs + 1).min(MAX_NUMERIC_FIELD);
                     app.pipeline.pipeline_runs_buf = app.pipeline.pipeline_runs.to_string();
                 }
                 KeyCode::Down | KeyCode::Char('-') => {
@@ -2003,12 +2012,10 @@ pub(super) fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up | KeyCode::Char('k') if !app.edit_popup.editing => {
             match app.edit_popup.section {
                 EditPopupSection::Providers => {
-                    app.edit_popup.cursor =
-                        app.edit_popup.cursor.saturating_sub(1);
+                    app.edit_popup.cursor = app.edit_popup.cursor.saturating_sub(1);
                 }
                 EditPopupSection::Timeouts => {
-                    app.edit_popup.timeout_cursor =
-                        app.edit_popup.timeout_cursor.saturating_sub(1);
+                    app.edit_popup.timeout_cursor = app.edit_popup.timeout_cursor.saturating_sub(1);
                 }
             }
         }
@@ -2029,8 +2036,7 @@ pub(super) fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('a')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             app.edit_popup.field = EditField::ApiKey;
             app.edit_popup.edit_buffer = effective_section_config(app)
@@ -2039,8 +2045,7 @@ pub(super) fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             app.edit_popup.editing = true;
         }
         KeyCode::Char('m')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             app.edit_popup.field = EditField::Model;
             app.edit_popup.edit_buffer = effective_section_config(app)
@@ -2049,8 +2054,7 @@ pub(super) fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             app.edit_popup.editing = true;
         }
         KeyCode::Char('x')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             app.edit_popup.field = EditField::ExtraCliArgs;
             app.edit_popup.edit_buffer = effective_section_config(app)
@@ -2059,8 +2063,7 @@ pub(super) fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             app.edit_popup.editing = true;
         }
         KeyCode::Char('l')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             app.edit_popup.field = EditField::Model;
             start_model_fetch(app);
@@ -2074,44 +2077,37 @@ pub(super) fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             save_config_globally(app);
         }
         KeyCode::Char('c')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             toggle_cli_mode(app);
         }
         KeyCode::Char('d')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             toggle_diagnostic_agent(app);
         }
         KeyCode::Char('t')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             cycle_reasoning(app);
         }
         KeyCode::Char('b')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             toggle_cli_print_mode(app);
         }
         KeyCode::Char('n')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             add_new_agent(app);
         }
         KeyCode::Char('p')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             cycle_agent_provider(app);
         }
         KeyCode::Char('r')
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             if let Some(agent) = app.config.agents.get(app.edit_popup.cursor) {
                 app.edit_popup.field = EditField::AgentName;
@@ -2120,8 +2116,7 @@ pub(super) fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Delete | KeyCode::Backspace
-            if !app.edit_popup.editing
-                && app.edit_popup.section == EditPopupSection::Providers =>
+            if !app.edit_popup.editing && app.edit_popup.section == EditPopupSection::Providers =>
         {
             remove_agent(app);
         }
@@ -2704,7 +2699,12 @@ pub(super) fn sync_iterations_buf(app: &mut App) {
     if app.prompt.iterations_buf.is_empty() {
         app.prompt.iterations = 1;
     } else {
-        app.prompt.iterations = app.prompt.iterations_buf.parse().unwrap_or(1).clamp(1, MAX_NUMERIC_FIELD);
+        app.prompt.iterations = app
+            .prompt
+            .iterations_buf
+            .parse()
+            .unwrap_or(1)
+            .clamp(1, MAX_NUMERIC_FIELD);
     }
     app.prompt.iterations_buf = app.prompt.iterations.to_string();
 }
@@ -2713,7 +2713,12 @@ pub(super) fn sync_runs_buf(app: &mut App) {
     if app.prompt.runs_buf.is_empty() {
         app.prompt.runs = 1;
     } else {
-        app.prompt.runs = app.prompt.runs_buf.parse().unwrap_or(1).clamp(1, MAX_NUMERIC_FIELD);
+        app.prompt.runs = app
+            .prompt
+            .runs_buf
+            .parse()
+            .unwrap_or(1)
+            .clamp(1, MAX_NUMERIC_FIELD);
     }
     app.prompt.runs_buf = app.prompt.runs.to_string();
 }
@@ -2722,7 +2727,12 @@ pub(super) fn sync_concurrency_buf(app: &mut App) {
     if app.prompt.concurrency_buf.is_empty() {
         app.prompt.concurrency = 0;
     } else {
-        app.prompt.concurrency = app.prompt.concurrency_buf.parse().unwrap_or(0).min(MAX_NUMERIC_FIELD);
+        app.prompt.concurrency = app
+            .prompt
+            .concurrency_buf
+            .parse()
+            .unwrap_or(0)
+            .min(MAX_NUMERIC_FIELD);
     }
     app.prompt.concurrency_buf = app.prompt.concurrency.to_string();
 }
