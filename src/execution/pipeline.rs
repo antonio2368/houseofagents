@@ -17,7 +17,8 @@ const MAX_TERMINAL_OUTPUTS_BYTES: usize = 512 * 1024; // 512 KB cap
 
 pub type BlockId = u32;
 type ProviderPool = HashMap<(String, String), Arc<Mutex<Box<dyn provider::Provider>>>>;
-type PipelineAgentConfigs = HashMap<String, (ProviderKind, crate::config::ProviderConfig, bool)>;
+pub(crate) type PipelineAgentConfigs =
+    HashMap<String, (ProviderKind, crate::config::ProviderConfig, bool)>;
 
 #[derive(Debug, Clone)]
 struct PipelineTaskMetadata {
@@ -141,6 +142,68 @@ pub(crate) fn build_runtime_table(def: &PipelineDefinition) -> RuntimeReplicaTab
         logical_to_runtime,
         keep_policy,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline step labels (shared between TUI and headless)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn pipeline_step_labels(def: &PipelineDefinition) -> Vec<String> {
+    let rt = build_runtime_table(def);
+    // Build set of block IDs participating in loops and their total passes
+    let mut loop_passes: HashMap<BlockId, u32> = HashMap::new();
+    let graph = RegularGraph::from_def(def);
+    for lc in &def.loop_connections {
+        if let Some(sub_dag) = compute_loop_sub_dag(&graph, lc.from, lc.to) {
+            for &block_id in &sub_dag {
+                loop_passes.insert(block_id, lc.count + 1);
+            }
+        }
+    }
+    let mut labels = Vec::new();
+    for info in &rt.entries {
+        let total_passes = loop_passes.get(&info.source_block_id).copied().unwrap_or(1);
+        if total_passes > 1 {
+            for pass in 0..total_passes {
+                labels.push(format_block_step_label_with_pass(
+                    info.runtime_id,
+                    &info.display_label,
+                    &info.agent,
+                    pass,
+                ));
+            }
+        } else {
+            labels.push(format_block_step_label(
+                info.runtime_id,
+                &info.display_label,
+                &info.agent,
+            ));
+        }
+    }
+    labels
+}
+
+pub(crate) fn format_block_step_label(block_id: u32, label: &str, agent_name: &str) -> String {
+    if label.trim().is_empty() {
+        format!("Block {block_id} ({agent_name})")
+    } else if label.contains(&format!("({agent_name})"))
+        || label.contains(&format!("({agent_name} "))
+    {
+        // Label already includes agent name (multi-agent display labels from runtime table)
+        label.to_string()
+    } else {
+        format!("{label} ({agent_name})")
+    }
+}
+
+pub(crate) fn format_block_step_label_with_pass(
+    block_id: u32,
+    label: &str,
+    agent_name: &str,
+    pass: u32,
+) -> String {
+    let base = format_block_step_label(block_id, label, agent_name);
+    format!("{base} [pass {pass}]")
 }
 
 fn replica_filename(info: &RuntimeReplicaInfo, iteration: u32) -> String {

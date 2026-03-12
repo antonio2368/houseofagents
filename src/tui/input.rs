@@ -2800,10 +2800,3 @@ fn sync_pipeline_edit_replicas_buf(app: &mut App) {
         .clamp(1, max);
     app.pipeline.pipeline_edit_replicas_buf = v.to_string();
 }
-
-pub(super) fn effective_concurrency(runs: u32, concurrency: u32) -> u32 {
-    match concurrency {
-        0 => runs.max(1),
-        value => value.min(runs).max(1),
-    }
-}

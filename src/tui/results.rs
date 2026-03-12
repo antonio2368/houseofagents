@@ -167,28 +167,6 @@ fn selected_preview_path(app: &App) -> Option<&std::path::PathBuf> {
     }
 }
 
-pub(super) fn batch_run_directories(run_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut dirs = std::fs::read_dir(run_dir)
-        .ok()
-        .into_iter()
-        .flat_map(|entries| entries.flatten())
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
-                return None;
-            }
-            let name = path.file_name()?.to_str()?;
-            if name.starts_with("run_") {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    dirs.sort();
-    dirs
-}
-
 pub(super) fn has_batch_result_tree(app: &App) -> bool {
     !app.results.batch_result_runs.is_empty() || !app.results.batch_result_root_files.is_empty()
 }

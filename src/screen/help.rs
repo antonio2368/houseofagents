@@ -75,6 +75,18 @@ pub fn home_help_lines() -> &'static [Line<'static>] {
             Line::from("  Best for: complex multi-step pipelines, hierarchical analysis,"),
             Line::from("  workflows requiring specific agent ordering and data flow."),
             Line::from(""),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Headless Mode",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("  All modes can also run noninteractively from the CLI."),
+            Line::from("  Pass --prompt/--prompt-file or --pipeline to skip the TUI."),
+            Line::from("  Run houseofagents --help for full flag reference."),
+            Line::from(""),
         ]
     });
     &LINES

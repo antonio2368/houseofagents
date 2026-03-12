@@ -1,5 +1,3 @@
-use super::consolidation::*;
-use super::diagnostics::*;
 use super::execution::*;
 use super::input::*;
 use super::results::*;
@@ -10,6 +8,13 @@ use super::*;
 use crate::config::AppConfig;
 use crate::error::AppError;
 use crate::execution::ProgressEvent;
+use crate::post_run::{
+    build_diagnostic_prompt, build_file_consolidation_prompt, collect_application_errors,
+    collect_report_files, find_last_iteration, find_last_iteration_async,
+    parse_agent_iteration_filename, parse_iteration_from_filename,
+    parse_pipeline_iteration_filename, run_consolidation_with_provider_factory,
+    ConsolidationRequest, POST_RUN_SYNTHESIS_MAX_INPUT_BYTES,
+};
 use crate::provider::{CompletionResponse, Provider};
 use crossterm::event::KeyEvent;
 use std::collections::HashMap;
@@ -894,17 +899,17 @@ async fn per_run_consolidation_recreates_provider_each_run() {
     }
 
     let result = run_consolidation_with_provider_factory(
-        ConsolidationRequest::new(
-            batch_root.run_dir().clone(),
-            ConsolidationTarget::PerRun,
-            ExecutionMode::Swarm,
-            vec!["Claude".to_string(), "OpenAI".to_string()],
-            vec![1, 2],
-            false,
-            String::new(),
-            "Claude".to_string(),
-            false,
-        ),
+        ConsolidationRequest {
+            run_dir: batch_root.run_dir().clone(),
+            target: ConsolidationTarget::PerRun,
+            mode: ExecutionMode::Swarm,
+            selected_agents: vec!["Claude".to_string(), "OpenAI".to_string()],
+            successful_runs: vec![1, 2],
+            batch_stage1_done: false,
+            additional: String::new(),
+            agent_name: "Claude".to_string(),
+            agent_use_cli: false,
+        },
         || {
             Box::new(HistoryEchoProvider {
                 kind: ProviderKind::Anthropic,

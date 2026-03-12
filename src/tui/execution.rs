@@ -1,13 +1,13 @@
 use super::consolidation::should_offer_consolidation;
 use super::diagnostics::maybe_start_diagnostics;
 use super::input::{
-    effective_concurrency, sync_pipeline_concurrency_buf, sync_pipeline_iterations_buf,
-    sync_pipeline_runs_buf,
+    sync_pipeline_concurrency_buf, sync_pipeline_iterations_buf, sync_pipeline_runs_buf,
 };
 use super::resume::{
     find_last_complete_iteration_for_agents, find_latest_compatible_run, session_matches_resume,
 };
 use super::*;
+use crate::runtime_support::effective_concurrency;
 
 type BuiltExecutionOutput = (u32, Option<String>, HashMap<String, String>, OutputManager);
 
@@ -238,52 +238,16 @@ pub(super) fn resolve_selected_agent_configs(
     app: &App,
     agent_names: &[String],
 ) -> Result<Vec<AgentConfig>, String> {
-    let mut resolved = Vec::with_capacity(agent_names.len());
-    for name in agent_names {
-        let agent_config = app
-            .effective_agent_config(name)
-            .cloned()
-            .ok_or_else(|| format!("{name} is not configured"))?;
-        validate_agent_runtime(app, name, &agent_config)?;
-        resolved.push(agent_config);
-    }
-    Ok(resolved)
+    crate::runtime_support::resolve_selected_agent_configs(
+        agent_names,
+        &app.session_overrides,
+        &app.config.agents,
+        &app.cli_available,
+    )
 }
 
 pub(super) fn pipeline_step_labels(def: &pipeline_mod::PipelineDefinition) -> Vec<String> {
-    let rt = pipeline_mod::build_runtime_table(def);
-    // Build set of block IDs participating in loops and their total passes
-    let mut loop_passes: std::collections::HashMap<pipeline_mod::BlockId, u32> =
-        std::collections::HashMap::new();
-    let graph = pipeline_mod::RegularGraph::from_def(def);
-    for lc in &def.loop_connections {
-        if let Some(sub_dag) = pipeline_mod::compute_loop_sub_dag(&graph, lc.from, lc.to) {
-            for &block_id in &sub_dag {
-                loop_passes.insert(block_id, lc.count + 1);
-            }
-        }
-    }
-    let mut labels = Vec::new();
-    for info in &rt.entries {
-        let total_passes = loop_passes.get(&info.source_block_id).copied().unwrap_or(1);
-        if total_passes > 1 {
-            for pass in 0..total_passes {
-                labels.push(format_block_step_label_with_pass(
-                    info.runtime_id,
-                    &info.display_label,
-                    &info.agent,
-                    pass,
-                ));
-            }
-        } else {
-            labels.push(format_block_step_label(
-                info.runtime_id,
-                &info.display_label,
-                &info.agent,
-            ));
-        }
-    }
-    labels
+    pipeline_mod::pipeline_step_labels(def)
 }
 
 pub(super) struct MultiExecutionParams {
@@ -1109,30 +1073,7 @@ pub(super) fn validate_agent_runtime(
     agent_label: &str,
     agent_config: &AgentConfig,
 ) -> Result<(), String> {
-    if agent_config.use_cli
-        && !app
-            .cli_available
-            .get(&agent_config.provider)
-            .copied()
-            .unwrap_or(false)
-    {
-        return Err(format!(
-            "{agent_label}: {} CLI is not installed",
-            agent_config.provider.display_name()
-        ));
-    }
-
-    if !agent_config.use_cli && agent_config.api_key.trim().is_empty() {
-        return Err(format!("{agent_label} API key is missing"));
-    }
-
-    provider::validate_effort_config(
-        agent_config.provider,
-        agent_config.use_cli,
-        agent_config.reasoning_effort.as_deref(),
-        agent_config.thinking_effort.as_deref(),
-    )
-    .map_err(|message| format!("{agent_label}: {message}"))
+    crate::runtime_support::validate_agent_runtime(&app.cli_available, agent_label, agent_config)
 }
 
 pub(super) fn handle_progress(app: &mut App, event: ProgressEvent) {
@@ -1353,16 +1294,7 @@ pub(super) fn update_step_status(state: &mut RunState, label: &str, status: RunS
 }
 
 pub(super) fn format_block_step_label(block_id: u32, label: &str, agent_name: &str) -> String {
-    if label.trim().is_empty() {
-        format!("Block {block_id} ({agent_name})")
-    } else if label.contains(&format!("({agent_name})"))
-        || label.contains(&format!("({agent_name} "))
-    {
-        // Label already includes agent name (multi-agent display labels from runtime table)
-        label.to_string()
-    } else {
-        format!("{label} ({agent_name})")
-    }
+    pipeline_mod::format_block_step_label(block_id, label, agent_name)
 }
 
 fn format_block_step_label_with_pass(
@@ -1371,8 +1303,7 @@ fn format_block_step_label_with_pass(
     agent_name: &str,
     pass: u32,
 ) -> String {
-    let base = format_block_step_label(block_id, label, agent_name);
-    format!("{base} [pass {pass}]")
+    pipeline_mod::format_block_step_label_with_pass(block_id, label, agent_name, pass)
 }
 
 /// Resolve the step label for a block event, preferring the pass-specific

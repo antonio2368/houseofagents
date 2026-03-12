@@ -515,55 +515,11 @@ pub enum PipelineDialogMode {
     Load,
 }
 
-fn detect_cli(name: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    find_executable(name, std::env::split_paths(&paths))
-}
-
-fn find_executable(name: &str, dirs: impl Iterator<Item = std::path::PathBuf>) -> bool {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
-    dirs.into_iter().any(|dir| {
-        let candidate = dir.join(name);
-        candidate
-            .metadata()
-            .map(|m| {
-                if !m.is_file() {
-                    return false;
-                }
-                #[cfg(unix)]
-                {
-                    m.permissions().mode() & 0o111 != 0
-                }
-                #[cfg(not(unix))]
-                {
-                    true
-                }
-            })
-            .unwrap_or(false)
-    })
-}
-
 impl App {
     pub fn new(config: AppConfig) -> Self {
-        let mut cli_available = HashMap::new();
-        cli_available.insert(ProviderKind::Anthropic, detect_cli("claude"));
-        cli_available.insert(ProviderKind::OpenAI, detect_cli("codex"));
-        cli_available.insert(ProviderKind::Gemini, detect_cli("gemini"));
-
-        let mut session_overrides = HashMap::new();
-        for agent in &config.agents {
-            let has_key = !agent.api_key.is_empty();
-            let has_cli = cli_available.get(&agent.provider).copied().unwrap_or(false);
-            if !has_key && has_cli {
-                let mut override_agent = agent.clone();
-                override_agent.use_cli = true;
-                session_overrides.insert(agent.name.clone(), override_agent);
-            }
-        }
+        let cli_available = crate::runtime_support::detect_cli_availability();
+        let session_overrides =
+            crate::runtime_support::compute_session_overrides(&config.agents, &cli_available);
 
         Self {
             config,
@@ -1797,27 +1753,5 @@ mod tests {
         assert_eq!(entries[0], "[Block 1 Claude iter 1] fail");
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn find_executable_rejects_non_executable_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let bin_path = dir.path().join("fakecli");
-        std::fs::write(&bin_path, "").unwrap();
-        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let result = super::find_executable("fakecli", std::iter::once(dir.path().to_path_buf()));
-        assert!(!result, "non-executable file should not be detected as CLI");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn find_executable_accepts_executable_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let bin_path = dir.path().join("fakecli2");
-        std::fs::write(&bin_path, "").unwrap();
-        std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let result = super::find_executable("fakecli2", std::iter::once(dir.path().to_path_buf()));
-        assert!(result, "executable file should be detected as CLI");
-    }
+    // find_executable tests moved to runtime_support::tests
 }

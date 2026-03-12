@@ -103,7 +103,83 @@ Options:
       --init-config      Write a starter config file and exit
       --force            Overwrite config when used with --init-config
   -h, --help             Print help
+
+Headless mode (noninteractive):
+      --prompt <TEXT>              Prompt text (activates headless mode)
+      --prompt-file <PATH>        Read prompt from file (activates headless mode)
+      --pipeline <PATH>           Pipeline TOML file (activates headless mode)
+      --mode <MODE>               Execution mode: relay, swarm, pipeline [default: swarm]
+      --agents <A,B,...>          Comma-separated agent names
+      --order <A,B,...>           Explicit relay order (defaults to --agents order)
+      --iterations <N>            Number of iterations
+      --runs <N>                  Independent runs [default: 1]
+      --concurrency <N>           Batch concurrency, 0 = unlimited [default: 0]
+      --session-name <NAME>       Output directory label
+      --forward-prompt            Forward prompt to all relay agents
+      --no-keep-session           Disable session history keeping
+      --consolidate <AGENT>       Agent for post-run consolidation
+      --consolidation-prompt <S>  Extra consolidation instructions
+      --output-format <FMT>       Output format: text, json [default: text]
+      --quiet                     Suppress stderr progress output
 ```
+
+## Noninteractive (Headless) Mode
+
+Run agents from scripts and CI pipelines without the TUI. Activate headless mode by passing `--prompt`, `--prompt-file`, or `--pipeline`.
+
+### Relay / Swarm Examples
+
+```bash
+# Swarm with two agents, 3 iterations
+houseofagents --prompt "Analyze this codebase" --agents Claude,OpenAI --iterations 3
+
+# Relay with explicit order
+houseofagents --prompt "Review and fix" --mode relay --agents Claude,OpenAI --order OpenAI,Claude
+
+# Batch: 5 independent runs, 3 at a time
+houseofagents --prompt "Generate tests" --agents Claude --runs 5 --concurrency 3
+
+# With consolidation
+houseofagents --prompt "Debate pros and cons" --agents Claude,Gemini --iterations 2 \
+  --consolidate Claude --consolidation-prompt "Summarize the debate"
+
+# JSON output for scripting
+houseofagents --prompt "Analyze" --agents Claude --output-format json --quiet
+```
+
+### Pipeline Examples
+
+```bash
+# Run a saved pipeline
+houseofagents --pipeline my_pipeline.toml
+
+# Override iterations and run in batch
+houseofagents --pipeline my_pipeline.toml --iterations 5 --runs 3
+
+# Pipeline with consolidation
+houseofagents --pipeline my_pipeline.toml --consolidate Claude
+```
+
+### Output Behavior
+
+- **stdout**: In text mode, prints the run directory path on success. In JSON mode, prints a structured result object.
+- **stderr**: Progress events (agent starts, iteration completions, errors). Suppressed with `--quiet`. In JSON output format, progress events are NDJSON on stderr.
+- Headless mode never enters alternate-screen mode — safe for piping and CI.
+
+### Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success |
+| `1` | Validation error (bad flags, missing agents, etc.) |
+| `2` | Execution error (provider failure, partial failure) |
+| `130` | Cancelled (Ctrl+C) |
+
+### Limitations
+
+- Resume is not supported in headless mode (planned for a future version).
+- Prompt is required for relay/swarm (`--prompt` or `--prompt-file`); for pipeline, the pipeline TOML's `initial_prompt` is used if `--prompt` is not given.
+- `--consolidate` is not supported for single-run relay (relay produces a single output chain with no branches to merge). Batch relay consolidation works normally.
 
 ## Configuration
 

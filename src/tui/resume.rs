@@ -1,56 +1,5 @@
 use super::*;
-
-pub(super) async fn find_last_iteration_async(
-    run_dir: &std::path::Path,
-    agent_keys: &[String],
-) -> Option<u32> {
-    let mut max_iter: Option<u32> = None;
-    let mut entries = tokio::fs::read_dir(run_dir).await.ok()?;
-
-    loop {
-        match entries.next_entry().await {
-            Ok(Some(entry)) => {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if agent_keys.is_empty() {
-                    if let Some(iter) = parse_pipeline_iteration_filename(&name) {
-                        max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
-                    }
-                } else {
-                    for key in agent_keys {
-                        if let Some(iter) = parse_agent_iteration_filename(&name, key) {
-                            max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
-                        }
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(_) => break,
-        }
-    }
-
-    max_iter
-}
-
-pub(super) fn find_last_iteration(run_dir: &std::path::Path, agent_keys: &[String]) -> Option<u32> {
-    let mut max_iter: Option<u32> = None;
-    let entries = std::fs::read_dir(run_dir).ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if agent_keys.is_empty() {
-            if let Some(iter) = parse_pipeline_iteration_filename(&name) {
-                max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
-            }
-        } else {
-            for key in agent_keys {
-                if let Some(iter) = parse_agent_iteration_filename(&name, key) {
-                    max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
-                }
-            }
-        }
-    }
-    max_iter
-}
+use crate::post_run;
 
 pub(super) fn find_last_complete_iteration_for_agents(
     run_dir: &std::path::Path,
@@ -62,14 +11,17 @@ pub(super) fn find_last_complete_iteration_for_agents(
         return None;
     }
 
-    let agent_keys: Vec<String> = agents.iter().map(|n| App::agent_file_key(n)).collect();
+    let agent_keys: Vec<String> = agents
+        .iter()
+        .map(|n| OutputManager::sanitize_session_name(n))
+        .collect();
     let mut iter_to_agents: HashMap<u32, HashSet<String>> = HashMap::new();
     let entries = std::fs::read_dir(run_dir).ok()?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         for key in &agent_keys {
-            if let Some(iter) = parse_agent_iteration_filename(&name, key) {
+            if let Some(iter) = post_run::parse_agent_iteration_filename(&name, key) {
                 iter_to_agents.entry(iter).or_default().insert(key.clone());
             }
         }
@@ -160,69 +112,4 @@ pub(super) fn run_dir_matches_mode_and_agents(
     OutputManager::read_agent_session_info(run_dir)
         .map(|session| session_matches_resume(&session, mode, agents, keep_session))
         .unwrap_or(false)
-}
-
-pub(super) fn parse_agent_iteration_filename(name: &str, agent_key: &str) -> Option<u32> {
-    if !name.ends_with(".md") {
-        return None;
-    }
-    let prefix = format!("{agent_key}_iter");
-    if !name.starts_with(&prefix) {
-        return None;
-    }
-    let iter_str = name.trim_end_matches(".md").strip_prefix(&prefix)?;
-    iter_str.parse::<u32>().ok()
-}
-
-/// Parse iteration from a pipeline block output filename.
-/// Matches both named blocks (`{name}_b{id}_{agent}_iter{n}.md`)
-/// and unnamed blocks (`block{id}_{agent}_iter{n}.md`).
-pub(super) fn parse_pipeline_iteration_filename(name: &str) -> Option<u32> {
-    if !name.ends_with(".md") {
-        return None;
-    }
-    let stem = name.trim_end_matches(".md");
-
-    // Search right-to-left so block names containing "_b" (for example
-    // "web_builder") still detect the actual "_b{id}_" marker.
-    let mut search_end = stem.len();
-    while let Some(rel) = stem[..search_end].rfind("_b") {
-        let after_b = &stem[rel + 2..];
-        if let Some(end_of_id) = after_b.find('_') {
-            if after_b[..end_of_id].parse::<u32>().is_ok() {
-                return parse_iteration_from_filename(name);
-            }
-        }
-        search_end = rel;
-    }
-
-    if let Some(rest) = stem.strip_prefix("block") {
-        if let Some(underscore) = rest.find('_') {
-            if rest[..underscore].parse::<u32>().is_ok() {
-                return parse_iteration_from_filename(name);
-            }
-        }
-    }
-
-    None
-}
-
-pub(super) fn parse_iteration_from_filename(name: &str) -> Option<u32> {
-    if !name.ends_with(".md") {
-        return None;
-    }
-    let stem = name.trim_end_matches(".md");
-    // Strip optional _loop{N} suffix before parsing iteration number
-    let stem = if let Some(lp) = stem.rfind("_loop") {
-        if stem[lp + 5..].parse::<u32>().is_ok() {
-            &stem[..lp]
-        } else {
-            stem
-        }
-    } else {
-        stem
-    };
-    let iter_pos = stem.rfind("_iter")?;
-    let iter_str = &stem[iter_pos + 5..];
-    iter_str.parse::<u32>().ok()
 }
