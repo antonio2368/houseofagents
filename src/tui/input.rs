@@ -447,6 +447,9 @@ pub(super) fn handle_pipeline_paste(app: &mut App, text: &str) {
     if app.pipeline.pipeline_show_session_config {
         return;
     }
+    if app.pipeline.pipeline_show_feed_list || app.pipeline.pipeline_show_feed_edit {
+        return;
+    }
     if app.pipeline.pipeline_show_edit {
         match app.pipeline.pipeline_edit_field {
             PipelineEditField::Name => {
@@ -559,8 +562,14 @@ pub(super) fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
         handle_pipeline_loop_edit_key(app, key);
         return;
     }
+    // feed_edit checked before feed_list: Enter in list opens edit stacked on
+    // top of list, so the edit popup must capture keys first.
     if app.pipeline.pipeline_show_feed_edit {
         handle_pipeline_feed_edit_key(app, key);
+        return;
+    }
+    if app.pipeline.pipeline_show_feed_list {
+        handle_pipeline_feed_list_key(app, key);
         return;
     }
     if app.pipeline.pipeline_removing_conn {
@@ -935,20 +944,14 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     if incoming_feeds.is_empty() {
                         app.error_modal =
                             Some("Use 'f' on an execution block to create feeds.".into());
-                    } else {
-                        // Cycle to next feed if already editing one for this block
-                        let next = if let Some(current) = app.pipeline.pipeline_feed_edit_target {
-                            if let Some(pos) = incoming_feeds.iter().position(|f| *f == current) {
-                                incoming_feeds[(pos + 1) % incoming_feeds.len()]
-                            } else {
-                                incoming_feeds[0]
-                            }
-                        } else {
-                            incoming_feeds[0]
-                        };
+                    } else if incoming_feeds.len() == 1 {
                         app.pipeline.pipeline_show_feed_edit = true;
-                        app.pipeline.pipeline_feed_edit_target = Some(next);
+                        app.pipeline.pipeline_feed_edit_target = Some(incoming_feeds[0]);
                         app.pipeline.pipeline_feed_edit_field = PipelineFeedEditField::Collection;
+                    } else {
+                        app.pipeline.pipeline_show_feed_list = true;
+                        app.pipeline.pipeline_feed_list_cursor = 0;
+                        app.pipeline.pipeline_feed_list_target = Some(sel);
                     }
                 } else {
                     app.error_modal = Some("No applicable feeds for this block".into());
@@ -968,23 +971,22 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     .collect();
                 if feeds.is_empty() {
                     app.error_modal = Some("No data feeds on this block".into());
+                } else if feeds.len() == 1 {
+                    app.pipeline.pipeline_def.data_feeds.remove(feeds[0].0);
                 } else {
-                    // If feed edit popup is targeting a specific feed, remove that one;
-                    // otherwise remove the first matching feed.
-                    let idx = if let Some((efrom, eto)) = app.pipeline.pipeline_feed_edit_target {
-                        feeds
-                            .iter()
-                            .find(|(_, from, to)| *from == efrom && *to == eto)
-                            .map(|(i, _, _)| *i)
-                            .unwrap_or(feeds[0].0)
+                    // Multiple feeds: need user to pick which one.
+                    let is_fin = app.pipeline.pipeline_def.is_finalization_block(sel);
+                    if is_fin {
+                        // Open feed list picker for targeted deletion
+                        app.pipeline.pipeline_show_feed_list = true;
+                        app.pipeline.pipeline_feed_list_cursor = 0;
+                        app.pipeline.pipeline_feed_list_target = Some(sel);
                     } else {
-                        feeds[0].0
-                    };
-                    app.pipeline.pipeline_def.data_feeds.remove(idx);
-                    // Close feed edit popup if it was targeting the removed feed
-                    if app.pipeline.pipeline_show_feed_edit {
-                        app.pipeline.pipeline_show_feed_edit = false;
-                        app.pipeline.pipeline_feed_edit_target = None;
+                        app.error_modal = Some(
+                            "Multiple feeds on this block. Use F on the \
+                             finalization block to pick which feed to remove."
+                                .into(),
+                        );
                     }
                 }
             }
@@ -2017,6 +2019,15 @@ fn load_pipeline_by_filtered_cursor(app: &mut App) {
                 app.pipeline.pipeline_save_path = Some(path);
                 app.pipeline.pipeline_block_cursor =
                     app.pipeline.pipeline_def.all_blocks().next().map(|b| b.id);
+                // Reset overlay state that may reference old definition
+                app.pipeline.pipeline_show_feed_list = false;
+                app.pipeline.pipeline_feed_list_target = None;
+                app.pipeline.pipeline_feed_list_cursor = 0;
+                app.pipeline.pipeline_show_feed_edit = false;
+                app.pipeline.pipeline_feed_edit_target = None;
+                app.pipeline.pipeline_feed_edit_field = PipelineFeedEditField::Collection;
+                app.pipeline.pipeline_show_loop_edit = false;
+                app.pipeline.pipeline_loop_edit_target = None;
                 close_load_dialog(app);
             }
             Err(e) => {
@@ -2228,6 +2239,7 @@ fn handle_pipeline_feed_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
             app.pipeline.pipeline_show_feed_edit = false;
+            app.pipeline.pipeline_feed_edit_target = None;
         }
         KeyCode::Tab => {
             app.pipeline.pipeline_feed_edit_field = match app.pipeline.pipeline_feed_edit_field {
@@ -2280,6 +2292,81 @@ fn handle_pipeline_feed_edit_key(app: &mut App, key: KeyEvent) {
                 PipelineFeedEditField::Collection => PipelineFeedEditField::Granularity,
                 PipelineFeedEditField::Granularity => PipelineFeedEditField::Collection,
             };
+        }
+        _ => {}
+    }
+}
+
+fn handle_pipeline_feed_list_key(app: &mut App, key: KeyEvent) {
+    let fin_id = match app.pipeline.pipeline_feed_list_target {
+        Some(id) => id,
+        None => return,
+    };
+
+    // Collect (data_feeds_index, from, to) so deletion uses exact index
+    let feeds: Vec<(usize, BlockId, BlockId)> = app
+        .pipeline
+        .pipeline_def
+        .data_feeds
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.to == fin_id)
+        .map(|(i, f)| (i, f.from, f.to))
+        .collect();
+
+    if feeds.is_empty() {
+        app.pipeline.pipeline_show_feed_list = false;
+        app.pipeline.pipeline_feed_list_target = None;
+        app.pipeline.pipeline_feed_list_cursor = 0;
+        return;
+    }
+
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            let len = feeds.len();
+            app.pipeline.pipeline_feed_list_cursor = if app.pipeline.pipeline_feed_list_cursor == 0
+            {
+                len - 1
+            } else {
+                app.pipeline.pipeline_feed_list_cursor - 1
+            };
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.pipeline.pipeline_feed_list_cursor =
+                (app.pipeline.pipeline_feed_list_cursor + 1) % feeds.len();
+        }
+        KeyCode::Enter => {
+            let idx = app.pipeline.pipeline_feed_list_cursor;
+            if let Some(&(_, from, to)) = feeds.get(idx) {
+                app.pipeline.pipeline_feed_edit_target = Some((from, to));
+                app.pipeline.pipeline_show_feed_edit = true;
+                app.pipeline.pipeline_feed_edit_field = PipelineFeedEditField::Collection;
+            }
+        }
+        KeyCode::Esc => {
+            app.pipeline.pipeline_show_feed_list = false;
+            app.pipeline.pipeline_feed_list_target = None;
+            app.pipeline.pipeline_feed_list_cursor = 0;
+        }
+        KeyCode::Char('F') => {
+            let cursor = app.pipeline.pipeline_feed_list_cursor;
+            if let Some(&(data_idx, _, _)) = feeds.get(cursor) {
+                app.pipeline.pipeline_def.data_feeds.remove(data_idx);
+                let remaining = app
+                    .pipeline
+                    .pipeline_def
+                    .data_feeds
+                    .iter()
+                    .filter(|f| f.to == fin_id)
+                    .count();
+                if remaining == 0 {
+                    app.pipeline.pipeline_show_feed_list = false;
+                    app.pipeline.pipeline_feed_list_target = None;
+                    app.pipeline.pipeline_feed_list_cursor = 0;
+                } else {
+                    app.pipeline.pipeline_feed_list_cursor = cursor.min(remaining - 1);
+                }
+            }
         }
         _ => {}
     }

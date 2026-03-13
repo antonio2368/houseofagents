@@ -172,6 +172,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.pipeline.pipeline_show_loop_edit {
         draw_loop_edit_popup(f, app, area);
     }
+    if app.pipeline.pipeline_show_feed_list {
+        draw_feed_list_popup(f, app, area);
+    }
     if app.pipeline.pipeline_show_feed_edit {
         draw_feed_edit_popup(f, app, area);
     }
@@ -261,6 +264,7 @@ fn draw_prompt_area(f: &mut Frame, app: &App, area: Rect) {
         || app.pipeline.pipeline_show_session_config
         || app.pipeline.pipeline_show_loop_edit
         || app.pipeline.pipeline_show_feed_edit
+        || app.pipeline.pipeline_show_feed_list
         || app.error_modal.is_some()
         || app.help_popup.active
         || app.setup_analysis.active;
@@ -2694,6 +2698,113 @@ fn draw_feed_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     let hint = Paragraph::new("  Tab: switch field  Space/Enter: toggle value  Esc: close")
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(hint, chunks[4]);
+}
+
+fn draw_feed_list_popup(f: &mut Frame, app: &App, area: Rect) {
+    let fin_id = match app.pipeline.pipeline_feed_list_target {
+        Some(id) => id,
+        None => return,
+    };
+
+    let popup = centered_rect(50, 30, area);
+    f.render_widget(Clear, popup);
+
+    let fin_name = app
+        .pipeline
+        .pipeline_def
+        .finalization_blocks
+        .iter()
+        .find(|b| b.id == fin_id)
+        .map(|b| {
+            if b.name.is_empty() {
+                format!("Block {}", b.id)
+            } else {
+                b.name.clone()
+            }
+        })
+        .unwrap_or_else(|| format!("#{fin_id}"));
+
+    let title = format!(" Feeds \u{2192} {fin_name} ");
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    if inner.width < 10 || inner.height < 3 {
+        return;
+    }
+
+    let feeds: Vec<&crate::execution::pipeline::DataFeed> = app
+        .pipeline
+        .pipeline_def
+        .data_feeds
+        .iter()
+        .filter(|df| df.to == fin_id)
+        .collect();
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),    // feed list (scrollable)
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    let cursor = app.pipeline.pipeline_feed_list_cursor;
+    let lines: Vec<Line> = feeds
+        .iter()
+        .enumerate()
+        .map(|(i, feed)| {
+            let source_name = if feed.from == 0 {
+                "All execution blocks".to_string()
+            } else {
+                app.pipeline
+                    .pipeline_def
+                    .blocks
+                    .iter()
+                    .find(|b| b.id == feed.from)
+                    .map(|b| {
+                        if b.name.is_empty() {
+                            format!("Block {}", b.id)
+                        } else {
+                            b.name.clone()
+                        }
+                    })
+                    .unwrap_or_else(|| format!("#{}", feed.from))
+            };
+            let marker = if i == cursor { "\u{25b8} " } else { "  " };
+            let style = if i == cursor {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(
+                format!(
+                    "{marker}{source_name}  [{}] [{}]",
+                    feed.collection.as_str(),
+                    feed.granularity.as_str()
+                ),
+                style,
+            ))
+        })
+        .collect();
+
+    let visible_rows = chunks[0].height as usize;
+    let scroll = if cursor >= visible_rows {
+        (cursor - visible_rows + 1) as u16
+    } else {
+        0
+    };
+    let list_p = Paragraph::new(lines).scroll((scroll, 0));
+    f.render_widget(list_p, chunks[0]);
+
+    let hint = Paragraph::new("  Up/Down: navigate | Enter: edit | F: delete | Esc: close")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(hint, chunks[1]);
 }
 
 fn draw_error_modal(f: &mut Frame, message: &str) {

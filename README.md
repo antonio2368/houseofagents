@@ -324,8 +324,8 @@ Fields vary by mode for options, but every prompt flow includes Prompt, Session 
 | `x` | Enter remove-connection mode — pick a connection to delete |
 | `o` | Create loop-back connection — press on the downstream feedback block, then select the upstream restart target; set count and prompt; press on existing loop to edit |
 | `A` | Add a finalization block (placed below the separator in the finalization region) |
-| `f` | Create or edit data feed — on an execution block, enters feed-connect mode (navigate to a finalization block and press Enter to create the feed); on a finalization block, opens incoming feeds for editing |
-| `F` | Remove a data feed attached to the selected block |
+| `f` | Create or edit data feed — on an execution block, enters feed-connect mode (navigate to a finalization block and press Enter to create the feed); on a finalization block with multiple feeds, opens a feed list picker for selecting and editing individual feeds (opens edit directly if only one feed) |
+| `F` | Remove a data feed — removes directly if only one feed on the block; on a finalization block with multiple feeds, opens the feed list picker to select which one; on an execution block with multiple feeds, prompts to use the finalization block instead |
 | `s` | Open session configuration popup — toggle per-session history persistence |
 | `Arrow keys` / `h j k l` | Navigate/select blocks spatially without moving |
 | `Shift+Arrow keys` / `Shift+H J K L` | Move selected block (swap with occupied target cell, otherwise move) |

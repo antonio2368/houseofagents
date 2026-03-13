@@ -382,6 +382,9 @@ pub(crate) struct PipelineState {
     pub(crate) pipeline_show_feed_edit: bool,
     pub(crate) pipeline_feed_edit_target: Option<(BlockId, BlockId)>,
     pub(crate) pipeline_feed_edit_field: PipelineFeedEditField,
+    pub(crate) pipeline_show_feed_list: bool,
+    pub(crate) pipeline_feed_list_cursor: usize,
+    pub(crate) pipeline_feed_list_target: Option<BlockId>,
 }
 
 pub(crate) struct PendingSingleExecution {
@@ -1266,6 +1269,9 @@ impl PipelineState {
             pipeline_show_feed_edit: false,
             pipeline_feed_edit_target: None,
             pipeline_feed_edit_field: PipelineFeedEditField::Collection,
+            pipeline_show_feed_list: false,
+            pipeline_feed_list_cursor: 0,
+            pipeline_feed_list_target: None,
         }
     }
 }

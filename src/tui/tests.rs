@@ -3239,3 +3239,317 @@ fn load_dialog_viewport_shrink_corrects_scroll() {
     // Expected: 9 + 1 - 4 = 6
     assert_eq!(app.pipeline.pipeline_file_scroll, 9 + 1 - 4);
 }
+
+// --- Feed list picker tests ---
+
+fn pipeline_app_with_fin_and_feeds(n: usize) -> App {
+    use crate::execution::pipeline::{DataFeed, FeedCollection, FeedGranularity, PipelineBlock};
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+
+    let fin_id = (n + 1) as u32;
+
+    for i in 1..=n {
+        app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+            id: i as u32,
+            name: format!("Exec{i}"),
+            agents: vec!["Claude".into()],
+            prompt: String::new(),
+            profiles: vec![],
+            session_id: None,
+            position: ((i - 1) as u16, 0),
+            replicas: 1,
+        });
+        app.pipeline.pipeline_def.data_feeds.push(DataFeed {
+            from: i as u32,
+            to: fin_id,
+            collection: FeedCollection::LastIteration,
+            granularity: FeedGranularity::PerRun,
+        });
+    }
+
+    app.pipeline
+        .pipeline_def
+        .finalization_blocks
+        .push(PipelineBlock {
+            id: fin_id,
+            name: "Fin".into(),
+            agents: vec!["Claude".into()],
+            prompt: String::new(),
+            profiles: vec![],
+            session_id: None,
+            position: (0, 1),
+            replicas: 1,
+        });
+
+    app.pipeline.pipeline_block_cursor = Some(fin_id);
+    app.pipeline.pipeline_next_id = fin_id + 1;
+    app
+}
+
+#[test]
+fn f_on_fin_no_feeds_shows_error() {
+    let mut app = pipeline_app_with_fin_and_feeds(0);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert!(app.error_modal.is_some());
+    assert!(!app.pipeline.pipeline_show_feed_list);
+    assert!(!app.pipeline.pipeline_show_feed_edit);
+}
+
+#[test]
+fn f_on_fin_one_feed_opens_edit_directly() {
+    let mut app = pipeline_app_with_fin_and_feeds(1);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert!(app.pipeline.pipeline_show_feed_edit);
+    assert!(!app.pipeline.pipeline_show_feed_list);
+    assert_eq!(app.pipeline.pipeline_feed_edit_target, Some((1, 2)));
+}
+
+#[test]
+fn f_on_fin_two_feeds_opens_list() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert!(app.pipeline.pipeline_show_feed_list);
+    assert_eq!(app.pipeline.pipeline_feed_list_target, Some(3));
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 0);
+    assert!(!app.pipeline.pipeline_show_feed_edit);
+}
+
+#[test]
+fn feed_list_nav_wraps_down() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 0);
+    handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 1);
+    handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 0);
+}
+
+#[test]
+fn feed_list_nav_wraps_up() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 0);
+    handle_key(&mut app, key(KeyCode::Up));
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 1);
+}
+
+#[test]
+fn feed_list_enter_opens_edit_keeps_list() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    handle_key(&mut app, key(KeyCode::Down)); // cursor at 1
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(app.pipeline.pipeline_show_feed_edit);
+    assert_eq!(app.pipeline.pipeline_feed_edit_target, Some((2, 3)));
+    assert!(app.pipeline.pipeline_show_feed_list);
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 1);
+}
+
+#[test]
+fn esc_from_edit_returns_to_list() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    handle_key(&mut app, key(KeyCode::Enter)); // open edit
+    assert!(app.pipeline.pipeline_show_feed_edit);
+    assert!(app.pipeline.pipeline_show_feed_list);
+    handle_key(&mut app, key(KeyCode::Esc)); // close edit
+    assert!(!app.pipeline.pipeline_show_feed_edit);
+    assert!(app.pipeline.pipeline_feed_edit_target.is_none());
+    assert!(app.pipeline.pipeline_show_feed_list);
+}
+
+#[test]
+fn esc_from_list_closes_all() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert!(app.pipeline.pipeline_show_feed_list);
+    handle_key(&mut app, key(KeyCode::Esc));
+    assert!(!app.pipeline.pipeline_show_feed_list);
+    assert!(app.pipeline.pipeline_feed_list_target.is_none());
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 0);
+}
+
+#[test]
+fn feed_list_f_deletes_and_clamps() {
+    let mut app = pipeline_app_with_fin_and_feeds(3);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    // Move cursor to last item (index 2)
+    handle_key(&mut app, key(KeyCode::Down));
+    handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 2);
+    handle_key(&mut app, key(KeyCode::Char('F')));
+    let remaining = app
+        .pipeline
+        .pipeline_def
+        .data_feeds
+        .iter()
+        .filter(|f| f.to == 4)
+        .count();
+    assert_eq!(remaining, 2);
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 1);
+    assert!(app.pipeline.pipeline_show_feed_list);
+}
+
+#[test]
+fn feed_list_f_deletes_until_empty_closes() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    // Delete first feed
+    handle_key(&mut app, key(KeyCode::Char('F')));
+    let remaining = app
+        .pipeline
+        .pipeline_def
+        .data_feeds
+        .iter()
+        .filter(|f| f.to == 3)
+        .count();
+    assert_eq!(remaining, 1);
+    assert!(app.pipeline.pipeline_show_feed_list);
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 0);
+    // Delete second feed
+    handle_key(&mut app, key(KeyCode::Char('F')));
+    let remaining = app
+        .pipeline
+        .pipeline_def
+        .data_feeds
+        .iter()
+        .filter(|f| f.to == 3)
+        .count();
+    assert_eq!(remaining, 0);
+    assert!(!app.pipeline.pipeline_show_feed_list);
+    assert!(app.pipeline.pipeline_feed_list_target.is_none());
+    assert_eq!(app.pipeline.pipeline_feed_list_cursor, 0);
+}
+
+#[test]
+fn feed_list_suppresses_canvas_cursor() {
+    let app = pipeline_app_with_fin_and_feeds(2);
+    // When feed list is not shown, no overlay from it
+    let has_overlay_without = app.pipeline.pipeline_show_feed_list;
+    assert!(!has_overlay_without);
+
+    let mut app2 = pipeline_app_with_fin_and_feeds(2);
+    app2.pipeline.pipeline_show_feed_list = true;
+    assert!(app2.pipeline.pipeline_show_feed_list);
+}
+
+#[test]
+fn paste_is_noop_when_feed_list_open() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    // Open the feed list via 'f' on builder focus (default from helper)
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert!(app.pipeline.pipeline_show_feed_list);
+    // Now switch underlying focus to InitialPrompt to verify paste doesn't leak through
+    app.pipeline.pipeline_focus = PipelineFocus::InitialPrompt;
+    app.pipeline.pipeline_def.initial_prompt = String::new();
+    handle_pipeline_paste(&mut app, "should not appear");
+    assert!(app.pipeline.pipeline_def.initial_prompt.is_empty());
+}
+
+#[test]
+fn paste_is_noop_when_feed_edit_open() {
+    let mut app = pipeline_app_with_fin_and_feeds(1);
+    // Open feed edit via 'f' on builder focus (single feed -> direct edit)
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert!(app.pipeline.pipeline_show_feed_edit);
+    app.pipeline.pipeline_focus = PipelineFocus::InitialPrompt;
+    app.pipeline.pipeline_def.initial_prompt = String::new();
+    handle_pipeline_paste(&mut app, "should not appear");
+    assert!(app.pipeline.pipeline_def.initial_prompt.is_empty());
+}
+
+#[test]
+fn feed_list_f_deletes_exact_feed_by_index() {
+    use crate::execution::pipeline::{DataFeed, FeedCollection, FeedGranularity};
+    // Create a setup with two feeds that have the same (from, to) but different settings
+    // to verify index-based deletion removes exactly one
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    let fin_id = 3;
+    // Add a duplicate-source feed (same from=1, to=3 but different collection)
+    app.pipeline.pipeline_def.data_feeds.push(DataFeed {
+        from: 1,
+        to: fin_id,
+        collection: FeedCollection::AllIterations,
+        granularity: FeedGranularity::AllRuns,
+    });
+    // Now there are 3 feeds to fin_id: from=1, from=2, from=1(dup)
+    handle_key(&mut app, key(KeyCode::Char('f')));
+    assert!(app.pipeline.pipeline_show_feed_list);
+    // Cursor at 0 → first feed (from=1, LastIteration)
+    handle_key(&mut app, key(KeyCode::Char('F')));
+    // Should delete exactly 1 feed, leaving 2
+    let remaining: Vec<_> = app
+        .pipeline
+        .pipeline_def
+        .data_feeds
+        .iter()
+        .filter(|f| f.to == fin_id)
+        .collect();
+    assert_eq!(remaining.len(), 2);
+    // The duplicate (from=1, AllIterations) should still be present
+    assert!(remaining
+        .iter()
+        .any(|f| f.from == 1 && f.collection == FeedCollection::AllIterations));
+}
+
+#[test]
+fn canvas_f_on_multi_feed_fin_opens_list() {
+    let mut app = pipeline_app_with_fin_and_feeds(2);
+    let feed_count_before = app.pipeline.pipeline_def.data_feeds.len();
+    handle_key(&mut app, key(KeyCode::Char('F')));
+    // Should open feed list instead of deleting
+    assert!(app.pipeline.pipeline_show_feed_list);
+    assert_eq!(app.pipeline.pipeline_feed_list_target, Some(3));
+    // No feed was deleted
+    assert_eq!(
+        app.pipeline.pipeline_def.data_feeds.len(),
+        feed_count_before
+    );
+}
+
+#[test]
+fn canvas_f_on_single_feed_fin_deletes_directly() {
+    let mut app = pipeline_app_with_fin_and_feeds(1);
+    assert_eq!(app.pipeline.pipeline_def.data_feeds.len(), 1);
+    handle_key(&mut app, key(KeyCode::Char('F')));
+    // Should delete directly, not open list
+    assert!(!app.pipeline.pipeline_show_feed_list);
+    assert_eq!(app.pipeline.pipeline_def.data_feeds.len(), 0);
+}
+
+#[test]
+fn canvas_f_on_exec_with_multi_feeds_shows_error() {
+    use crate::execution::pipeline::{DataFeed, FeedCollection, FeedGranularity, PipelineBlock};
+    let mut app = pipeline_app_with_fin_and_feeds(1);
+    // Add a second finalization block and a second feed from the same exec block
+    app.pipeline
+        .pipeline_def
+        .finalization_blocks
+        .push(PipelineBlock {
+            id: 10,
+            name: "Fin2".into(),
+            agents: vec!["Claude".into()],
+            prompt: String::new(),
+            profiles: vec![],
+            session_id: None,
+            position: (1, 1),
+            replicas: 1,
+        });
+    app.pipeline.pipeline_def.data_feeds.push(DataFeed {
+        from: 1,
+        to: 10,
+        collection: FeedCollection::LastIteration,
+        granularity: FeedGranularity::PerRun,
+    });
+    // Cursor on execution block 1, which now has 2 outgoing feeds
+    app.pipeline.pipeline_block_cursor = Some(1);
+    let feed_count = app.pipeline.pipeline_def.data_feeds.len();
+    handle_key(&mut app, key(KeyCode::Char('F')));
+    // Should show error, not delete
+    assert!(app.error_modal.is_some());
+    assert!(!app.pipeline.pipeline_show_feed_list);
+    assert_eq!(app.pipeline.pipeline_def.data_feeds.len(), feed_count);
+}
