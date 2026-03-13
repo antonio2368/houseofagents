@@ -1524,21 +1524,32 @@ pub(super) fn handle_pipeline_edit_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => {
             app.pipeline.pipeline_show_edit = false;
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab => {
             let is_fin_block = app
                 .pipeline
                 .pipeline_block_cursor
                 .map(|sel| app.pipeline.pipeline_def.is_finalization_block(sel))
                 .unwrap_or(false);
-            app.pipeline.pipeline_edit_field = match app.pipeline.pipeline_edit_field {
-                PipelineEditField::Name => PipelineEditField::Agent,
-                PipelineEditField::Agent => PipelineEditField::Profile,
-                PipelineEditField::Profile => PipelineEditField::Prompt,
-                // Skip SessionId for finalization blocks (hardcoded at runtime)
-                PipelineEditField::Prompt if is_fin_block => PipelineEditField::Replicas,
-                PipelineEditField::Prompt => PipelineEditField::SessionId,
-                PipelineEditField::SessionId => PipelineEditField::Replicas,
-                PipelineEditField::Replicas => PipelineEditField::Name,
+            app.pipeline.pipeline_edit_field = if key.code == KeyCode::Tab {
+                match app.pipeline.pipeline_edit_field {
+                    PipelineEditField::Name => PipelineEditField::Agent,
+                    PipelineEditField::Agent => PipelineEditField::Profile,
+                    PipelineEditField::Profile => PipelineEditField::Prompt,
+                    PipelineEditField::Prompt if is_fin_block => PipelineEditField::Replicas,
+                    PipelineEditField::Prompt => PipelineEditField::SessionId,
+                    PipelineEditField::SessionId => PipelineEditField::Replicas,
+                    PipelineEditField::Replicas => PipelineEditField::Name,
+                }
+            } else {
+                match app.pipeline.pipeline_edit_field {
+                    PipelineEditField::Name => PipelineEditField::Replicas,
+                    PipelineEditField::Agent => PipelineEditField::Name,
+                    PipelineEditField::Profile => PipelineEditField::Agent,
+                    PipelineEditField::Prompt => PipelineEditField::Profile,
+                    PipelineEditField::SessionId => PipelineEditField::Prompt,
+                    PipelineEditField::Replicas if is_fin_block => PipelineEditField::Prompt,
+                    PipelineEditField::Replicas => PipelineEditField::SessionId,
+                }
             };
         }
         KeyCode::Enter => {

@@ -1795,8 +1795,50 @@ fn draw_help_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(help_p, area);
 }
 
+/// Build a truncated comma-separated summary that fits within `max_width` display chars.
+/// Shows `"(empty_label)"` when `names` is empty. Uses char count for width measurement.
+fn collapse_summary(names: &[&str], max_width: usize, empty_label: &str) -> String {
+    use crate::execution::truncate_chars;
+
+    if names.is_empty() {
+        return format!("({empty_label})");
+    }
+    let total = names.len();
+    let mut buf = String::new();
+    for (i, name) in names.iter().enumerate() {
+        let remaining = total - i;
+        let suffix_len = if remaining > 1 {
+            // ", +N more" where N can be multi-digit
+            ", +".len() + format!("{}", remaining - 1).len() + " more".len()
+        } else {
+            0
+        };
+        let candidate = if buf.is_empty() {
+            name.to_string()
+        } else {
+            format!("{buf}, {name}")
+        };
+        let candidate_chars = candidate.chars().count();
+        if candidate_chars + suffix_len > max_width {
+            if i == 0 {
+                // Single first name too long — truncate it
+                let avail = max_width.saturating_sub(suffix_len);
+                let truncated = truncate_chars(name, avail);
+                return if total > 1 {
+                    format!("{truncated}, +{} more", total - 1)
+                } else {
+                    truncated
+                };
+            }
+            return format!("{buf}, +{} more", total - i);
+        }
+        buf = candidate;
+    }
+    buf
+}
+
 fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(60, 55, area);
+    let popup = centered_rect(60, 80, area);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -1810,13 +1852,24 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    // Agent list height: 1 label + min(agent_count, 6) rows
-    let agent_list_h = 1 + (app.config.agents.len() as u16).min(6);
-    let profile_count = app.pipeline.pipeline_edit_profile_list.len() as u16;
-    let profile_list_h = if profile_count == 0 {
-        2
+    // Dynamic heights: full list when focused, 1-line summary when unfocused
+    let agent_focus = app.pipeline.pipeline_edit_field == PipelineEditField::Agent;
+    let profile_focus = app.pipeline.pipeline_edit_field == PipelineEditField::Profile;
+
+    let agent_list_h = if agent_focus {
+        1 + (app.config.agents.len() as u16).min(6)
     } else {
-        1 + profile_count.min(4)
+        1
+    };
+    let profile_count = app.pipeline.pipeline_edit_profile_list.len() as u16;
+    let profile_list_h = if profile_focus {
+        if profile_count == 0 {
+            2
+        } else {
+            1 + profile_count.min(4)
+        }
+    } else {
+        1
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1824,16 +1877,14 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(2),              // [0]  Name
             Constraint::Length(1),              // [1]  spacer
             Constraint::Length(agent_list_h),   // [2]  Agents list
-            Constraint::Length(1),              // [3]  spacer
-            Constraint::Length(profile_list_h), // [4]  Profiles list
+            Constraint::Length(profile_list_h), // [3]  Profiles list
+            Constraint::Min(6),                 // [4]  Prompt
             Constraint::Length(1),              // [5]  spacer
-            Constraint::Min(6),                 // [6]  Prompt
+            Constraint::Length(2),              // [6]  Session ID
             Constraint::Length(1),              // [7]  spacer
-            Constraint::Length(2),              // [8]  Session ID
+            Constraint::Length(2),              // [8]  Replicas
             Constraint::Length(1),              // [9]  spacer
-            Constraint::Length(2),              // [10] Replicas
-            Constraint::Length(1),              // [11] spacer
-            Constraint::Length(1),              // [12] hint
+            Constraint::Length(1),              // [10] hint
         ])
         .split(inner);
 
@@ -1852,129 +1903,174 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(name_line), chunks[0]);
 
-    // Agent multiselect list
-    let agent_focus = app.pipeline.pipeline_edit_field == PipelineEditField::Agent;
-    let avail_agents: std::collections::HashMap<&str, bool> = app
-        .available_agents()
-        .into_iter()
-        .map(|(a, avail)| (a.name.as_str(), avail))
-        .collect();
-    let agent_lines: Vec<Line> = app
-        .config
-        .agents
-        .iter()
-        .enumerate()
-        .map(|(i, a)| {
-            let selected = app
-                .pipeline
-                .pipeline_edit_agent_selection
-                .get(i)
-                .copied()
-                .unwrap_or(false);
-            let is_avail = avail_agents.get(a.name.as_str()).copied().unwrap_or(false);
-            let checkbox = if selected { "[x] " } else { "[ ] " };
-            let agent_color = if is_avail { Color::Green } else { Color::Red };
-            let is_cursor = agent_focus && i == app.pipeline.pipeline_edit_agent_cursor;
-            let style = if is_cursor {
-                Style::default()
-                    .fg(agent_color)
-                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-            } else {
-                Style::default().fg(agent_color)
-            };
-            Line::from(Span::styled(format!("{checkbox}{}", a.name), style))
-        })
-        .collect();
-    let agent_label = Line::from(Span::styled(
-        "Agents:",
-        Style::default().fg(if agent_focus {
-            Color::Cyan
-        } else {
-            Color::White
-        }),
-    ));
-    let mut all_agent_lines = vec![agent_label];
-    all_agent_lines.extend(agent_lines);
-    let agent_visible_rows = (chunks[2].height as usize).saturating_sub(1);
-    app.pipeline
-        .pipeline_edit_agent_visible
-        .set(agent_visible_rows);
-    let scroll_offset = app.pipeline.pipeline_edit_agent_scroll as u16;
-    let agent_p = Paragraph::new(all_agent_lines).scroll((scroll_offset, 0));
-    f.render_widget(agent_p, chunks[2]);
-
-    // Profile multiselect list
-    let profile_focus = app.pipeline.pipeline_edit_field == PipelineEditField::Profile;
-    if app.pipeline.pipeline_edit_profile_list.is_empty() {
-        let label = Line::from(Span::styled(
-            "Profiles:",
-            Style::default().fg(if profile_focus {
-                Color::Cyan
-            } else {
-                Color::White
-            }),
-        ));
-        let none_line = Line::from(Span::styled(
-            "(none found)",
-            Style::default().fg(Color::DarkGray),
-        ));
-        let profile_p = Paragraph::new(vec![label, none_line]);
-        f.render_widget(profile_p, chunks[4]);
+    // Agent multiselect list (expanded when focused, summary when unfocused)
+    if agent_focus {
+        let avail_agents: std::collections::HashMap<&str, bool> = app
+            .available_agents()
+            .into_iter()
+            .map(|(a, avail)| (a.name.as_str(), avail))
+            .collect();
+        let agent_lines: Vec<Line> = app
+            .config
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let selected = app
+                    .pipeline
+                    .pipeline_edit_agent_selection
+                    .get(i)
+                    .copied()
+                    .unwrap_or(false);
+                let is_avail = avail_agents.get(a.name.as_str()).copied().unwrap_or(false);
+                let checkbox = if selected { "[x] " } else { "[ ] " };
+                let agent_color = if is_avail { Color::Green } else { Color::Red };
+                let is_cursor = i == app.pipeline.pipeline_edit_agent_cursor;
+                let style = if is_cursor {
+                    Style::default()
+                        .fg(agent_color)
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default().fg(agent_color)
+                };
+                Line::from(Span::styled(format!("{checkbox}{}", a.name), style))
+            })
+            .collect();
+        let agent_label = Line::from(Span::styled("Agents:", Style::default().fg(Color::Cyan)));
+        let mut all_agent_lines = vec![agent_label];
+        all_agent_lines.extend(agent_lines);
+        let agent_visible_rows = (chunks[2].height as usize).saturating_sub(1);
+        app.pipeline
+            .pipeline_edit_agent_visible
+            .set(agent_visible_rows);
+        let scroll_offset = app.pipeline.pipeline_edit_agent_scroll as u16;
+        let agent_p = Paragraph::new(all_agent_lines).scroll((scroll_offset, 0));
+        f.render_widget(agent_p, chunks[2]);
     } else {
-        let profile_lines: Vec<Line> = app
+        // Collapsed summary line
+        let selected_names: Vec<&str> = app
+            .config
+            .agents
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                app.pipeline
+                    .pipeline_edit_agent_selection
+                    .get(*i)
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .map(|(_, a)| a.name.as_str())
+            .collect();
+        let max_w = chunks[2].width.saturating_sub(9) as usize; // "Agents: " = 8 chars + margin
+        let summary = collapse_summary(&selected_names, max_w, "none selected");
+        let line = Line::from(vec![
+            Span::styled("Agents: ", Style::default().fg(Color::White)),
+            Span::styled(summary, Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(line), chunks[2]);
+    }
+
+    // Profile multiselect list (expanded when focused, summary when unfocused)
+    if profile_focus {
+        if app.pipeline.pipeline_edit_profile_list.is_empty() {
+            let label = Line::from(Span::styled("Profiles:", Style::default().fg(Color::Cyan)));
+            let none_line = Line::from(Span::styled(
+                "(none found)",
+                Style::default().fg(Color::DarkGray),
+            ));
+            let profile_p = Paragraph::new(vec![label, none_line]);
+            f.render_widget(profile_p, chunks[3]);
+        } else {
+            let profile_lines: Vec<Line> = app
+                .pipeline
+                .pipeline_edit_profile_list
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let selected = app
+                        .pipeline
+                        .pipeline_edit_profile_selection
+                        .get(i)
+                        .copied()
+                        .unwrap_or(false);
+                    let is_orphan = app.pipeline.pipeline_edit_profile_orphaned.contains(name);
+                    let checkbox = if selected { "[x] " } else { "[ ] " };
+                    let color = if is_orphan {
+                        Color::Yellow
+                    } else if selected {
+                        Color::Green
+                    } else {
+                        Color::White
+                    };
+                    let label = if is_orphan {
+                        format!("{checkbox}{name} [!]")
+                    } else {
+                        format!("{checkbox}{name}")
+                    };
+                    let is_cursor = i == app.pipeline.pipeline_edit_profile_cursor;
+                    let style = if is_cursor {
+                        Style::default()
+                            .fg(color)
+                            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                    } else {
+                        Style::default().fg(color)
+                    };
+                    Line::from(Span::styled(label, style))
+                })
+                .collect();
+            let profile_label =
+                Line::from(Span::styled("Profiles:", Style::default().fg(Color::Cyan)));
+            let mut all_profile_lines = vec![profile_label];
+            all_profile_lines.extend(profile_lines);
+            let profile_visible_rows = (chunks[3].height as usize).saturating_sub(1);
+            app.pipeline
+                .pipeline_edit_profile_visible
+                .set(profile_visible_rows);
+            let profile_scroll_offset = app.pipeline.pipeline_edit_profile_scroll as u16;
+            let profile_p = Paragraph::new(all_profile_lines).scroll((profile_scroll_offset, 0));
+            f.render_widget(profile_p, chunks[3]);
+        }
+    } else {
+        // Collapsed summary line — append [!] to orphaned profile names
+        let selected_names: Vec<String> = app
             .pipeline
             .pipeline_edit_profile_list
             .iter()
             .enumerate()
-            .map(|(i, name)| {
-                let selected = app
-                    .pipeline
+            .filter(|(i, _)| {
+                app.pipeline
                     .pipeline_edit_profile_selection
-                    .get(i)
+                    .get(*i)
                     .copied()
-                    .unwrap_or(false);
-                let is_orphan = app.pipeline.pipeline_edit_profile_orphaned.contains(name);
-                let checkbox = if selected { "[x] " } else { "[ ] " };
-                let color = if is_orphan {
-                    Color::Yellow
-                } else if selected {
-                    Color::Green
+                    .unwrap_or(false)
+            })
+            .map(|(_, name)| {
+                if app.pipeline.pipeline_edit_profile_orphaned.contains(name) {
+                    format!("{name} [!]")
                 } else {
-                    Color::White
-                };
-                let label = if is_orphan {
-                    format!("{checkbox}{name} [!]")
-                } else {
-                    format!("{checkbox}{name}")
-                };
-                let is_cursor = profile_focus && i == app.pipeline.pipeline_edit_profile_cursor;
-                let style = if is_cursor {
-                    Style::default()
-                        .fg(color)
-                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-                } else {
-                    Style::default().fg(color)
-                };
-                Line::from(Span::styled(label, style))
+                    name.clone()
+                }
             })
             .collect();
-        let profile_label = Line::from(Span::styled(
-            "Profiles:",
-            Style::default().fg(if profile_focus {
-                Color::Cyan
-            } else {
-                Color::White
-            }),
-        ));
-        let mut all_profile_lines = vec![profile_label];
-        all_profile_lines.extend(profile_lines);
-        let profile_visible_rows = (chunks[4].height as usize).saturating_sub(1);
-        app.pipeline
-            .pipeline_edit_profile_visible
-            .set(profile_visible_rows);
-        let profile_scroll_offset = app.pipeline.pipeline_edit_profile_scroll as u16;
-        let profile_p = Paragraph::new(all_profile_lines).scroll((profile_scroll_offset, 0));
-        f.render_widget(profile_p, chunks[4]);
+        let name_refs: Vec<&str> = selected_names.iter().map(|s| s.as_str()).collect();
+        let max_w = chunks[3].width.saturating_sub(11) as usize; // "Profiles: " = 10 chars + margin
+        let summary = if app.pipeline.pipeline_edit_profile_list.is_empty() {
+            "(none found)".to_string()
+        } else {
+            collapse_summary(&name_refs, max_w, "none")
+        };
+        let has_orphans = selected_names.iter().any(|s| s.ends_with("[!]"));
+        let summary_color = if has_orphans {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        let line = Line::from(vec![
+            Span::styled("Profiles: ", Style::default().fg(Color::White)),
+            Span::styled(summary, Style::default().fg(summary_color)),
+        ]);
+        f.render_widget(Paragraph::new(line), chunks[3]);
     }
 
     // Prompt textarea
@@ -1988,8 +2084,8 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
         .title(" Prompt ")
         .borders(Borders::ALL)
         .border_style(prompt_style);
-    let prompt_inner = prompt_block.inner(chunks[6]);
-    f.render_widget(prompt_block, chunks[6]);
+    let prompt_inner = prompt_block.inner(chunks[4]);
+    f.render_widget(prompt_block, chunks[4]);
 
     let (prompt_scroll, prompt_cursor_col, prompt_cursor_row) = if prompt_focus {
         prompt_cursor_layout(
@@ -2029,7 +2125,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("Session ID: ", Style::default().fg(Color::White)),
             Span::styled("(managed by runtime)", Style::default().fg(Color::DarkGray)),
         ]);
-        f.render_widget(Paragraph::new(sess_line), chunks[8]);
+        f.render_widget(Paragraph::new(sess_line), chunks[6]);
     } else {
         let sess_focus = app.pipeline.pipeline_edit_field == PipelineEditField::SessionId;
         let sess_style = if sess_focus {
@@ -2043,7 +2139,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
             Span::raw(&app.pipeline.pipeline_edit_session_buf),
             Span::styled("]", sess_style),
         ]);
-        f.render_widget(Paragraph::new(sess_line), chunks[8]);
+        f.render_widget(Paragraph::new(sess_line), chunks[6]);
     }
 
     // Replicas
@@ -2080,12 +2176,12 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(rep_hint, Style::default().fg(Color::DarkGray)),
         ])
     };
-    f.render_widget(Paragraph::new(rep_line), chunks[10]);
+    f.render_widget(Paragraph::new(rep_line), chunks[8]);
 
     // Hint
-    let hint = Paragraph::new("  Tab: next  Space: toggle  Enter: save  Esc: back")
+    let hint = Paragraph::new("  Tab/S-Tab: nav  Space: toggle  Enter: save  Esc: back")
         .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[12]);
+    f.render_widget(hint, chunks[10]);
 }
 
 fn draw_file_dialog(f: &mut Frame, app: &App, area: Rect) {
