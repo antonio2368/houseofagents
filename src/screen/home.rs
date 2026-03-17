@@ -77,10 +77,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         );
     }
 
-    // Error modal overlay (always topmost)
-    if let Some(ref err) = app.error_modal {
-        draw_error_modal(f, err);
-    }
+    // Error/info modals are rendered globally by screen::draw()
 }
 
 fn draw_agents_panel(f: &mut Frame, app: &App, area: Rect) {
@@ -171,19 +168,6 @@ fn draw_mode_panel(f: &mut Frame, app: &App, area: Rect) {
             .border_style(border_style),
     );
     f.render_widget(list, area);
-}
-
-fn draw_error_modal(f: &mut Frame, message: &str) {
-    let area = centered_rect(60, 20, f.area());
-    let block = Block::default()
-        .title(" Error ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red));
-    let text = Paragraph::new(message)
-        .style(Style::default().fg(Color::Red))
-        .block(block);
-    f.render_widget(ratatui::widgets::Clear, area);
-    f.render_widget(text, area);
 }
 
 fn draw_edit_popup(f: &mut Frame, app: &App) {

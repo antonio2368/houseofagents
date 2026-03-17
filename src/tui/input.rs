@@ -22,9 +22,10 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Dismiss error modal with any key
-    if app.error_modal.is_some() {
+    // Dismiss error/info modal with any key
+    if app.error_modal.is_some() || app.info_modal.is_some() {
         app.error_modal = None;
+        app.info_modal = None;
         return;
     }
 
@@ -58,8 +59,9 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 pub(super) fn handle_paste(app: &mut App, text: &str) {
-    if app.error_modal.is_some() {
+    if app.error_modal.is_some() || app.info_modal.is_some() {
         app.error_modal = None;
+        app.info_modal = None;
         return;
     }
 
@@ -3198,9 +3200,11 @@ pub(super) fn handle_config_save_result(app: &mut App, result: Result<(), String
             app.session_http_timeout_seconds = None;
             app.session_model_fetch_timeout_seconds = None;
             app.session_cli_timeout_seconds = None;
-            app.error_modal = Some("Config saved to disk".into());
+            app.error_modal = None;
+            app.info_modal = Some("Config saved to disk".into());
         }
         Err(e) => {
+            app.info_modal = None;
             app.error_modal = Some(format!("Failed to save config: {e}"));
         }
     }

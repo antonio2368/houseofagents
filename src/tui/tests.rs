@@ -1785,6 +1785,58 @@ fn error_dismisses_before_help() {
 }
 
 #[test]
+fn info_modal_dismisses_with_any_key() {
+    let mut app = test_app();
+    app.info_modal = Some("Config saved to disk".into());
+    handle_key(&mut app, key(KeyCode::Char('a')));
+    assert!(app.info_modal.is_none());
+}
+
+#[test]
+fn info_modal_dismisses_before_help() {
+    let mut app = test_app();
+    app.info_modal = Some("Config saved to disk".into());
+    app.help_popup.open(1);
+    handle_key(&mut app, key(KeyCode::Char('a')));
+    assert!(app.info_modal.is_none());
+    assert!(app.help_popup.active);
+}
+
+#[test]
+fn config_save_success_sets_info_modal() {
+    let mut app = test_app();
+    app.session_http_timeout_seconds = Some(99);
+    app.error_modal = Some("stale error".into());
+    handle_config_save_result(&mut app, Ok(()));
+    assert_eq!(app.info_modal.as_deref(), Some("Config saved to disk"));
+    assert!(app.error_modal.is_none());
+    assert!(app.session_http_timeout_seconds.is_none());
+    assert!(!app.edit_popup.config_save_in_progress);
+}
+
+#[test]
+fn config_save_failure_sets_error_modal() {
+    let mut app = test_app();
+    app.info_modal = Some("stale info".into());
+    handle_config_save_result(&mut app, Err("disk full".into()));
+    assert_eq!(
+        app.error_modal.as_deref(),
+        Some("Failed to save config: disk full")
+    );
+    assert!(app.info_modal.is_none());
+}
+
+#[test]
+fn dismiss_clears_both_modals() {
+    let mut app = test_app();
+    app.error_modal = Some("error".into());
+    app.info_modal = Some("info".into());
+    handle_key(&mut app, key(KeyCode::Char('x')));
+    assert!(app.error_modal.is_none());
+    assert!(app.info_modal.is_none());
+}
+
+#[test]
 fn pipeline_step_labels_expands_replicas() {
     use crate::execution::pipeline::{PipelineBlock, PipelineDefinition};
     let def = PipelineDefinition {

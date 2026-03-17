@@ -87,6 +87,8 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.prompt.prompt_focus == PromptFocus::Text
         && prompt_inner.width > 0
         && prompt_inner.height > 0
+        && app.error_modal.is_none()
+        && app.info_modal.is_none()
     {
         let visible_row = cursor_row.saturating_sub(scroll_y as usize);
         let x =

@@ -11,7 +11,7 @@ use crate::screen::prompt::{char_wrap_text, prompt_cursor_layout};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 pub(crate) const BLOCK_W: u16 = 18;
@@ -192,9 +192,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.setup_analysis.active {
         help::draw_setup_analysis_popup(f, &app.setup_analysis);
     }
-    if let Some(ref msg) = app.error_modal {
-        draw_error_modal(f, msg);
-    }
+    // Error/info modals are rendered globally by screen::draw()
 }
 
 fn draw_title(f: &mut Frame, area: Rect) {
@@ -266,6 +264,7 @@ fn draw_prompt_area(f: &mut Frame, app: &App, area: Rect) {
         || app.pipeline.pipeline_show_feed_edit
         || app.pipeline.pipeline_show_feed_list
         || app.error_modal.is_some()
+        || app.info_modal.is_some()
         || app.help_popup.active
         || app.setup_analysis.active;
     if prompt_focus && !has_overlay && inner.width > 0 && inner.height > 0 {
@@ -2109,7 +2108,12 @@ fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     let prompt_p = Paragraph::new(edit_wrapped.as_str()).scroll((prompt_scroll, 0));
     f.render_widget(prompt_p, prompt_inner);
 
-    if prompt_focus && prompt_inner.width > 0 && prompt_inner.height > 0 {
+    if prompt_focus
+        && prompt_inner.width > 0
+        && prompt_inner.height > 0
+        && app.error_modal.is_none()
+        && app.info_modal.is_none()
+    {
         let visible_row = prompt_cursor_row.saturating_sub(prompt_scroll as usize);
         let cx = prompt_inner.x
             + (prompt_cursor_col.min(prompt_inner.width.saturating_sub(1) as usize) as u16);
@@ -2559,7 +2563,12 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     let prompt_p = Paragraph::new(edit_wrapped.as_str()).scroll((prompt_scroll, 0));
     f.render_widget(prompt_p, prompt_inner);
 
-    if prompt_focus && prompt_inner.width > 0 && prompt_inner.height > 0 {
+    if prompt_focus
+        && prompt_inner.width > 0
+        && prompt_inner.height > 0
+        && app.error_modal.is_none()
+        && app.info_modal.is_none()
+    {
         let visible_row = prompt_cursor_row.saturating_sub(prompt_scroll as usize);
         let cx = prompt_inner.x
             + (prompt_cursor_col.min(prompt_inner.width.saturating_sub(1) as usize) as u16);
@@ -2805,21 +2814,6 @@ fn draw_feed_list_popup(f: &mut Frame, app: &App, area: Rect) {
     let hint = Paragraph::new("  Up/Down: navigate | Enter: edit | F: delete | Esc: close")
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(hint, chunks[1]);
-}
-
-fn draw_error_modal(f: &mut Frame, message: &str) {
-    let area = centered_rect(60, 20, f.area());
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .title(" Error ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let msg = Paragraph::new(message)
-        .style(Style::default().fg(Color::Red))
-        .wrap(Wrap { trim: false });
-    f.render_widget(msg, inner);
 }
 
 #[cfg(test)]

@@ -221,6 +221,9 @@ pub struct App {
 
     // Error modal
     pub(crate) error_modal: Option<String>,
+
+    // Info modal (success messages)
+    pub(crate) info_modal: Option<String>,
 }
 
 #[derive(Default)]
@@ -620,6 +623,7 @@ impl App {
             setup_analysis: SetupAnalysisState::new(),
             memory,
             error_modal: None,
+            info_modal: None,
         }
     }
 
