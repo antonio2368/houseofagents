@@ -1424,7 +1424,7 @@ mod tests {
         let path = dir.path().join("test.db");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(&format!(
+            conn.execute_batch(
                 "CREATE TABLE memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     project_id TEXT NOT NULL,
@@ -1462,7 +1462,7 @@ mod tests {
                     VALUES ('delete', old.id, old.content, old.reasoning, old.tags);
                 END;
                 PRAGMA user_version = 2;",
-            ))
+            )
             .unwrap();
             conn.execute(
                 "INSERT INTO memories (project_id, kind, content, reasoning, created_at, updated_at)

@@ -77,7 +77,7 @@ cargo clippy -- -D warnings
 
 ## Key Conventions
 
-- **Always run `cargo fmt` and `cargo clippy -- -D warnings` before committing** to avoid CI formatting and lint failures
+- **Always run `cargo fmt` and `cargo clippy --all-targets --all-features -- -D warnings` before committing** to avoid CI formatting and lint failures
 - Provider implementations live in `src/provider/` and implement a common trait
 - Execution modes live in `src/execution/` and implement a common trait
 - Screens live in `src/screen/` and implement a common trait

@@ -15,7 +15,7 @@ if ! cargo fmt --check 2>&1; then
   ERRORS="cargo fmt check failed. Run 'cargo fmt' to fix formatting."
 fi
 
-if ! cargo clippy -- -D warnings 2>&1; then
+if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1; then
   ERRORS="${ERRORS:+$ERRORS\n}cargo clippy failed. Fix lint warnings first."
 fi
 

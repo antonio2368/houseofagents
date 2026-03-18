@@ -2354,6 +2354,43 @@ where
                                                 }
                                             }
                                         }
+                                        // Clear provider history for sub-DAG sessions with keep_session=false
+                                        {
+                                            let mut cleared: HashSet<(String, String)> =
+                                                HashSet::new();
+                                            for &bid in &ls.sub_dag.blocks {
+                                                if let Some(rids) =
+                                                    rt.logical_to_runtime.get(&bid)
+                                                {
+                                                    for &rid in rids {
+                                                        let info =
+                                                            &rt.entries[rid as usize];
+                                                        let pool_key = (
+                                                            info.agent.clone(),
+                                                            info.session_key.clone(),
+                                                        );
+                                                        if cleared.contains(&pool_key) {
+                                                            continue;
+                                                        }
+                                                        let keep = rt
+                                                            .keep_policy
+                                                            .get(&pool_key)
+                                                            .copied()
+                                                            .unwrap_or(true);
+                                                        if !keep {
+                                                            if let Some(p) =
+                                                                provider_pool.get(&pool_key)
+                                                            {
+                                                                let mut guard =
+                                                                    p.lock().await;
+                                                                guard.clear_history();
+                                                            }
+                                                            cleared.insert(pool_key);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                         // Reset all sub-DAG blocks' in-degrees
                                         for (&bid, &deg) in &ls.sub_dag.internal_in_degree {
                                             current_in_degree.insert(bid, deg);
@@ -5316,6 +5353,120 @@ keep_across_iterations = false
 
         // Two blocks share one provider, cleared once before iteration 2
         assert_eq!(clear_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn loop_pass_clears_non_keep_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("loop-clear")).unwrap();
+        // A(1) → B(2) with loop from B back to A, 2 extra passes
+        let mut def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![conn(1, 2)],
+            vec![lconn(2, 1, 2)],
+        );
+        def.set_keep_session_across_iterations("Claude", "__block_1", false);
+        def.set_keep_session_across_iterations("Claude", "__block_2", false);
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clear_count = Arc::new(AtomicUsize::new(0));
+        let cc = clear_count.clone();
+
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            cancel,
+            move |_kind, _cfg| {
+                Box::new(ClearCountProvider {
+                    kind: ProviderKind::Anthropic,
+                    responses: std::sync::Mutex::new(VecDeque::new()),
+                    clear_count: cc.clone(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        // 2 pass-advances × 2 sessions = 4 clears
+        assert_eq!(clear_count.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn loop_pass_keeps_sessions_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("loop-keep")).unwrap();
+        // Same topology, default keep_session=true
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![conn(1, 2)],
+            vec![lconn(2, 1, 2)],
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let clear_count = Arc::new(AtomicUsize::new(0));
+        let cc = clear_count.clone();
+
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            cancel,
+            move |_kind, _cfg| {
+                Box::new(ClearCountProvider {
+                    kind: ProviderKind::Anthropic,
+                    responses: std::sync::Mutex::new(VecDeque::new()),
+                    clear_count: cc.clone(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+        // keep_session=true by default, no clears
+        assert_eq!(clear_count.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     // -- loop connection helpers --
