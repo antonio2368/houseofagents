@@ -5,7 +5,7 @@ pub fn build_extraction_prompt(
     files: &[(String, std::path::PathBuf)],
     observation_ttl_days: u32,
     summary_ttl_days: u32,
-) -> Result<String, String> {
+) -> Result<(String, usize), String> {
     let mut prompt = format!(
         "Extract reusable memories from these agent outputs. Return a JSON array.\n\n\
          Each object: {{\"kind\": \"decision|observation|summary|principle\", \
@@ -35,13 +35,17 @@ pub fn build_extraction_prompt(
 
     let mut budget = PostRunPromptBudget::with_limit(EXTRACTION_MAX_INPUT_BYTES);
     let mut appended_any = false;
+    let mut skipped_count: usize = 0;
 
-    for (label, path) in files {
+    // Iterate in reverse so that finalization/consolidation outputs (appended
+    // last by callers) get budget priority over earlier agent outputs.
+    for (label, path) in files.iter().rev() {
         // Check file size before reading to avoid loading huge files into memory
         // only to discard them when the budget is exceeded. Skip (don't break) so
         // smaller files later in the list (e.g. finalization summaries) still get included.
         if let Ok(meta) = std::fs::metadata(path) {
             if budget.would_exceed(meta.len() as usize) {
+                skipped_count += 1;
                 continue;
             }
         }
@@ -50,6 +54,7 @@ pub fn build_extraction_prompt(
             Err(_) => continue,
         };
         if budget.add_text(&content, "Extraction input").is_err() {
+            skipped_count += 1;
             continue; // Budget exceeded for this file — try remaining smaller ones
         }
         prompt.push_str(&format!("\n--- {label} ---\n{content}\n"));
@@ -60,7 +65,7 @@ pub fn build_extraction_prompt(
     // file so that long single-agent runs still produce some memories.
     if !appended_any {
         let limit = EXTRACTION_MAX_INPUT_BYTES as usize;
-        for (label, path) in files {
+        for (label, path) in files.iter().rev() {
             let content = match std::fs::read_to_string(path) {
                 Ok(c) if !c.is_empty() => c,
                 _ => continue,
@@ -82,7 +87,7 @@ pub fn build_extraction_prompt(
         return Err("No file content available for extraction".into());
     }
 
-    Ok(prompt)
+    Ok((prompt, skipped_count))
 }
 
 /// Maximum memories accepted from a single extraction. Prevents a chatty model
@@ -178,9 +183,11 @@ mod tests {
         let file = dir.path().join("test.md");
         std::fs::write(&file, "Agent output content here").unwrap();
 
-        let prompt = build_extraction_prompt(&[("Agent1".into(), file)], 90, 180).unwrap();
+        let (prompt, skipped) =
+            build_extraction_prompt(&[("Agent1".into(), file)], 90, 180).unwrap();
         assert!(prompt.contains("Agent output content here"));
         assert!(prompt.contains("--- Agent1 ---"));
+        assert_eq!(skipped, 0);
     }
 
     #[test]
@@ -194,7 +201,7 @@ mod tests {
             files.push((format!("Agent{i}"), file));
         }
 
-        let prompt = build_extraction_prompt(&files, 90, 180).unwrap();
+        let (prompt, _skipped) = build_extraction_prompt(&files, 90, 180).unwrap();
         // Should not fail, just truncate
         assert!(prompt.len() < 150 * 1024);
     }
@@ -206,10 +213,29 @@ mod tests {
         // Create a single file larger than the extraction budget
         std::fs::write(&file, "y".repeat(200 * 1024)).unwrap();
 
-        let prompt = build_extraction_prompt(&[("Agent1".into(), file)], 90, 180).unwrap();
+        let (prompt, _skipped) =
+            build_extraction_prompt(&[("Agent1".into(), file)], 90, 180).unwrap();
         assert!(prompt.contains("truncated to fit extraction budget"));
         // Should be capped close to 100KB, not the full 200KB
         assert!(prompt.len() < 110 * 1024);
+    }
+
+    #[test]
+    fn build_extraction_prompt_prioritizes_later_files() {
+        let dir = tempdir().unwrap();
+        let fin_file = dir.path().join("finalization.md");
+        std::fs::write(&fin_file, "FINALIZATION_MARKER unique content").unwrap();
+        let mut files = Vec::new();
+        for i in 0..15 {
+            let f = dir.path().join(format!("agent{i}.md"));
+            std::fs::write(&f, "x".repeat(10 * 1024)).unwrap();
+            files.push((format!("Agent{i}"), f));
+        }
+        files.push(("Finalization".into(), fin_file));
+
+        let (prompt, skipped) = build_extraction_prompt(&files, 90, 180).unwrap();
+        assert!(prompt.contains("FINALIZATION_MARKER"));
+        assert!(skipped > 0);
     }
 
     #[test]

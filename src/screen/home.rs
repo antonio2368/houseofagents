@@ -551,6 +551,13 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     has_override: app.session_memory_summary_ttl_days.is_some(),
                 },
                 MemoryRow::Value {
+                    label: "Stale Permanent Days",
+                    description:
+                        "Archive permanent memories after N days without recall (0 = disabled).",
+                    value: format!("{} days", app.effective_memory_stale_permanent_days()),
+                    has_override: app.session_memory_stale_permanent_days.is_some(),
+                },
+                MemoryRow::Value {
                     label: "Extraction Agent",
                     description: "Agent used for post-run memory extraction (empty = auto).",
                     value: {
@@ -655,7 +662,7 @@ fn draw_edit_popup(f: &mut Frame, app: &App) {
                     let unit_hint = match app.edit_popup.memory_cursor {
                         1 => " (count)",    // MEM_MAX_RECALL
                         2 => " (bytes)",    // MEM_MAX_RECALL_BYTES
-                        3 | 4 => " (days)", // MEM_OBSERVATION_TTL | MEM_SUMMARY_TTL
+                        3..=5 => " (days)", // MEM_OBSERVATION_TTL | MEM_SUMMARY_TTL | MEM_STALE_PERMANENT_DAYS
                         _ => "",
                     };
                     selected_line_start = body_lines.len();

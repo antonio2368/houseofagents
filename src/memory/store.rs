@@ -60,7 +60,8 @@ fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
             expires_at TEXT,
             updated_at TEXT NOT NULL,
             recall_count INTEGER NOT NULL DEFAULT 0,
-            last_recalled_at TEXT
+            last_recalled_at TEXT,
+            archived INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -75,6 +76,7 @@ fn create_fresh_schema(conn: &Connection) -> Result<(), String> {
         CREATE INDEX IF NOT EXISTS idx_memories_project_kind ON memories(project_id, kind);
         CREATE INDEX IF NOT EXISTS idx_memories_project_recall ON memories(project_id, recall_count);
         CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at) WHERE expires_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(project_id, archived);
 
         PRAGMA user_version = {SCHEMA_VERSION};",
     ))
@@ -184,8 +186,32 @@ fn migrate_4_to_5(conn: &Connection) -> Result<(), String> {
          ON memories(expires_at) WHERE expires_at IS NOT NULL;",
     )
     .map_err(|e| format!("Migration 4→5 (expires index) failed: {e}"))?;
-    conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))
+    conn.execute_batch("PRAGMA user_version = 5;")
         .map_err(|e| format!("Migration 4→5 PRAGMA failed: {e}"))
+}
+
+/// Migration 5→6: Add `archived` column for permanent memory staleness.
+fn migrate_5_to_6(conn: &Connection) -> Result<(), String> {
+    let has_column = |col: &str| -> bool {
+        conn.prepare("PRAGMA table_info(memories)")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .map(|rows| rows.flatten().any(|name| name == col))
+            })
+            .unwrap_or(false)
+    };
+    conn.execute_batch("BEGIN;").map_err(|e| e.to_string())?;
+    if !has_column("archived") {
+        conn.execute_batch("ALTER TABLE memories ADD COLUMN archived INTEGER NOT NULL DEFAULT 0;")
+            .map_err(|e| format!("Migration 5→6 (archived column) failed: {e}"))?;
+    }
+    conn.execute_batch("COMMIT;").map_err(|e| e.to_string())?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(project_id, archived);",
+    )
+    .map_err(|e| format!("Migration 5→6 (archived index) failed: {e}"))?;
+    conn.execute_batch("PRAGMA user_version = 6;")
+        .map_err(|e| format!("Migration 5→6 PRAGMA failed: {e}"))
 }
 
 #[derive(Clone)]
@@ -195,7 +221,7 @@ pub struct MemoryStore {
 }
 
 /// Current schema version. Increment when adding migrations.
-const SCHEMA_VERSION: i32 = 5;
+const SCHEMA_VERSION: i32 = 6;
 
 /// SQL for FTS5 triggers — shared between fresh creation and migrations.
 /// The UPDATE trigger guards on FTS-indexed column changes only, so that
@@ -254,6 +280,7 @@ impl MemoryStore {
                 migrate_2_to_3(&conn)?;
                 migrate_3_to_4(&conn)?;
                 migrate_4_to_5(&conn)?;
+                migrate_5_to_6(&conn)?;
             } else {
                 // Fresh DB: create everything at current version
                 create_fresh_schema(&conn)?;
@@ -274,6 +301,9 @@ impl MemoryStore {
             }
             if version < 5 {
                 migrate_4_to_5(&conn)?;
+            }
+            if version < 6 {
+                migrate_5_to_6(&conn)?;
             }
         }
         // version >= SCHEMA_VERSION: already current, no-op
@@ -352,10 +382,17 @@ impl MemoryStore {
                 // Higher threshold for decisions: numeric parameters (e.g.,
                 // "max 20 connections" vs "max 50 connections") change few
                 // words but represent materially different choices.
-                if self
-                    .find_similar_memory(&conn, project_id, &content, "decision", 0.85)?
-                    .is_some()
+                if let Some(existing_id) =
+                    self.find_similar_memory(&conn, project_id, &content, "decision", 0.85)?
                 {
+                    // Auto-unarchive if the duplicate was archived, resetting
+                    // updated_at and last_recalled_at so it won't be immediately
+                    // re-archived on restart.
+                    conn.execute(
+                        "UPDATE memories SET archived = 0, updated_at = ?1, last_recalled_at = ?1 WHERE id = ?2 AND archived = 1",
+                        rusqlite::params![now, existing_id],
+                    )
+                    .map_err(|e| format!("Failed to unarchive decision: {e}"))?;
                     return Ok(-1); // skip duplicate decision
                 }
             }
@@ -426,10 +463,12 @@ impl MemoryStore {
             .prepare(
                 "SELECT m.id, m.project_id, m.kind, m.content, m.reasoning, m.source_run,
                         m.source_agent, m.evidence_count, m.tags, m.created_at,
-                        m.expires_at, m.updated_at, m.recall_count, m.last_recalled_at
+                        m.expires_at, m.updated_at, m.recall_count, m.last_recalled_at,
+                        m.archived
                  FROM memories m
                  JOIN memories_fts ON memories_fts.rowid = m.id
                  WHERE memories_fts MATCH ?1 AND m.project_id = ?2
+                   AND m.archived = 0
                    AND (m.expires_at IS NULL OR m.expires_at > ?4)
                  ORDER BY bm25(memories_fts) * CASE m.kind
                             WHEN 'principle'   THEN 1.5
@@ -471,6 +510,7 @@ impl MemoryStore {
                         updated_at: row.get(11)?,
                         recall_count: row.get(12)?,
                         last_recalled_at: row.get(13)?,
+                        archived: row.get::<_, i64>(14)? != 0,
                     })
                 },
             )
@@ -509,6 +549,7 @@ impl MemoryStore {
         project_id: &str,
         kind_filter: Option<MemoryKind>,
         never_recalled_only: bool,
+        show_archived: bool,
     ) -> Result<Vec<Memory>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -526,10 +567,11 @@ impl MemoryStore {
         if never_recalled_only {
             clauses.push("recall_count = 0".to_string());
         }
+        clauses.push(format!("archived = {}", if show_archived { 1 } else { 0 }));
         let sql = format!(
             "SELECT id, project_id, kind, content, reasoning, source_run, source_agent, \
              evidence_count, tags, created_at, expires_at, updated_at, recall_count, \
-             last_recalled_at FROM memories WHERE {} ORDER BY updated_at DESC LIMIT 500",
+             last_recalled_at, archived FROM memories WHERE {} ORDER BY updated_at DESC LIMIT 500",
             clauses.join(" AND ")
         );
 
@@ -559,6 +601,7 @@ impl MemoryStore {
                     updated_at: row.get(11)?,
                     recall_count: row.get(12)?,
                     last_recalled_at: row.get(13)?,
+                    archived: row.get::<_, i64>(14)? != 0,
                 })
             })
             .map_err(|e| format!("List query failed: {e}"))?;
@@ -653,6 +696,7 @@ impl MemoryStore {
         project_id: &str,
         kind_filter: Option<MemoryKind>,
         never_recalled_only: bool,
+        show_archived: bool,
     ) -> Result<u64, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -670,6 +714,7 @@ impl MemoryStore {
         if never_recalled_only {
             clauses.push("recall_count = 0".to_string());
         }
+        clauses.push(format!("archived = {}", if show_archived { 1 } else { 0 }));
         let sql = format!(
             "SELECT COUNT(*) FROM memories WHERE {}",
             clauses.join(" AND ")
@@ -710,6 +755,41 @@ impl MemoryStore {
         Ok(count)
     }
 
+    /// Archive permanent memories (decisions, principles) that are stale.
+    /// Requires both `updated_at` and `last_recalled_at` (when present) to
+    /// be older than the threshold, so any mutation that refreshes
+    /// `updated_at` automatically prevents re-archival.
+    pub fn archive_stale_permanent(&self, stale_days: u32) -> Result<usize, String> {
+        if stale_days == 0 {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let threshold =
+            (chrono::Utc::now() - chrono::Duration::days(i64::from(stale_days))).to_rfc3339();
+        let count = conn
+            .execute(
+                "UPDATE memories SET archived = 1
+                 WHERE kind IN ('decision', 'principle')
+                   AND archived = 0
+                   AND updated_at < ?1
+                   AND (last_recalled_at IS NULL OR last_recalled_at < ?1)",
+                rusqlite::params![threshold],
+            )
+            .map_err(|e| format!("archive_stale_permanent failed: {e}"))?;
+        Ok(count)
+    }
+
+    pub fn unarchive(&self, id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET archived = 0, updated_at = ?1, last_recalled_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, id],
+        )
+        .map_err(|e| format!("unarchive failed: {e}"))?;
+        Ok(())
+    }
+
     fn reinforce_principle_inner(
         &self,
         conn: &Connection,
@@ -717,7 +797,7 @@ impl MemoryStore {
         now: &str,
     ) -> Result<(), String> {
         conn.execute(
-            "UPDATE memories SET evidence_count = evidence_count + 1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE memories SET evidence_count = evidence_count + 1, updated_at = ?1, archived = 0 WHERE id = ?2",
             rusqlite::params![now, id],
         )
         .map_err(|e| format!("Failed to reinforce principle: {e}"))?;
@@ -855,7 +935,7 @@ mod tests {
             .unwrap();
         assert!(id > 0);
 
-        let list = store.list("proj1", None, false).unwrap();
+        let list = store.list("proj1", None, false, false).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].content, "Use Rust for the backend");
         assert_eq!(list[0].kind, MemoryKind::Decision);
@@ -878,7 +958,7 @@ mod tests {
 
         let count = store.cleanup_expired().unwrap();
         assert_eq!(count, 1);
-        assert!(store.list("proj1", None, false).unwrap().is_empty());
+        assert!(store.list("proj1", None, false, false).unwrap().is_empty());
     }
 
     #[test]
@@ -906,7 +986,7 @@ mod tests {
             .unwrap();
 
         let list = store
-            .list("proj1", Some(MemoryKind::Principle), false)
+            .list("proj1", Some(MemoryKind::Principle), false, false)
             .unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].evidence_count, 2);
@@ -991,7 +1071,7 @@ mod tests {
             )
             .unwrap();
         store.delete(id).unwrap();
-        assert!(store.list("proj1", None, false).unwrap().is_empty());
+        assert!(store.list("proj1", None, false, false).unwrap().is_empty());
     }
 
     #[test]
@@ -1058,7 +1138,7 @@ mod tests {
                 &test_config(),
             )
             .unwrap();
-        let list = store.list("proj1", None, false).unwrap();
+        let list = store.list("proj1", None, false, false).unwrap();
         assert_eq!(list.len(), 1);
         assert!(list[0].content.len() <= 1024);
     }
@@ -1087,7 +1167,7 @@ mod tests {
                 &test_config(),
             )
             .unwrap();
-        let list = store.list("proj1", None, false).unwrap();
+        let list = store.list("proj1", None, false, false).unwrap();
         assert_eq!(list.len(), 1);
         // Tags should be: database,perf,arch (lowercase, deduped, empty stripped)
         let tags: Vec<&str> = list[0].tags.split(',').collect();
@@ -1134,7 +1214,7 @@ mod tests {
         assert_eq!(id2, -1); // skipped
         assert_eq!(
             store
-                .list("proj1", Some(MemoryKind::Decision), false)
+                .list("proj1", Some(MemoryKind::Decision), false, false)
                 .unwrap()
                 .len(),
             1
@@ -1181,7 +1261,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .list("proj1", Some(MemoryKind::Decision), false)
+                .list("proj1", Some(MemoryKind::Decision), false, false)
                 .unwrap()
                 .len(),
             2
@@ -1207,7 +1287,7 @@ mod tests {
                 &cfg,
             )
             .unwrap();
-        let before = store.list("proj1", None, false).unwrap();
+        let before = store.list("proj1", None, false, false).unwrap();
         let before_updated = before[0].updated_at.clone();
 
         // Brief pause to get a different timestamp
@@ -1229,7 +1309,7 @@ mod tests {
                 &cfg,
             )
             .unwrap();
-        let after = store.list("proj1", None, false).unwrap();
+        let after = store.list("proj1", None, false, false).unwrap();
         assert_eq!(after.len(), 1); // no duplicate
         assert!(after[0].updated_at > before_updated);
         // expires_at should also be refreshed (not stuck at original value)
@@ -1278,7 +1358,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .list("proj1", Some(MemoryKind::Observation), false)
+                .list("proj1", Some(MemoryKind::Observation), false, false)
                 .unwrap()
                 .len(),
             2
@@ -1309,7 +1389,7 @@ mod tests {
         store.mark_recalled(&[id]).unwrap();
         store.mark_recalled(&[id]).unwrap();
 
-        let list = store.list("proj1", None, false).unwrap();
+        let list = store.list("proj1", None, false, false).unwrap();
         assert_eq!(list[0].recall_count, 2);
         assert!(list[0].last_recalled_at.is_some());
     }
@@ -1412,7 +1492,7 @@ mod tests {
 
         // Data should survive.
         drop(conn);
-        let list = store.list("p", None, false).unwrap();
+        let list = store.list("p", None, false, false).unwrap();
         assert_eq!(list.len(), 1);
         assert!(list[0].content.contains("pooling"));
     }
@@ -1504,7 +1584,7 @@ mod tests {
         assert!(recall_idx, "Recall index should exist after migration 3→4");
 
         drop(conn);
-        let list = store.list("p", None, false).unwrap();
+        let list = store.list("p", None, false, false).unwrap();
         assert_eq!(list.len(), 1);
         assert!(list[0].content.contains("migration"));
     }
@@ -1547,11 +1627,11 @@ mod tests {
         store.mark_recalled(&[id1]).unwrap();
 
         // Without filter: both visible
-        let all = store.list("proj1", None, false).unwrap();
+        let all = store.list("proj1", None, false, false).unwrap();
         assert_eq!(all.len(), 2);
 
         // With never_recalled_only: only the second
-        let cold = store.list("proj1", None, true).unwrap();
+        let cold = store.list("proj1", None, true, false).unwrap();
         assert_eq!(cold.len(), 1);
         assert!(cold[0].content.contains("never recalled"));
     }
@@ -1580,12 +1660,12 @@ mod tests {
                 .unwrap();
             ids.push(id);
         }
-        assert_eq!(store.list("proj1", None, false).unwrap().len(), 5);
+        assert_eq!(store.list("proj1", None, false, false).unwrap().len(), 5);
 
         // Delete first 3
         let deleted = store.delete_batch(&ids[..3]).unwrap();
         assert_eq!(deleted, 3);
-        assert_eq!(store.list("proj1", None, false).unwrap().len(), 2);
+        assert_eq!(store.list("proj1", None, false, false).unwrap().len(), 2);
 
         // Empty batch is a no-op
         assert_eq!(store.delete_batch(&[]).unwrap(), 0);
@@ -1657,9 +1737,359 @@ mod tests {
                 )
                 .unwrap();
         }
-        let listed = store.list("proj1", None, false).unwrap();
-        let counted = store.count("proj1", None, false).unwrap();
+        let listed = store.list("proj1", None, false, false).unwrap();
+        let counted = store.count("proj1", None, false, false).unwrap();
         assert_eq!(listed.len() as u64, counted);
+    }
+
+    // -----------------------------------------------------------------------
+    // Archival tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: directly insert a memory with custom timestamps for archival testing.
+    fn insert_raw_permanent(
+        store: &MemoryStore,
+        kind: &str,
+        content: &str,
+        created_at: &str,
+        updated_at: &str,
+        last_recalled_at: Option<&str>,
+    ) -> i64 {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO memories (project_id, kind, content, reasoning, tags, \
+             created_at, updated_at, last_recalled_at) \
+             VALUES ('proj1', ?1, ?2, '', '', ?3, ?4, ?5)",
+            rusqlite::params![kind, content, created_at, updated_at, last_recalled_at],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn archive_stale_permanent_archives_old_never_recalled() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(&dir.path().join("test.db")).unwrap();
+        let old = "2024-01-01T00:00:00+00:00";
+        insert_raw_permanent(
+            &store,
+            "principle",
+            "Old principle that was never recalled and should be archived",
+            old,
+            old,
+            None,
+        );
+        let archived = store.archive_stale_permanent(365).unwrap();
+        assert_eq!(archived, 1);
+        // Should not appear in active list
+        assert!(store.list("proj1", None, false, false).unwrap().is_empty());
+        // Should appear in archived list
+        assert_eq!(store.list("proj1", None, false, true).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn archive_stale_permanent_skips_recently_reinforced() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(&dir.path().join("test.db")).unwrap();
+        let old = "2024-01-01T00:00:00+00:00";
+        let recent = chrono::Utc::now().to_rfc3339();
+        // Created long ago but updated_at is recent (reinforced)
+        insert_raw_permanent(
+            &store,
+            "principle",
+            "Reinforced principle that should not be archived",
+            old,
+            &recent,
+            None,
+        );
+        let archived = store.archive_stale_permanent(365).unwrap();
+        assert_eq!(archived, 0);
+        assert_eq!(store.list("proj1", None, false, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn archive_stale_permanent_disabled_when_zero() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(&dir.path().join("test.db")).unwrap();
+        let old = "2024-01-01T00:00:00+00:00";
+        insert_raw_permanent(
+            &store,
+            "principle",
+            "Old principle should remain because disabled",
+            old,
+            old,
+            None,
+        );
+        let archived = store.archive_stale_permanent(0).unwrap();
+        assert_eq!(archived, 0);
+        assert_eq!(store.list("proj1", None, false, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recall_excludes_archived() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(&dir.path().join("test.db")).unwrap();
+        let old = "2024-01-01T00:00:00+00:00";
+        insert_raw_permanent(
+            &store,
+            "principle",
+            "Connection pooling best practice for databases",
+            old,
+            old,
+            None,
+        );
+        // Archive it
+        store.archive_stale_permanent(365).unwrap();
+        // Recall should not find it
+        let recalled = store
+            .recall("proj1", &["pooling".into(), "database".into()], 10, 16384)
+            .unwrap();
+        assert!(recalled.memories.is_empty());
+    }
+
+    #[test]
+    fn list_archived_vs_active() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(&dir.path().join("test.db")).unwrap();
+        let old = "2024-01-01T00:00:00+00:00";
+        // Insert one active and one that will be archived
+        insert_raw_permanent(
+            &store,
+            "decision",
+            "Active decision that should remain visible",
+            old,
+            &chrono::Utc::now().to_rfc3339(),
+            None,
+        );
+        insert_raw_permanent(
+            &store,
+            "principle",
+            "Stale principle should be archived after staleness check",
+            old,
+            old,
+            None,
+        );
+        store.archive_stale_permanent(365).unwrap();
+
+        let active = store.list("proj1", None, false, false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(!active[0].archived);
+
+        let archived = store.list("proj1", None, false, true).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert!(archived[0].archived);
+    }
+
+    #[test]
+    fn unarchive_restores_memory() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(&dir.path().join("test.db")).unwrap();
+        let old = "2024-01-01T00:00:00+00:00";
+
+        // Test both branches: one with last_recalled_at NULL, one with non-NULL.
+        let id_null = insert_raw_permanent(
+            &store,
+            "principle",
+            "Archived principle with null recall",
+            old,
+            old,
+            None,
+        );
+        let id_recalled = insert_raw_permanent(
+            &store,
+            "decision",
+            "Archived decision with old recall timestamp",
+            old,
+            old,
+            Some(old),
+        );
+        store.archive_stale_permanent(365).unwrap();
+        assert!(store.list("proj1", None, false, false).unwrap().is_empty());
+
+        // Unarchive both
+        store.unarchive(id_null).unwrap();
+        store.unarchive(id_recalled).unwrap();
+        let active = store.list("proj1", None, false, false).unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().all(|m| !m.archived));
+
+        // Re-run archival — both should stay active (durability check).
+        let re_archived = store.archive_stale_permanent(365).unwrap();
+        assert_eq!(
+            re_archived, 0,
+            "Unarchived memories must survive re-archival"
+        );
+        let still_active = store.list("proj1", None, false, false).unwrap();
+        assert_eq!(still_active.len(), 2);
+    }
+
+    #[test]
+    fn reinforce_archived_principle_unarchives() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(&dir.path().join("test.db")).unwrap();
+        let cfg = test_config();
+        let old = "2024-01-01T00:00:00+00:00";
+        // Use non-NULL last_recalled_at to exercise the harder archival branch.
+        insert_raw_permanent(
+            &store,
+            "principle",
+            "Always validate user input at system boundaries",
+            old,
+            old,
+            Some(old),
+        );
+        store.archive_stale_permanent(365).unwrap();
+        assert!(store.list("proj1", None, false, false).unwrap().is_empty());
+
+        // Re-extract a similar principle — should reinforce and auto-unarchive
+        let mem = ExtractedMemory {
+            kind: MemoryKind::Principle,
+            content: "Always validate user input at system boundaries".into(),
+            reasoning: "Security".into(),
+            tags: vec![],
+        };
+        store.insert("proj1", &mem, "run2", "Claude", &cfg).unwrap();
+
+        let active = store.list("proj1", None, false, false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(!active[0].archived);
+        assert!(active[0].evidence_count > 1);
+
+        // Durability: re-run archival — reinforced principle must stay active.
+        let re_archived = store.archive_stale_permanent(365).unwrap();
+        assert_eq!(
+            re_archived, 0,
+            "Reinforced principle must survive re-archival"
+        );
+    }
+
+    #[test]
+    fn decision_dedup_unarchives() {
+        let dir = tempdir().unwrap();
+        let store = MemoryStore::open(&dir.path().join("test.db")).unwrap();
+        let cfg = test_config();
+        let old = "2024-01-01T00:00:00+00:00";
+        insert_raw_permanent(
+            &store,
+            "decision",
+            "Use connection pooling with max twenty connections for PostgreSQL",
+            old,
+            old,
+            None,
+        );
+        store.archive_stale_permanent(365).unwrap();
+        assert!(store.list("proj1", None, false, false).unwrap().is_empty());
+
+        // Re-extract same decision — should dedup and unarchive
+        let mem = ExtractedMemory {
+            kind: MemoryKind::Decision,
+            content: "Use connection pooling with max twenty connections for PostgreSQL".into(),
+            reasoning: "Performance".into(),
+            tags: vec![],
+        };
+        let result = store.insert("proj1", &mem, "run2", "Claude", &cfg).unwrap();
+        assert_eq!(result, -1); // dedup skip
+
+        let active = store.list("proj1", None, false, false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(!active[0].archived);
+    }
+
+    #[test]
+    fn schema_migration_v5_to_v6() {
+        // Create a real v5 database without the `archived` column,
+        // then reopen via MemoryStore and verify the migration adds it.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    reasoning TEXT NOT NULL DEFAULT '',
+                    source_run TEXT NOT NULL DEFAULT '',
+                    source_agent TEXT NOT NULL DEFAULT '',
+                    evidence_count INTEGER NOT NULL DEFAULT 1,
+                    tags TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    recall_count INTEGER NOT NULL DEFAULT 0,
+                    last_recalled_at TEXT
+                );
+                CREATE VIRTUAL TABLE memories_fts USING fts5(
+                    content, reasoning, tags,
+                    content=memories, content_rowid=id,
+                    tokenize='porter unicode61'
+                );
+                CREATE TRIGGER memories_ai AFTER INSERT ON memories
+                WHEN new.kind IN ('decision','principle')
+                BEGIN
+                    INSERT INTO memories_fts(rowid, content, reasoning, tags)
+                    VALUES (new.id, new.content, new.reasoning, new.tags);
+                END;
+                CREATE TRIGGER memories_au AFTER UPDATE ON memories
+                WHEN new.kind IN ('decision','principle')
+                BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, content, reasoning, tags)
+                    VALUES ('delete', old.id, old.content, old.reasoning, old.tags);
+                    INSERT INTO memories_fts(rowid, content, reasoning, tags)
+                    VALUES (new.id, new.content, new.reasoning, new.tags);
+                END;
+                CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+                    INSERT INTO memories_fts(memories_fts, rowid, content, reasoning, tags)
+                    VALUES ('delete', old.id, old.content, old.reasoning, old.tags);
+                END;
+                CREATE INDEX idx_memories_project ON memories(project_id);
+                CREATE INDEX idx_memories_project_kind ON memories(project_id, kind);
+                CREATE INDEX idx_memories_project_recall ON memories(project_id, recall_count DESC, last_recalled_at DESC);
+                CREATE INDEX idx_memories_expires ON memories(expires_at) WHERE expires_at IS NOT NULL;
+                PRAGMA user_version = 5;",
+            )
+            .unwrap();
+            // Insert a permanent memory so we can verify it survives and gets archived column.
+            conn.execute(
+                "INSERT INTO memories (project_id, kind, content, reasoning, created_at, updated_at)
+                 VALUES ('p', 'decision', 'Use connection pooling', 'performance', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Reopen through MemoryStore — should auto-migrate 5→6.
+        let store = MemoryStore::open(&db_path).unwrap();
+        let conn = store.conn.lock().unwrap();
+
+        // Version should be 6.
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+
+        // archived column should exist with default 0.
+        let archived: bool = conn
+            .query_row("SELECT archived FROM memories WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(!archived, "Pre-existing row should default to not archived");
+
+        // Data should survive.
+        drop(conn);
+        let list = store.list("p", None, false, false).unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].content.contains("pooling"));
+
+        // archive_stale_permanent should work (the row is >365 days old).
+        let archived_count = store.archive_stale_permanent(365).unwrap();
+        assert_eq!(archived_count, 1);
+        let active = store.list("p", None, false, false).unwrap();
+        assert!(active.is_empty());
+        let archived_list = store.list("p", None, false, true).unwrap();
+        assert_eq!(archived_list.len(), 1);
     }
 
     // -----------------------------------------------------------------------

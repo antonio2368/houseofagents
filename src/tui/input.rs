@@ -3010,6 +3010,10 @@ pub(super) fn handle_edit_popup_key(app: &mut App, key: KeyEvent) {
                         let db_path = app.config.resolved_output_dir().join("memory.db");
                         match crate::memory::store::MemoryStore::open(&db_path) {
                             Ok(store) => {
+                                let stale_days = app.effective_memory_stale_permanent_days();
+                                if stale_days > 0 {
+                                    let _ = store.archive_stale_permanent(stale_days);
+                                }
                                 app.memory.store = Some(store);
                                 app.memory.project_id = crate::memory::project::detect_project_id(
                                     &app.config.memory.project_id,
@@ -3273,6 +3277,9 @@ pub(super) fn save_config_globally(app: &mut App) {
     if let Some(v) = app.session_memory_disable_extraction {
         config_to_save.memory.disable_extraction = v;
     }
+    if let Some(v) = app.session_memory_stale_permanent_days {
+        config_to_save.memory.stale_permanent_days = v;
+    }
     app.edit_popup.config_save_in_progress = true;
     let path_override = app.config_path_override.clone();
 
@@ -3323,6 +3330,7 @@ pub(super) fn handle_config_save_result(app: &mut App, result: Result<AppConfig,
             app.session_memory_summary_ttl_days = None;
             app.session_memory_extraction_agent = None;
             app.session_memory_disable_extraction = None;
+            app.session_memory_stale_permanent_days = None;
             app.error_modal = None;
             app.info_modal = Some("Config saved to disk".into());
         }
@@ -3600,9 +3608,10 @@ pub(crate) const MEM_MAX_RECALL: usize = 1;
 pub(crate) const MEM_MAX_RECALL_BYTES: usize = 2;
 pub(crate) const MEM_OBSERVATION_TTL: usize = 3;
 pub(crate) const MEM_SUMMARY_TTL: usize = 4;
-pub(crate) const MEM_EXTRACTION_AGENT: usize = 5;
-pub(crate) const MEM_DISABLE_EXTRACTION: usize = 6;
-pub(crate) const MEM_FIELD_COUNT: usize = 7;
+pub(crate) const MEM_STALE_PERMANENT_DAYS: usize = 5;
+pub(crate) const MEM_EXTRACTION_AGENT: usize = 6;
+pub(crate) const MEM_DISABLE_EXTRACTION: usize = 7;
+pub(crate) const MEM_FIELD_COUNT: usize = 8;
 
 // Compile-time guard: if you add a new MEM_* field, bump MEM_FIELD_COUNT too.
 const _: () = assert!(MEM_DISABLE_EXTRACTION + 1 == MEM_FIELD_COUNT);
@@ -3629,6 +3638,10 @@ pub(super) fn toggle_memory_field(app: &mut App) {
                 };
                 match crate::memory::store::MemoryStore::open(&db_path) {
                     Ok(store) => {
+                        let stale_days = app.effective_memory_stale_permanent_days();
+                        if stale_days > 0 {
+                            let _ = store.archive_stale_permanent(stale_days);
+                        }
                         app.memory.store = Some(store);
                         app.memory.project_id = crate::memory::project::detect_project_id(
                             &app.config.memory.project_id,
@@ -3660,6 +3673,7 @@ pub(super) fn begin_memory_edit(app: &mut App) {
         MEM_MAX_RECALL_BYTES => app.effective_memory_max_recall_bytes().to_string(),
         MEM_OBSERVATION_TTL => app.effective_memory_observation_ttl_days().to_string(),
         MEM_SUMMARY_TTL => app.effective_memory_summary_ttl_days().to_string(),
+        MEM_STALE_PERMANENT_DAYS => app.effective_memory_stale_permanent_days().to_string(),
         MEM_EXTRACTION_AGENT => app.effective_memory_extraction_agent().to_string(),
         _ => String::new(),
     };
@@ -3704,6 +3718,12 @@ pub(super) fn set_memory_override_from_buffer(app: &mut App) -> Result<(), Strin
                 return Err("Summary TTL must be at least 1 day".into());
             }
             app.session_memory_summary_ttl_days = Some(v);
+        }
+        MEM_STALE_PERMANENT_DAYS => {
+            let v = raw
+                .parse::<u32>()
+                .map_err(|_| "Stale permanent days must be a non-negative integer".to_string())?;
+            app.session_memory_stale_permanent_days = Some(v);
         }
         MEM_EXTRACTION_AGENT => {
             // Empty string means "auto" — always valid.
@@ -3900,6 +3920,7 @@ fn refresh_memory_list(app: &mut App) {
             &app.memory.project_id,
             app.memory.management_kind_filter,
             app.memory.management_never_recalled_filter,
+            app.memory.management_show_archived,
         ) {
             app.memory.management_memories = memories;
             if app.memory.management_cursor >= app.memory.management_memories.len() {
@@ -3912,6 +3933,7 @@ fn refresh_memory_list(app: &mut App) {
                 &app.memory.project_id,
                 app.memory.management_kind_filter,
                 app.memory.management_never_recalled_filter,
+                app.memory.management_show_archived,
             )
             .unwrap_or(app.memory.management_memories.len() as u64);
         app.memory.cached_db_size = store.db_size_bytes();
@@ -3982,6 +4004,26 @@ fn handle_memory_key(app: &mut App, key: KeyEvent) {
             app.memory.management_never_recalled_filter =
                 !app.memory.management_never_recalled_filter;
             refresh_memory_list(app);
+        }
+        KeyCode::Char('a') => {
+            app.memory.management_show_archived = !app.memory.management_show_archived;
+            app.memory.management_cursor = 0;
+            refresh_memory_list(app);
+        }
+        KeyCode::Char('u') => {
+            if app.memory.management_show_archived {
+                if let Some(mem) = app
+                    .memory
+                    .management_memories
+                    .get(app.memory.management_cursor)
+                {
+                    let id = mem.id;
+                    if let Some(ref store) = app.memory.store {
+                        let _ = store.unarchive(id);
+                    }
+                    refresh_memory_list(app);
+                }
+            }
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.screen = Screen::Home;

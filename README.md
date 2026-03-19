@@ -261,6 +261,7 @@ extra_cli_args = ""
 | `disable_extraction` | Disable post-run memory extraction (default: false) |
 | `observation_ttl_days` | Days before observations expire (default: 120) |
 | `summary_ttl_days` | Days before summaries expire (default: 180) |
+| `stale_permanent_days` | Archive permanent memories (decisions, principles) after N days without recall (default: 365, 0 to disable) |
 
 **Agent settings** (`[[agents]]`):
 
@@ -302,6 +303,8 @@ Anthropic `thinking_effort = "max"` is rejected in API mode. In CLI mode, House 
 | `D` | Bulk delete all visible memories (press twice to confirm) |
 | `f` | Cycle kind filter (all → decision → observation → summary → principle) |
 | `r` | Toggle "never recalled" filter |
+| `a` | Toggle archived view |
+| `u` | Unarchive selected memory (in archived view) |
 | `q` / `Esc` | Back to home |
 
 ### Config Editor

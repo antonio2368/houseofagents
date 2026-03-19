@@ -17,6 +17,7 @@ type BuiltExecutionOutput = (u32, Option<String>, HashMap<String, String>, Outpu
 fn inject_memory_recall(app: &mut App, prompt_context: &mut PromptRuntimeContext) -> Vec<i64> {
     app.memory.last_recalled_count = 0;
     app.memory.last_extraction_count = None;
+    app.memory.last_extraction_error = None;
     if !app.effective_memory_enabled() {
         return vec![];
     }
@@ -1124,6 +1125,7 @@ pub(super) fn start_execution(app: &mut App) {
     } else {
         app.memory.last_recalled_count = 0;
         app.memory.last_extraction_count = None;
+        app.memory.last_extraction_error = None;
         vec![]
     };
     let agent_names = app.selected_agents.clone();
@@ -1890,12 +1892,12 @@ pub(super) fn maybe_start_memory_extraction(app: &mut App) {
     }
 
     let mem_cfg = app.effective_memory_config();
-    let prompt = match crate::memory::extraction::build_extraction_prompt(
+    let (prompt, skipped) = match crate::memory::extraction::build_extraction_prompt(
         &files,
         mem_cfg.observation_ttl_days,
         mem_cfg.summary_ttl_days,
     ) {
-        Ok(p) => p,
+        Ok(result) => result,
         Err(e) => {
             if let Ok(output) = OutputManager::from_existing(run_dir.clone()) {
                 let _ = output.append_error(&format!(
@@ -1905,6 +1907,13 @@ pub(super) fn maybe_start_memory_extraction(app: &mut App) {
             return;
         }
     };
+    if skipped > 0 {
+        if let Ok(output) = OutputManager::from_existing(run_dir.clone()) {
+            let _ = output.append_error(&format!(
+                "Memory extraction: {skipped} file(s) skipped (budget exceeded)"
+            ));
+        }
+    }
 
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(
@@ -1998,9 +2007,11 @@ pub(super) fn handle_extraction_result(
     match result {
         Ok(memories) => {
             app.memory.last_extraction_count = Some(memories.len());
+            app.memory.last_extraction_error = None;
         }
-        Err(_) => {
+        Err(e) => {
             app.memory.last_extraction_count = Some(0);
+            app.memory.last_extraction_error = Some(e);
         }
     }
 }
@@ -2016,9 +2027,11 @@ fn drain_completed_extractions(app: &mut App) {
                 match result {
                     Ok(memories) => {
                         app.memory.last_extraction_count = Some(memories.len());
+                        app.memory.last_extraction_error = None;
                     }
-                    Err(_) => {
+                    Err(e) => {
                         app.memory.last_extraction_count = Some(0);
+                        app.memory.last_extraction_error = Some(e);
                     }
                 }
                 false // remove completed receiver

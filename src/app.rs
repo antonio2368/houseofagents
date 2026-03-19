@@ -202,6 +202,7 @@ pub struct App {
     pub(crate) session_memory_summary_ttl_days: Option<u32>,
     pub(crate) session_memory_extraction_agent: Option<String>,
     pub(crate) session_memory_disable_extraction: Option<bool>,
+    pub(crate) session_memory_stale_permanent_days: Option<u32>,
     pub(crate) screen: Screen,
     pub(crate) should_quit: bool,
 
@@ -247,6 +248,9 @@ pub(crate) struct MemoryState {
     pub extraction_rx:
         Vec<mpsc::UnboundedReceiver<Result<Vec<crate::memory::types::ExtractedMemory>, String>>>,
     pub last_extraction_count: Option<usize>,
+    pub last_extraction_error: Option<String>,
+    /// When true, the management screen shows archived memories instead of active.
+    pub management_show_archived: bool,
     // Management screen state
     pub management_memories: Vec<crate::memory::types::Memory>,
     pub management_cursor: usize,
@@ -611,13 +615,18 @@ impl App {
                 std::path::PathBuf::from(&config.memory.db_path)
             };
             match crate::memory::store::MemoryStore::open(&db_path) {
-                Ok(store) => MemoryState {
-                    store: Some(store),
-                    project_id: crate::memory::project::detect_project_id(
-                        &config.memory.project_id,
-                    ),
-                    ..Default::default()
-                },
+                Ok(store) => {
+                    if config.memory.stale_permanent_days > 0 {
+                        let _ = store.archive_stale_permanent(config.memory.stale_permanent_days);
+                    }
+                    MemoryState {
+                        store: Some(store),
+                        project_id: crate::memory::project::detect_project_id(
+                            &config.memory.project_id,
+                        ),
+                        ..Default::default()
+                    }
+                }
                 Err(e) => {
                     eprintln!("Warning: memory store failed to open ({db_path:?}): {e}");
                     MemoryState::default()
@@ -641,6 +650,7 @@ impl App {
             session_memory_summary_ttl_days: None,
             session_memory_extraction_agent: None,
             session_memory_disable_extraction: None,
+            session_memory_stale_permanent_days: None,
             screen: Screen::Home,
             should_quit: false,
             selected_agents: Vec::new(),
@@ -730,6 +740,11 @@ impl App {
             .unwrap_or(self.config.memory.summary_ttl_days)
     }
 
+    pub fn effective_memory_stale_permanent_days(&self) -> u32 {
+        self.session_memory_stale_permanent_days
+            .unwrap_or(self.config.memory.stale_permanent_days)
+    }
+
     pub fn effective_memory_extraction_agent(&self) -> &str {
         match &self.session_memory_extraction_agent {
             Some(s) => s.as_str(),
@@ -771,6 +786,7 @@ impl App {
             disable_extraction: self.effective_memory_disable_extraction(),
             observation_ttl_days: self.effective_memory_observation_ttl_days(),
             summary_ttl_days: self.effective_memory_summary_ttl_days(),
+            stale_permanent_days: self.effective_memory_stale_permanent_days(),
         }
     }
 

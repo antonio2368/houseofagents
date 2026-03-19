@@ -72,6 +72,7 @@ pub struct Memory {
     pub updated_at: String,
     pub recall_count: i64,
     pub last_recalled_at: Option<String>,
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

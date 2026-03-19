@@ -24,6 +24,8 @@ pub struct MemoryConfig {
     pub observation_ttl_days: u32,
     #[serde(default = "default_summary_ttl_days")]
     pub summary_ttl_days: u32,
+    #[serde(default = "default_stale_permanent_days")]
+    pub stale_permanent_days: u32,
 }
 
 impl Default for MemoryConfig {
@@ -38,24 +40,29 @@ impl Default for MemoryConfig {
             disable_extraction: false,
             observation_ttl_days: default_observation_ttl_days(),
             summary_ttl_days: default_summary_ttl_days(),
+            stale_permanent_days: default_stale_permanent_days(),
         }
     }
 }
 
 fn default_max_recall() -> usize {
-    15
+    20
 }
 
 fn default_max_recall_bytes() -> usize {
-    8192
+    16384
 }
 
 fn default_observation_ttl_days() -> u32 {
-    90
+    120
 }
 
 fn default_summary_ttl_days() -> u32 {
     180
+}
+
+fn default_stale_permanent_days() -> u32 {
+    365
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,13 +375,14 @@ max_history_bytes = 102400
 # enabled = true
 # db_path = ""                  # empty = {output_dir}/memory.db
 # project_id = ""               # empty = auto-detect from git remote / cwd
-# max_recall = 15               # max memories injected per run
-# max_recall_bytes = 8192       # max total bytes of recalled memory context
+# max_recall = 20               # max memories injected per run
+# max_recall_bytes = 16384      # max total bytes of recalled memory context
 # extraction_agent = ""         # empty = first participating agent, then first configured
                                 # Tip: stronger models produce higher-quality memories
 # disable_extraction = false    # set true to skip post-run extraction
-# observation_ttl_days = 90
+# observation_ttl_days = 120
 # summary_ttl_days = 180
+# stale_permanent_days = 365   # archive permanent memories after N days (0=disabled)
 
 # Named agents — you can have multiple agents per provider
 [[agents]]

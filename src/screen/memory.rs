@@ -33,6 +33,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.memory.management_never_recalled_filter {
         filter_parts.push("never recalled".to_string());
     }
+    if app.memory.management_show_archived {
+        filter_parts.push("archived".to_string());
+    }
     let filter_text = if filter_parts.is_empty() {
         String::new()
     } else {
@@ -110,9 +113,21 @@ pub fn draw(f: &mut Frame, app: &App) {
             } else {
                 mem.content.clone()
             };
+            let style = if app.memory.management_show_archived {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(prefix, Style::default().fg(kind_color(mem.kind))),
-                Span::raw(content_preview),
+                Span::styled(
+                    prefix,
+                    if app.memory.management_show_archived {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(kind_color(mem.kind))
+                    },
+                ),
+                Span::styled(content_preview, style),
             ]))
         })
         .collect();
@@ -149,10 +164,19 @@ pub fn draw(f: &mut Frame, app: &App) {
                 Span::styled(mem.kind.as_str(), Style::default().fg(kind_color(mem.kind))),
             ]),
             Line::from(""),
+        ];
+        if mem.archived {
+            lines.push(Line::from(Span::styled(
+                "ARCHIVED",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(""));
+        }
+        lines.extend([
             Line::from(Span::styled("Content:", Style::default().fg(Color::Yellow))),
             Line::from(mem.content.as_str()),
             Line::from(""),
-        ];
+        ]);
         if !mem.reasoning.is_empty() {
             lines.push(Line::from(Span::styled(
                 "Reasoning:",
@@ -213,7 +237,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     f.render_widget(detail.block(detail_block), content_chunks[1]);
 
     // Help bar
-    let help = Paragraph::new(Line::from(vec![
+    let mut help_spans = vec![
         Span::styled("j/k", Style::default().fg(Color::Yellow)),
         Span::raw(": navigate  "),
         Span::styled("d", Style::default().fg(Color::Yellow)),
@@ -224,9 +248,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         Span::raw(": filter kind  "),
         Span::styled("r", Style::default().fg(Color::Yellow)),
         Span::raw(": never recalled  "),
-        Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
-        Span::raw(": back"),
-    ]))
-    .block(Block::default().borders(Borders::TOP));
+        Span::styled("a", Style::default().fg(Color::Yellow)),
+        Span::raw(": archived  "),
+    ];
+    if app.memory.management_show_archived {
+        help_spans.push(Span::styled("u", Style::default().fg(Color::Yellow)));
+        help_spans.push(Span::raw(": unarchive  "));
+    }
+    help_spans.push(Span::styled("q/Esc", Style::default().fg(Color::Yellow)));
+    help_spans.push(Span::raw(": back"));
+    let help = Paragraph::new(Line::from(help_spans)).block(Block::default().borders(Borders::TOP));
     f.render_widget(help, chunks[2]);
 }

@@ -990,10 +990,15 @@ pub(crate) async fn run(args: HeadlessArgs, config: AppConfig) -> i32 {
             PathBuf::from(&config.memory.db_path)
         };
         match crate::memory::store::MemoryStore::open(&db_path) {
-            Ok(s) => (
-                Some(s),
-                crate::memory::project::detect_project_id(&config.memory.project_id),
-            ),
+            Ok(s) => {
+                if config.memory.stale_permanent_days > 0 {
+                    let _ = s.archive_stale_permanent(config.memory.stale_permanent_days);
+                }
+                (
+                    Some(s),
+                    crate::memory::project::detect_project_id(&config.memory.project_id),
+                )
+            }
             Err(e) => {
                 if !args.quiet {
                     match args.output_format {
@@ -2332,22 +2337,47 @@ async fn run_post_steps(
     // matching TUI behavior where extraction runs for any partial success.
     if config.memory.enabled && !config.memory.disable_extraction {
         if let Some(ref store) = memory_store {
-            if let Err(e) =
-                run_memory_extraction(&run_dir, config, summary, store, memory_project_id, &cancel)
-                    .await
+            match run_memory_extraction(
+                &run_dir,
+                config,
+                summary,
+                store,
+                memory_project_id,
+                &cancel,
+            )
+            .await
             {
-                if !args.quiet {
-                    match args.output_format {
-                        OutputFormat::Json => {
-                            let obj = serde_json::json!({
-                                "event": "warning",
-                                "component": "memory_extraction",
-                                "message": format!("Memory extraction failed (non-blocking): {e}"),
-                            });
-                            eprintln!("{}", serde_json::to_string(&obj).unwrap_or_default());
+                Ok(count) => {
+                    if !args.quiet && count > 0 {
+                        match args.output_format {
+                            OutputFormat::Json => {
+                                let obj = serde_json::json!({
+                                    "event": "info",
+                                    "component": "memory_extraction",
+                                    "message": format!("Extracted {count} memories"),
+                                });
+                                eprintln!("{}", serde_json::to_string(&obj).unwrap_or_default());
+                            }
+                            OutputFormat::Text => {
+                                eprintln!("Memory extraction: {count} memories extracted");
+                            }
                         }
-                        OutputFormat::Text => {
-                            eprintln!("Memory extraction failed (non-blocking): {e}");
+                    }
+                }
+                Err(e) => {
+                    if !args.quiet {
+                        match args.output_format {
+                            OutputFormat::Json => {
+                                let obj = serde_json::json!({
+                                    "event": "warning",
+                                    "component": "memory_extraction",
+                                    "message": format!("Memory extraction failed (non-blocking): {e}"),
+                                });
+                                eprintln!("{}", serde_json::to_string(&obj).unwrap_or_default());
+                            }
+                            OutputFormat::Text => {
+                                eprintln!("Memory extraction failed (non-blocking): {e}");
+                            }
                         }
                     }
                 }
@@ -2676,7 +2706,7 @@ async fn run_memory_extraction(
     store: &crate::memory::store::MemoryStore,
     project_id: &str,
     cancel: &Arc<AtomicBool>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let mode = summary.mode;
     let agents = &summary.agents;
 
@@ -2703,21 +2733,28 @@ async fn run_memory_extraction(
     }
 
     if files.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
-    let prompt = crate::memory::extraction::build_extraction_prompt(
+    let (prompt, skipped) = crate::memory::extraction::build_extraction_prompt(
         &files,
         config.memory.observation_ttl_days,
         config.memory.summary_ttl_days,
     )?;
+    if skipped > 0 {
+        if let Ok(output) = OutputManager::from_existing(run_dir.to_path_buf()) {
+            let _ = output.append_error(&format!(
+                "Memory extraction: {skipped} file(s) skipped (budget exceeded)"
+            ));
+        }
+    }
 
     let Some(agent_name) = crate::app::resolve_extraction_agent(
         &config.memory.extraction_agent,
         agents,
         &config.agents,
     ) else {
-        return Ok(());
+        return Ok(0);
     };
     let cli_available = rs::detect_cli_availability();
     let session_overrides = rs::compute_session_overrides(&config.agents, &cli_available);
@@ -2747,7 +2784,7 @@ async fn run_memory_extraction(
 
     // Check cancel before the potentially long API call
     if cancel.load(Ordering::Relaxed) {
-        return Ok(());
+        return Ok(0);
     }
     let response = tokio::select! {
         res = provider.send(&prompt) => res.map_err(|e| e.to_string())?,
@@ -2757,7 +2794,7 @@ async fn run_memory_extraction(
                 if cancel.load(Ordering::Relaxed) { break; }
             }
         } => {
-            return Ok(());
+            return Ok(0);
         }
     };
     let memories = crate::memory::extraction::parse_extraction_response(&response.content);
@@ -2790,5 +2827,5 @@ async fn run_memory_extraction(
         }
     }
 
-    Ok(())
+    Ok(memories.len())
 }

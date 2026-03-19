@@ -119,6 +119,12 @@ pub fn home_help_lines() -> &'static [Line<'static>] {
                 Span::raw(": filter by kind  "),
                 Span::styled("r", Style::default().fg(Color::Yellow)),
                 Span::raw(": toggle never-recalled  "),
+                Span::styled("a", Style::default().fg(Color::Yellow)),
+                Span::raw(": toggle archived"),
+            ]),
+            Line::from(vec![
+                Span::styled("  u", Style::default().fg(Color::Yellow)),
+                Span::raw(": unarchive  "),
                 Span::styled("q/Esc", Style::default().fg(Color::Yellow)),
                 Span::raw(": back"),
             ]),
