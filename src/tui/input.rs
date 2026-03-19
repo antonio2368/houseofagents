@@ -1397,6 +1397,14 @@ fn handle_pipeline_session_config_key(app: &mut App, key: KeyEvent) {
                     (app.pipeline.pipeline_session_config_cursor + 1).min(sessions.len() - 1);
             }
         }
+        KeyCode::Left | KeyCode::Char('h') => {
+            app.pipeline.pipeline_session_config_col =
+                app.pipeline.pipeline_session_config_col.saturating_sub(1);
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            app.pipeline.pipeline_session_config_col =
+                (app.pipeline.pipeline_session_config_col + 1).min(1);
+        }
         KeyCode::Char(' ') | KeyCode::Enter => {
             let sessions = app.pipeline.pipeline_def.effective_sessions();
             if sessions.is_empty() {
@@ -1407,10 +1415,26 @@ fn handle_pipeline_session_config_key(app: &mut App, key: KeyEvent) {
                 .pipeline_session_config_cursor
                 .min(sessions.len() - 1);
             let session = &sessions[cursor];
-            let new_keep = !session.keep_across_iterations;
-            app.pipeline
-                .pipeline_def
-                .set_keep_session_across_iterations(&session.agent, &session.session_key, new_keep);
+            let col = app.pipeline.pipeline_session_config_col;
+            if col == 0 {
+                let new_keep = !session.keep_across_iterations;
+                app.pipeline
+                    .pipeline_def
+                    .set_keep_session_across_iterations(
+                        &session.agent,
+                        &session.session_key,
+                        new_keep,
+                    );
+            } else {
+                let new_keep = !session.keep_across_loop_passes;
+                app.pipeline
+                    .pipeline_def
+                    .set_keep_session_across_loop_passes(
+                        &session.agent,
+                        &session.session_key,
+                        new_keep,
+                    );
+            }
             app.pipeline.pipeline_def.normalize_session_configs();
             // Re-clamp cursor
             let sessions = app.pipeline.pipeline_def.effective_sessions();

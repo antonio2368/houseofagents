@@ -2316,7 +2316,7 @@ fn draw_file_dialog(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_session_config_popup(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(55, 50, area);
+    let popup = centered_rect(60, 50, area);
     f.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -2356,19 +2356,32 @@ fn draw_session_config_popup(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Header
+    let col = app.pipeline.pipeline_session_config_col;
+    let iter_header_style = if col == 0 {
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let loop_header_style = if col == 1 {
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
     let header = Line::from(vec![
         Span::styled(
             format!("{:<15}", "Agent"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{:<17}", "Session"),
+            format!("{:<15}", "Session"),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            format!("{:<6}", "Keep"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("{:<6}", "Iter"), iter_header_style),
+        Span::styled(format!("{:<6}", "Loop"), loop_header_style),
         Span::styled("\u{00d7}N", Style::default().add_modifier(Modifier::BOLD)),
     ]);
     f.render_widget(
@@ -2377,7 +2390,7 @@ fn draw_session_config_popup(f: &mut Frame, app: &App, area: Rect) {
     );
 
     // Footer
-    let footer = Paragraph::new("j/k: navigate | Space/Enter: toggle | Esc: close")
+    let footer = Paragraph::new("j/k: navigate | h/l: column | Space/Enter: toggle | Esc: close")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(ratatui::layout::Alignment::Center);
     let footer_y = inner.y + inner.height.saturating_sub(1);
@@ -2403,8 +2416,13 @@ fn draw_session_config_popup(f: &mut Frame, app: &App, area: Rect) {
         let is_selected = si == cursor;
 
         let agent_col = fit_display_width(&session.agent, 15);
-        let label_col = fit_display_width(&session.display_label, 17);
-        let keep_col = if session.keep_across_iterations {
+        let label_col = fit_display_width(&session.display_label, 15);
+        let iter_col = if session.keep_across_iterations {
+            "[x]"
+        } else {
+            "[ ]"
+        };
+        let loop_col = if session.keep_across_loop_passes {
             "[x]"
         } else {
             "[ ]"
@@ -2421,25 +2439,53 @@ fn draw_session_config_popup(f: &mut Frame, app: &App, area: Rect) {
             Style::default()
         };
 
+        let iter_style = {
+            let base = if is_selected && col == 0 {
+                style.bg(Color::White)
+            } else {
+                style
+            };
+            if session.keep_across_iterations {
+                base.fg(if is_selected {
+                    Color::Black
+                } else {
+                    Color::Green
+                })
+            } else {
+                base.fg(if is_selected {
+                    Color::Black
+                } else {
+                    Color::Red
+                })
+            }
+        };
+
+        let loop_style = {
+            let base = if is_selected && col == 1 {
+                style.bg(Color::White)
+            } else {
+                style
+            };
+            if session.keep_across_loop_passes {
+                base.fg(if is_selected {
+                    Color::Black
+                } else {
+                    Color::Green
+                })
+            } else {
+                base.fg(if is_selected {
+                    Color::Black
+                } else {
+                    Color::Red
+                })
+            }
+        };
+
         let row = Line::from(vec![
             Span::styled(agent_col, style),
             Span::styled(label_col, style),
-            Span::styled(
-                format!("{keep_col:<6}"),
-                if session.keep_across_iterations {
-                    style.fg(if is_selected {
-                        Color::Black
-                    } else {
-                        Color::Green
-                    })
-                } else {
-                    style.fg(if is_selected {
-                        Color::Black
-                    } else {
-                        Color::Red
-                    })
-                },
-            ),
+            Span::styled(format!("{iter_col:<6}"), iter_style),
+            Span::styled(format!("{loop_col:<6}"), loop_style),
             Span::styled(replicas_col, style),
         ]);
 

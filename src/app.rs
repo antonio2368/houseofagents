@@ -414,6 +414,8 @@ pub(crate) struct PipelineState {
     pub(crate) pipeline_save_path: Option<PathBuf>,
     pub(crate) pipeline_show_session_config: bool,
     pub(crate) pipeline_session_config_cursor: usize,
+    /// 0 = Iter column, 1 = Loop column
+    pub(crate) pipeline_session_config_col: usize,
     pub(crate) pipeline_loop_connecting_from: Option<BlockId>,
     pub(crate) pipeline_show_loop_edit: bool,
     pub(crate) pipeline_loop_edit_field: PipelineLoopEditField,
@@ -1408,6 +1410,7 @@ impl PipelineState {
             pipeline_save_path: None,
             pipeline_show_session_config: false,
             pipeline_session_config_cursor: 0,
+            pipeline_session_config_col: 0,
             pipeline_loop_connecting_from: None,
             pipeline_show_loop_edit: false,
             pipeline_loop_edit_field: PipelineLoopEditField::Count,
@@ -1629,6 +1632,7 @@ mod tests {
         app.pipeline.pipeline_save_path = Some(PathBuf::from("pipeline.toml"));
         app.pipeline.pipeline_show_session_config = true;
         app.pipeline.pipeline_session_config_cursor = 2;
+        app.pipeline.pipeline_session_config_col = 1;
         app.help_popup.open(crate::screen::help::PIPELINE_TAB_COUNT);
         app.help_popup.tab = 3;
         app.help_popup.scroll = 15;
@@ -1729,6 +1733,7 @@ mod tests {
         assert!(app.pipeline.pipeline_save_path.is_none());
         assert!(!app.pipeline.pipeline_show_session_config);
         assert_eq!(app.pipeline.pipeline_session_config_cursor, 0);
+        assert_eq!(app.pipeline.pipeline_session_config_col, 0);
         assert!(!app.help_popup.active);
         assert_eq!(app.help_popup.tab, 0);
         assert_eq!(app.help_popup.scroll, 0);
@@ -1854,9 +1859,9 @@ mod tests {
     fn effective_memory_values_use_global_defaults() {
         let app = app_with_known_cli();
         assert!(app.effective_memory_enabled());
-        assert_eq!(app.effective_memory_max_recall(), 15);
-        assert_eq!(app.effective_memory_max_recall_bytes(), 8192);
-        assert_eq!(app.effective_memory_observation_ttl_days(), 90);
+        assert_eq!(app.effective_memory_max_recall(), 20);
+        assert_eq!(app.effective_memory_max_recall_bytes(), 16384);
+        assert_eq!(app.effective_memory_observation_ttl_days(), 120);
         assert_eq!(app.effective_memory_summary_ttl_days(), 180);
         assert_eq!(app.effective_memory_extraction_agent(), "");
         assert!(!app.effective_memory_disable_extraction());
@@ -1890,7 +1895,7 @@ mod tests {
         assert_eq!(cfg.max_recall, 3);
         assert_eq!(cfg.observation_ttl_days, 10);
         // Non-overridden fields should come from config defaults
-        assert_eq!(cfg.max_recall_bytes, 8192);
+        assert_eq!(cfg.max_recall_bytes, 16384);
         assert_eq!(cfg.summary_ttl_days, 180);
     }
 
