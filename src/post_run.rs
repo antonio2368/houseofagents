@@ -19,39 +19,62 @@ pub(crate) fn parse_agent_iteration_filename(name: &str, agent_key: &str) -> Opt
     iter_str.parse::<u32>().ok()
 }
 
-/// Parse iteration from a pipeline block output filename.
-/// Matches both named blocks (`{name}_b{id}_{agent}_iter{n}.md`)
-/// and unnamed blocks (`block{id}_{agent}_iter{n}.md`).
-pub(crate) fn parse_pipeline_iteration_filename(name: &str) -> Option<u32> {
+/// Check whether a filename matches the pipeline block output pattern.
+/// Recognises both current (`{stem}.md`, `{stem}_loop{N}.md`) and legacy
+/// (`{stem}_iter{N}.md`, `{stem}_iter{N}_loop{M}.md`) naming conventions.
+pub(crate) fn is_pipeline_output_filename(name: &str) -> bool {
     if !name.ends_with(".md") {
-        return None;
+        return false;
     }
     let stem = name.trim_end_matches(".md");
 
-    // Search right-to-left so block names containing "_b" (for example
-    // "web_builder") still detect the actual "_b{id}_" marker.
+    // Strip optional _loop{N} suffix
+    let stem = if let Some(lp) = stem.rfind("_loop") {
+        if stem[lp + 5..].parse::<u32>().is_ok() {
+            &stem[..lp]
+        } else {
+            stem
+        }
+    } else {
+        stem
+    };
+
+    // Strip optional _iter{N} suffix (backward compat for old runs)
+    let stem = if let Some(ip) = stem.rfind("_iter") {
+        if stem[ip + 5..].parse::<u32>().is_ok() {
+            &stem[..ip]
+        } else {
+            stem
+        }
+    } else {
+        stem
+    };
+
+    // Named block: ..._b{id}_...
     let mut search_end = stem.len();
     while let Some(rel) = stem[..search_end].rfind("_b") {
         let after_b = &stem[rel + 2..];
         if let Some(end_of_id) = after_b.find('_') {
             if after_b[..end_of_id].parse::<u32>().is_ok() {
-                return parse_iteration_from_filename(name);
+                return true;
             }
         }
         search_end = rel;
     }
 
+    // Unnamed block: block{id}_...
     if let Some(rest) = stem.strip_prefix("block") {
         if let Some(underscore) = rest.find('_') {
             if rest[..underscore].parse::<u32>().is_ok() {
-                return parse_iteration_from_filename(name);
+                return true;
             }
         }
     }
 
-    None
+    false
 }
 
+#[cfg(test)]
 pub(crate) fn parse_iteration_from_filename(name: &str) -> Option<u32> {
     if !name.ends_with(".md") {
         return None;
@@ -83,8 +106,8 @@ pub(crate) fn find_last_iteration(run_dir: &std::path::Path, agent_keys: &[Strin
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if agent_keys.is_empty() {
-            if let Some(iter) = parse_pipeline_iteration_filename(&name) {
-                max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
+            if is_pipeline_output_filename(&name) {
+                return Some(1);
             }
         } else {
             for key in agent_keys {
@@ -109,8 +132,8 @@ pub(crate) async fn find_last_iteration_async(
             Ok(Some(entry)) => {
                 let name = entry.file_name().to_string_lossy().to_string();
                 if agent_keys.is_empty() {
-                    if let Some(iter) = parse_pipeline_iteration_filename(&name) {
-                        max_iter = Some(max_iter.map_or(iter, |m| m.max(iter)));
+                    if is_pipeline_output_filename(&name) {
+                        return Some(1);
                     }
                 } else {
                     for key in agent_keys {
@@ -228,9 +251,6 @@ pub(crate) fn discover_final_outputs(
     selected_agents: &[String],
 ) -> Vec<(String, std::path::PathBuf)> {
     if mode == ExecutionMode::Pipeline {
-        let Some(last_iteration) = find_last_iteration(run_dir, &[]) else {
-            return Vec::new();
-        };
         let mut files = std::fs::read_dir(run_dir)
             .ok()
             .into_iter()
@@ -238,7 +258,7 @@ pub(crate) fn discover_final_outputs(
             .filter_map(|entry| {
                 let path = entry.path();
                 let name = path.file_name()?.to_str()?.to_string();
-                if parse_pipeline_iteration_filename(&name) == Some(last_iteration) {
+                if is_pipeline_output_filename(&name) {
                     Some((name, path))
                 } else {
                     None
@@ -310,10 +330,6 @@ pub(crate) async fn discover_final_outputs_async(
     selected_agents: &[String],
 ) -> Vec<(String, std::path::PathBuf)> {
     if mode == ExecutionMode::Pipeline {
-        let Some(last_iteration) = find_last_iteration_async(run_dir, &[]).await else {
-            return Vec::new();
-        };
-
         let mut files = Vec::new();
         let mut entries = match tokio::fs::read_dir(run_dir).await {
             Ok(entries) => entries,
@@ -331,7 +347,7 @@ pub(crate) async fn discover_final_outputs_async(
                     else {
                         continue;
                     };
-                    if parse_pipeline_iteration_filename(&name) == Some(last_iteration) {
+                    if is_pipeline_output_filename(&name) {
                         files.push((name, path));
                     }
                 }

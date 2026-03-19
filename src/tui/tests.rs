@@ -10,10 +10,11 @@ use crate::error::AppError;
 use crate::execution::ProgressEvent;
 use crate::post_run::{
     build_diagnostic_prompt, build_file_consolidation_prompt, collect_application_errors,
-    collect_report_files, find_last_iteration, find_last_iteration_async,
+    collect_report_files, discover_final_outputs, discover_final_outputs_async,
+    find_last_iteration, find_last_iteration_async, is_pipeline_output_filename,
     parse_agent_iteration_filename, parse_iteration_from_filename,
-    parse_pipeline_iteration_filename, run_consolidation_with_provider_factory,
-    ConsolidationRequest, POST_RUN_SYNTHESIS_MAX_INPUT_BYTES,
+    run_consolidation_with_provider_factory, ConsolidationRequest,
+    POST_RUN_SYNTHESIS_MAX_INPUT_BYTES,
 };
 use crate::provider::{CompletionResponse, Provider};
 use crossterm::event::KeyEvent;
@@ -260,58 +261,62 @@ fn parse_iteration_from_filename_accepts_any_iter_suffix() {
 
 #[test]
 fn parse_block_iteration_named_block() {
-    // {name}_b{id}_{agent}_iter{n}.md
-    assert_eq!(
-        parse_pipeline_iteration_filename("Analyzer_b1_Claude_iter2.md"),
-        Some(2)
-    );
+    // Legacy: {name}_b{id}_{agent}_iter{n}.md
+    assert!(is_pipeline_output_filename("Analyzer_b1_Claude_iter2.md"));
+    // New: {name}_b{id}_{agent}.md
+    assert!(is_pipeline_output_filename("Analyzer_b1_Claude.md"));
 }
 
 #[test]
 fn parse_pipeline_iteration_unnamed_block() {
-    // unnamed blocks use block{id}_{agent}_iter{n}.md pattern
-    assert_eq!(
-        parse_pipeline_iteration_filename("block1_openai_iter5.md"),
-        Some(5)
-    );
+    // Legacy: block{id}_{agent}_iter{n}.md
+    assert!(is_pipeline_output_filename("block1_openai_iter5.md"));
+    // New: block{id}_{agent}.md
+    assert!(is_pipeline_output_filename("block1_claude.md"));
 }
 
 #[test]
 fn parse_block_iteration_different_agent() {
-    assert_eq!(
-        parse_pipeline_iteration_filename("Reviewer_b3_Gemini_iter5.md"),
-        Some(5)
-    );
+    assert!(is_pipeline_output_filename("Reviewer_b3_Gemini_iter5.md"));
 }
 
 #[test]
 fn parse_block_iteration_not_md() {
-    assert_eq!(
-        parse_pipeline_iteration_filename("Analyzer_b1_Claude_iter2.txt"),
-        None
-    );
+    assert!(!is_pipeline_output_filename("Analyzer_b1_Claude_iter2.txt"));
+    assert!(!is_pipeline_output_filename("Analyzer_b1_Claude.txt"));
 }
 
 #[test]
 fn parse_block_iteration_no_block_id_marker() {
-    assert_eq!(parse_pipeline_iteration_filename("Claude_iter2.md"), None);
+    assert!(!is_pipeline_output_filename("Claude_iter2.md"));
+    assert!(!is_pipeline_output_filename("Claude.md"));
 }
 
 #[test]
 fn parse_block_iteration_non_numeric_block_id() {
-    assert_eq!(
-        parse_pipeline_iteration_filename("Analyzer_bx_Claude_iter2.md"),
-        None
-    );
+    assert!(!is_pipeline_output_filename("Analyzer_bx_Claude_iter2.md"));
+    assert!(!is_pipeline_output_filename("Analyzer_bx_Claude.md"));
 }
 
 #[test]
 fn parse_block_iteration_name_contains_b() {
     // Block name "web_builder" contains "_b" — parser must skip it and find _b7_
-    assert_eq!(
-        parse_pipeline_iteration_filename("web_builder_b7_Claude_iter1.md"),
-        Some(1)
-    );
+    assert!(is_pipeline_output_filename(
+        "web_builder_b7_Claude_iter1.md"
+    ));
+    assert!(is_pipeline_output_filename("web_builder_b7_Claude.md"));
+}
+
+#[test]
+fn is_pipeline_output_filename_loop_variants() {
+    // New loop format
+    assert!(is_pipeline_output_filename("block1_claude_loop2.md"));
+    assert!(is_pipeline_output_filename("Analyzer_b1_Claude_loop1.md"));
+    // Legacy iter+loop format
+    assert!(is_pipeline_output_filename("block1_claude_iter1_loop2.md"));
+    assert!(is_pipeline_output_filename(
+        "Analyzer_b1_Claude_iter1_loop1.md"
+    ));
 }
 
 #[test]
@@ -332,20 +337,192 @@ fn parse_iteration_from_filename_matches_block_files() {
 fn find_last_iteration_includes_block_files() {
     let dir = tempdir().unwrap();
     write_agent_iter(dir.path(), "anthropic", 1);
-    fs::write(dir.path().join("Analyzer_b1_Claude_iter3.md"), "test").unwrap();
-    fs::write(dir.path().join("Reviewer_b2_Gemini_iter3.md"), "test").unwrap();
-    assert_eq!(find_last_iteration(dir.path(), &[]), Some(3));
+    fs::write(dir.path().join("Analyzer_b1_Claude.md"), "test").unwrap();
+    fs::write(dir.path().join("Reviewer_b2_Gemini.md"), "test").unwrap();
+    assert_eq!(find_last_iteration(dir.path(), &[]), Some(1));
 }
 
 #[tokio::test]
 async fn find_last_iteration_async_matches_sync_for_pipeline_files() {
     let dir = tempdir().unwrap();
-    fs::write(dir.path().join("Analyzer_b1_Claude_iter2.md"), "test").unwrap();
-    fs::write(dir.path().join("Reviewer_b2_Gemini_iter5.md"), "test").unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude.md"), "test").unwrap();
+    fs::write(dir.path().join("Reviewer_b2_Gemini.md"), "test").unwrap();
 
     let sync = find_last_iteration(dir.path(), &[]);
     let async_found = find_last_iteration_async(dir.path(), &[]).await;
     assert_eq!(async_found, sync);
+    assert_eq!(sync, Some(1));
+}
+
+// --- Backward-compat integration tests for old _iter{N} filenames ---
+
+#[test]
+fn find_last_iteration_old_format_pipeline_files() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude_iter1.md"), "old").unwrap();
+    fs::write(dir.path().join("Reviewer_b2_Gemini_iter1.md"), "old").unwrap();
+    assert_eq!(find_last_iteration(dir.path(), &[]), Some(1));
+}
+
+#[tokio::test]
+async fn find_last_iteration_async_old_format_pipeline_files() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude_iter2.md"), "old").unwrap();
+    let sync = find_last_iteration(dir.path(), &[]);
+    let async_found = find_last_iteration_async(dir.path(), &[]).await;
+    assert_eq!(sync, Some(1));
+    assert_eq!(async_found, Some(1));
+}
+
+#[test]
+fn discover_final_outputs_old_format_pipeline_files() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude_iter1.md"), "old output").unwrap();
+    fs::write(
+        dir.path().join("Reviewer_b2_Gemini_iter1.md"),
+        "old output 2",
+    )
+    .unwrap();
+    fs::write(dir.path().join("session.toml"), "metadata").unwrap();
+
+    let files = discover_final_outputs(dir.path(), ExecutionMode::Pipeline, &[]);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"Analyzer_b1_Claude_iter1.md"),
+        "should discover old-format named block file"
+    );
+    assert!(
+        names.contains(&"Reviewer_b2_Gemini_iter1.md"),
+        "should discover old-format named block file"
+    );
+    assert_eq!(files.len(), 2, "should not include non-pipeline files");
+}
+
+#[tokio::test]
+async fn discover_final_outputs_async_old_format_pipeline_files() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("block1_claude_iter1.md"), "old output").unwrap();
+    fs::write(
+        dir.path().join("block1_claude_iter1_loop2.md"),
+        "old loop output",
+    )
+    .unwrap();
+    fs::write(dir.path().join("session.toml"), "metadata").unwrap();
+
+    let files = discover_final_outputs_async(dir.path(), ExecutionMode::Pipeline, &[]).await;
+    // keep_highest_loop_pass should keep only the loop2 variant
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"block1_claude_iter1_loop2.md"),
+        "should discover old-format loop file"
+    );
+    assert!(
+        !names.contains(&"block1_claude_iter1.md"),
+        "loop dedup should exclude base when loop variant exists"
+    );
+}
+
+#[tokio::test]
+async fn discover_final_outputs_async_new_format_loop_dedup() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude.md"), "base output").unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude_loop1.md"), "loop 1").unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude_loop2.md"), "loop 2").unwrap();
+
+    let files = discover_final_outputs_async(dir.path(), ExecutionMode::Pipeline, &[]).await;
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"Analyzer_b1_Claude_loop2.md"),
+        "should keep highest loop pass"
+    );
+    assert!(
+        !names.contains(&"Analyzer_b1_Claude.md"),
+        "loop dedup should exclude base when loop variants exist"
+    );
+    assert!(
+        !names.contains(&"Analyzer_b1_Claude_loop1.md"),
+        "loop dedup should exclude lower loop passes"
+    );
+    assert_eq!(files.len(), 1, "only the highest loop pass should remain");
+}
+
+#[test]
+fn discover_final_outputs_mixed_old_and_new_format() {
+    let dir = tempdir().unwrap();
+    // Old format
+    fs::write(dir.path().join("Analyzer_b1_Claude_iter1.md"), "old").unwrap();
+    // New format
+    fs::write(dir.path().join("Reviewer_b2_Gemini.md"), "new").unwrap();
+
+    let files = discover_final_outputs(dir.path(), ExecutionMode::Pipeline, &[]);
+    assert_eq!(
+        files.len(),
+        2,
+        "should discover both old and new format files"
+    );
+}
+
+#[test]
+fn discover_final_outputs_old_format_loop_dedup_sync() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("block1_claude_iter1.md"), "old output").unwrap();
+    fs::write(
+        dir.path().join("block1_claude_iter1_loop2.md"),
+        "old loop output",
+    )
+    .unwrap();
+
+    let files = discover_final_outputs(dir.path(), ExecutionMode::Pipeline, &[]);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"block1_claude_iter1_loop2.md"),
+        "should keep highest loop pass"
+    );
+    assert!(
+        !names.contains(&"block1_claude_iter1.md"),
+        "loop dedup should exclude base when loop variant exists"
+    );
+}
+
+#[test]
+fn discover_final_outputs_new_format_loop_dedup() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude.md"), "base output").unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude_loop1.md"), "loop 1").unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude_loop2.md"), "loop 2").unwrap();
+
+    let files = discover_final_outputs(dir.path(), ExecutionMode::Pipeline, &[]);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"Analyzer_b1_Claude_loop2.md"),
+        "should keep highest loop pass"
+    );
+    assert!(
+        !names.contains(&"Analyzer_b1_Claude.md"),
+        "loop dedup should exclude base when loop variants exist"
+    );
+    assert!(
+        !names.contains(&"Analyzer_b1_Claude_loop1.md"),
+        "loop dedup should exclude lower loop passes"
+    );
+    assert_eq!(files.len(), 1, "only the highest loop pass should remain");
+}
+
+#[test]
+fn discover_final_outputs_ignores_non_pipeline_files() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude.md"), "output").unwrap();
+    // These don't match is_pipeline_output_filename (no _b{id}_ or block{id}_ pattern)
+    fs::write(dir.path().join("consolidated_claude.md"), "consolidated").unwrap();
+    fs::write(dir.path().join("prompt.md"), "prompt").unwrap();
+    fs::write(dir.path().join("session.toml"), "metadata").unwrap();
+
+    let files = discover_final_outputs(dir.path(), ExecutionMode::Pipeline, &[]);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"Analyzer_b1_Claude.md"));
+    assert!(!names.contains(&"consolidated_claude.md"));
+    assert!(!names.contains(&"prompt.md"));
+    assert_eq!(files.len(), 1);
 }
 
 #[test]

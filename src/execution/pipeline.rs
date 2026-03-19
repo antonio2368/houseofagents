@@ -34,7 +34,6 @@ struct PipelineTaskMetadata {
 
 struct PipelineMessageContext<'a> {
     def: &'a PipelineDefinition,
-    iteration: u32,
     block_outputs: &'a HashMap<u32, String>,
     output: &'a OutputManager,
     prompt_context: &'a PromptRuntimeContext,
@@ -243,18 +242,15 @@ pub(crate) fn format_block_step_label_with_pass(
     format!("{base} [pass {pass}]")
 }
 
-fn replica_filename(info: &RuntimeReplicaInfo, iteration: u32) -> String {
-    format!("{}_iter{}.md", info.filename_stem, iteration)
+fn replica_filename(info: &RuntimeReplicaInfo) -> String {
+    format!("{}.md", info.filename_stem)
 }
 
-fn loop_replica_filename(info: &RuntimeReplicaInfo, iteration: u32, loop_pass: u32) -> String {
+fn loop_replica_filename(info: &RuntimeReplicaInfo, loop_pass: u32) -> String {
     if loop_pass == 0 {
-        replica_filename(info, iteration)
+        replica_filename(info)
     } else {
-        format!(
-            "{}_iter{}_loop{}.md",
-            info.filename_stem, iteration, loop_pass
-        )
+        format!("{}_loop{}.md", info.filename_stem, loop_pass)
     }
 }
 
@@ -281,7 +277,6 @@ async fn evaluate_loop_break(
     total_passes: u32,
     sub_dag_blocks: &HashSet<BlockId>,
     rt: &RuntimeReplicaTable,
-    iteration: u32,
     output: &crate::output::OutputManager,
     agent_configs: &PipelineAgentConfigs,
     provider_factory: &impl Fn(
@@ -327,7 +322,7 @@ async fn evaluate_loop_break(
             if let Some(rids) = rt.logical_to_runtime.get(&bid) {
                 for &rid in rids {
                     let info = &rt.entries[rid as usize];
-                    let fname = loop_replica_filename(info, iteration, pass);
+                    let fname = loop_replica_filename(info, pass);
                     let path = output.run_dir().join(&fname);
                     if let Ok(content) = tokio::fs::read_to_string(&path).await {
                         let entry =
@@ -2102,14 +2097,13 @@ where
                                         &ls.sub_dag.blocks, loop_from,
                                         current_loop_pass, lc.count + 1,
                                         &ls.prompt, &replica_outputs, &rt, output,
-                                        iteration,
                                         prompt_context, &block_to_loop, &block_loop_pass,
                                     )
                                 } else {
                                     build_pipeline_block_message(
                                         block, use_cli,
                                         &PipelineMessageContext {
-                                            def, iteration,
+                                            def,
                                             block_outputs: &replica_outputs,
                                             output, prompt_context, runtime_table: &rt,
                                             block_to_loop: &block_to_loop,
@@ -2124,7 +2118,7 @@ where
                             build_pipeline_block_message(
                                 block, use_cli,
                                 &PipelineMessageContext {
-                                    def, iteration,
+                                    def,
                                     block_outputs: &replica_outputs,
                                     output, prompt_context, runtime_table: &rt,
                                     block_to_loop: &block_to_loop,
@@ -2183,7 +2177,7 @@ where
                         let ptx = progress_tx.clone();
                         let cancel_clone = cancel.clone();
                         let task_output = output.clone();
-                        let task_filename = loop_replica_filename(info, iteration, current_loop_pass);
+                        let task_filename = loop_replica_filename(info, current_loop_pass);
                         let task_agent_name = info.agent.clone();
                         let task_label = info.display_label.clone();
                         let message_clone = message;
@@ -2256,7 +2250,7 @@ where
                                     if let Err(e) = tokio::fs::write(&path, &resp.content).await {
                                         let error = format!("Failed to write output: {e}");
                                         let _ = task_output.append_error(&format!(
-                                            "runtime {rid} {task_agent_name} iter{iteration}: {error}"
+                                            "runtime {rid} {task_agent_name}: {error}"
                                         ));
                                         let _ = ptx.send(ProgressEvent::BlockError {
                                             block_id: rid,
@@ -2282,7 +2276,7 @@ where
                                 Some(Err(e)) => {
                                     let error = e.to_string();
                                     let _ = task_output.append_error(&format!(
-                                        "runtime {rid} {task_agent_name} iter{iteration}: {error}"
+                                        "runtime {rid} {task_agent_name}: {error}"
                                     ));
                                     let _ = ptx.send(ProgressEvent::BlockError {
                                         block_id: rid,
@@ -2333,10 +2327,9 @@ where
                                     details: Some(error.clone()),
                                 });
                                 let _ = output.append_error(&format!(
-                                    "runtime {} {} iter{}: {}",
+                                    "runtime {} {}: {}",
                                     metadata.runtime_id,
                                     metadata.agent_name,
-                                    metadata.iteration,
                                     error
                                 ));
                                 failed_replicas.insert(metadata.runtime_id);
@@ -2453,7 +2446,6 @@ where
                                                 total,
                                                 &blocks,
                                                 &rt,
-                                                iteration,
                                                 output,
                                                 &agent_configs,
                                                 &provider_factory,
@@ -2737,7 +2729,6 @@ fn build_pipeline_block_message(
                         let info = &context.runtime_table.entries[rid as usize];
                         let filename = loop_aware_upstream_filename(
                             info,
-                            context.iteration,
                             *uid,
                             context.block_to_loop,
                             context.block_loop_pass,
@@ -2796,7 +2787,6 @@ fn build_pipeline_block_message(
 /// Loop-aware filename resolver for CLI upstream references.
 fn loop_aware_upstream_filename(
     info: &RuntimeReplicaInfo,
-    iteration: u32,
     upstream_block_id: BlockId,
     block_to_loop: &HashMap<BlockId, (BlockId, BlockId)>,
     block_loop_pass: &HashMap<BlockId, u32>,
@@ -2807,12 +2797,12 @@ fn loop_aware_upstream_filename(
             .copied()
             .unwrap_or(0);
         if pass == 0 {
-            replica_filename(info, iteration)
+            replica_filename(info)
         } else {
-            loop_replica_filename(info, iteration, pass)
+            loop_replica_filename(info, pass)
         }
     } else {
-        replica_filename(info, iteration)
+        replica_filename(info)
     }
 }
 
@@ -2831,7 +2821,6 @@ fn build_loop_rerun_message_v2(
     replica_outputs: &HashMap<u32, String>,
     runtime_table: &RuntimeReplicaTable,
     output: &OutputManager,
-    iteration: u32,
     prompt_context: &PromptRuntimeContext,
     block_to_loop: &HashMap<BlockId, (BlockId, BlockId)>,
     block_loop_pass: &HashMap<BlockId, u32>,
@@ -2859,13 +2848,8 @@ fn build_loop_rerun_message_v2(
                 if let Some(rids) = runtime_table.logical_to_runtime.get(&uid) {
                     for &rid in rids {
                         let info = &runtime_table.entries[rid as usize];
-                        let filename = loop_aware_upstream_filename(
-                            info,
-                            iteration,
-                            uid,
-                            block_to_loop,
-                            block_loop_pass,
-                        );
+                        let filename =
+                            loop_aware_upstream_filename(info, uid, block_to_loop, block_loop_pass);
                         let path = output.run_dir().join(&filename);
                         if path.exists() {
                             file_refs.push_str(&format!("- {}\n", path.display()));
@@ -2940,7 +2924,7 @@ fn build_loop_rerun_message_v2(
                 if replica_outputs.contains_key(&rid) {
                     // `to` on pass P needs `from`'s output from pass P-1
                     let feedback_pass = current_pass.saturating_sub(1);
-                    let filename = loop_replica_filename(info, iteration, feedback_pass);
+                    let filename = loop_replica_filename(info, feedback_pass);
                     let path = output.run_dir().join(&filename);
                     if path.exists() {
                         message.push_str(&format!("- {}\n", path.display()));
@@ -3223,16 +3207,19 @@ fn collect_feed_data(
                 continue;
             }
             // Check if this file matches any of the expected filename stems.
-            // Require `_iter` after the stem to avoid prefix collisions (e.g.
-            // stem "Builder_b1_Claude" must not match "Builder_b1_Claude_r1_iter1.md").
-            let matches_stem = filename_stems
-                .iter()
-                .any(|stem| name.starts_with(stem) && name[stem.len()..].starts_with("_iter"));
+            let matches_stem = filename_stems.iter().any(|stem| {
+                if !name.starts_with(stem) {
+                    return false;
+                }
+                let remainder = &name[stem.len()..];
+                remainder == ".md"
+                    || (remainder.starts_with("_loop") && remainder.ends_with(".md"))
+                    || (remainder.starts_with("_iter") && remainder.ends_with(".md"))
+            });
             if !matches_stem {
                 continue;
             }
-            // Verify it has an iteration marker
-            if post_run::parse_pipeline_iteration_filename(name).is_none() {
+            if !post_run::is_pipeline_output_filename(name) {
                 continue;
             }
             matched_files.push((name.to_string(), path));
@@ -4555,7 +4542,6 @@ to = 1
         let blp = HashMap::new();
         let message_context = PipelineMessageContext {
             def: &def,
-            iteration: 1,
             block_outputs: &block_outputs,
             output: &output,
             prompt_context: &context,
@@ -4649,7 +4635,7 @@ to = 1
             .any(|event| matches!(event, ProgressEvent::AllDone)));
 
         let log = std::fs::read_to_string(output.run_dir().join("_errors.log")).expect("log");
-        assert!(log.contains("runtime 0 Claude iter1"));
+        assert!(log.contains("runtime 0 Claude:"));
         assert!(log.contains("pipeline panic"));
     }
 
@@ -4730,7 +4716,7 @@ to = 1
         }));
 
         let log = std::fs::read_to_string(output.run_dir().join("_errors.log")).expect("log");
-        assert!(log.contains("runtime 0 Claude iter1"));
+        assert!(log.contains("runtime 0 Claude:"));
         assert!(log.contains("provider failed"));
     }
 
@@ -6158,18 +6144,18 @@ keep_across_loop_passes = false
         };
 
         // pass=0 should produce same as replica_filename
-        let pass0 = loop_replica_filename(&info, 1, 0);
-        let normal = replica_filename(&info, 1);
+        let pass0 = loop_replica_filename(&info, 0);
+        let normal = replica_filename(&info);
         assert_eq!(pass0, normal, "pass 0 should match replica_filename");
-        assert_eq!(pass0, "block1_claude_iter1.md");
+        assert_eq!(pass0, "block1_claude.md");
 
         // pass=1 should include _loop1
-        let pass1 = loop_replica_filename(&info, 1, 1);
-        assert_eq!(pass1, "block1_claude_iter1_loop1.md");
+        let pass1 = loop_replica_filename(&info, 1);
+        assert_eq!(pass1, "block1_claude_loop1.md");
 
-        // pass=2 at iteration 3
-        let pass2 = loop_replica_filename(&info, 3, 2);
-        assert_eq!(pass2, "block1_claude_iter3_loop2.md");
+        // pass=2
+        let pass2 = loop_replica_filename(&info, 2);
+        assert_eq!(pass2, "block1_claude_loop2.md");
     }
 
     // -- sub-DAG computation tests --
@@ -7242,18 +7228,10 @@ position = [0, 0]
         let rt = build_runtime_table(&def);
         let stem = &rt.entries[0].filename_stem;
         // Initial pass (pass 0)
-        std::fs::write(run_dir.join(format!("{stem}_iter1.md")), "initial output").unwrap();
+        std::fs::write(run_dir.join(format!("{stem}.md")), "initial output").unwrap();
         // Loop passes
-        std::fs::write(
-            run_dir.join(format!("{stem}_iter1_loop1.md")),
-            "loop pass 1",
-        )
-        .unwrap();
-        std::fs::write(
-            run_dir.join(format!("{stem}_iter1_loop2.md")),
-            "loop pass 2",
-        )
-        .unwrap();
+        std::fs::write(run_dir.join(format!("{stem}_loop1.md")), "loop pass 1").unwrap();
+        std::fs::write(run_dir.join(format!("{stem}_loop2.md")), "loop pass 2").unwrap();
 
         let scope = FinalizationRunScope::SingleRun {
             run_id: 1,
@@ -7300,6 +7278,41 @@ position = [0, 0]
         assert!(
             !result_last.contains("initial output"),
             "LastPass should exclude pass-0 when loop variants exist"
+        );
+    }
+
+    #[test]
+    fn collect_feed_data_old_format_backward_compat() {
+        // Old-format filenames ({stem}_iter1.md, {stem}_iter1_loop1.md) must still be collected
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let mut def = def_with(vec![block(1, 0, 0)], vec![]);
+        def.finalization_blocks = vec![fin_block(10, 0, 0)];
+        let rt = build_runtime_table(&def);
+        let stem = &rt.entries[0].filename_stem;
+        // Write old-format files
+        std::fs::write(run_dir.join(format!("{stem}_iter1.md")), "old output").unwrap();
+        std::fs::write(run_dir.join(format!("{stem}_iter1_loop1.md")), "old loop 1").unwrap();
+
+        let scope = FinalizationRunScope::SingleRun {
+            run_id: 1,
+            run_dir: run_dir.clone(),
+        };
+        let feed = DataFeed {
+            from: 1,
+            to: 10,
+            collection: FeedCollection::AllPasses,
+            granularity: FeedGranularity::PerRun,
+        };
+        let result = collect_feed_data(&feed, &def, &rt, &scope, Some(1)).unwrap();
+        assert!(
+            result.contains("old output"),
+            "should collect old-format base file"
+        );
+        assert!(
+            result.contains("old loop 1"),
+            "should collect old-format loop file"
         );
     }
 

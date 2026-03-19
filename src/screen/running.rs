@@ -126,7 +126,8 @@ fn draw_title_bar(f: &mut Frame, app: &App, area: Rect) {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let elapsed = format_duration(app.run_elapsed());
-    let iter_display = if app.final_iteration() > 0 {
+    let iter_display = if app.selected_mode != ExecutionMode::Pipeline && app.final_iteration() > 0
+    {
         format!(
             "  iter {}/{}",
             app.current_iteration(),
@@ -850,6 +851,7 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
         },
         Block {
             label: String,
+            #[allow(dead_code)]
             iteration: u32,
             loop_pass: u32,
             status: AgentStatus,
@@ -924,7 +926,9 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
                 }
             }
             ProgressEvent::IterationComplete { iteration } => {
-                rows.push(Row::IterationComplete(*iteration));
+                if app.selected_mode != ExecutionMode::Pipeline {
+                    rows.push(Row::IterationComplete(*iteration));
+                }
             }
             ProgressEvent::LoopBreakEval {
                 from,
@@ -1116,14 +1120,14 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
             ]))),
             Row::Block {
                 label,
-                iteration,
+                iteration: _,
                 loop_pass,
                 status,
             } => {
                 let suffix = if loop_pass > 0 {
-                    format!(" (iter {iteration} pass {loop_pass})")
+                    format!(" (loop {loop_pass})")
                 } else {
-                    format!(" (iter {iteration})")
+                    String::new()
                 };
                 match status {
                     AgentStatus::Thinking => items.push(ListItem::new(Line::from(vec![

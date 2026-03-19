@@ -437,15 +437,15 @@ output_dir/
       session.toml                         # mode = "pipeline", block/connection counts, total_runtime_tasks
       prompt.md                            # Pipeline-level prompt (shared across blocks)
       pipeline.toml                        # Pipeline definition snapshot (may include [[session_configs]])
-      Analyzer_b1_Claude_iter1.md          # Block "Analyzer" (id 1), agent Claude, iteration 1
-      Reviewer_b2_Gemini_iter1.md          # Block "Reviewer" (id 2), single agent, replicas=1
-      Critic_b4_Claude_iter1.md            # Block "Critic" (id 4), agents=[Claude, GPT] — one file per agent
-      Critic_b4_GPT_iter1.md
-      Worker_b3_Claude_r1_iter1.md         # Block "Worker" (id 3), replicas=3, replica 1
-      Worker_b3_Claude_r2_iter1.md         # replica 2
-      Worker_b3_Claude_r3_iter1.md         # replica 3
-      Analyzer_b1_Claude_iter1_loop1.md   # loop pass 1 (from loop connection)
-      Analyzer_b1_Claude_iter1_loop2.md   # loop pass 2
+      Analyzer_b1_Claude.md                # Block "Analyzer" (id 1), agent Claude
+      Reviewer_b2_Gemini.md                # Block "Reviewer" (id 2), single agent, replicas=1
+      Critic_b4_Claude.md                  # Block "Critic" (id 4), agents=[Claude, GPT] — one file per agent
+      Critic_b4_GPT.md
+      Worker_b3_Claude_r1.md               # Block "Worker" (id 3), replicas=3, replica 1
+      Worker_b3_Claude_r2.md               # replica 2
+      Worker_b3_Claude_r3.md               # replica 3
+      Analyzer_b1_Claude_loop1.md          # loop pass 1 (from loop connection)
+      Analyzer_b1_Claude_loop2.md          # loop pass 2
       _errors.log
 ```
 
@@ -525,8 +525,8 @@ Single-run finalization outputs are stored in `run_dir/finalization/`:
 my_session/
   session.toml
   pipeline.toml
-  Analyzer_b1_Claude_iter1.md
-  Reviewer_b2_Gemini_iter1.md
+  Analyzer_b1_Claude.md
+  Reviewer_b2_Gemini.md
   finalization/
     finalization.toml
     Summary_b3_Claude.md
