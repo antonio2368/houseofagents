@@ -492,12 +492,30 @@ pub(super) fn handle_pipeline_paste(app: &mut App, text: &str) {
             }
         }
     } else if app.pipeline.pipeline_show_loop_edit {
-        if app.pipeline.pipeline_loop_edit_field == PipelineLoopEditField::Prompt {
-            insert_text(
-                &mut app.pipeline.pipeline_loop_edit_prompt_buf,
-                &mut app.pipeline.pipeline_loop_edit_prompt_cursor,
-                text,
-            );
+        match app.pipeline.pipeline_loop_edit_field {
+            PipelineLoopEditField::Prompt => {
+                insert_text(
+                    &mut app.pipeline.pipeline_loop_edit_prompt_buf,
+                    &mut app.pipeline.pipeline_loop_edit_prompt_cursor,
+                    text,
+                );
+            }
+            PipelineLoopEditField::BreakAgent => {
+                let clean = text.replace(['\n', '\r'], "");
+                insert_text(
+                    &mut app.pipeline.pipeline_loop_edit_break_agent_buf,
+                    &mut app.pipeline.pipeline_loop_edit_break_agent_cursor,
+                    &clean,
+                );
+            }
+            PipelineLoopEditField::BreakCondition => {
+                insert_text(
+                    &mut app.pipeline.pipeline_loop_edit_break_condition_buf,
+                    &mut app.pipeline.pipeline_loop_edit_break_condition_cursor,
+                    text,
+                );
+            }
+            PipelineLoopEditField::Count => {}
         }
     } else if let Some(PipelineDialogMode::Save) = app.pipeline.pipeline_file_dialog {
         app.pipeline.pipeline_file_input.push_str(text);
@@ -1163,6 +1181,12 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     app.pipeline.pipeline_loop_edit_count_buf = lc.count.to_string();
                     app.pipeline.pipeline_loop_edit_prompt_buf = lc.prompt.clone();
                     app.pipeline.pipeline_loop_edit_prompt_cursor = lc.prompt.len();
+                    app.pipeline.pipeline_loop_edit_break_condition_buf =
+                        lc.break_condition.clone();
+                    app.pipeline.pipeline_loop_edit_break_condition_cursor =
+                        lc.break_condition.len();
+                    app.pipeline.pipeline_loop_edit_break_agent_buf = lc.break_agent.clone();
+                    app.pipeline.pipeline_loop_edit_break_agent_cursor = lc.break_agent.len();
                 } else {
                     // Enter loop connect mode
                     app.pipeline.pipeline_loop_connecting_from = Some(sel);
@@ -2136,6 +2160,8 @@ fn handle_pipeline_loop_connect_key(app: &mut App, key: KeyEvent) {
                                         to,
                                         count: 1,
                                         prompt: String::new(),
+                                        break_condition: String::new(),
+                                        break_agent: String::new(),
                                     },
                                 );
                                 app.pipeline.pipeline_loop_connecting_from = None;
@@ -2348,7 +2374,9 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
         KeyCode::Tab => {
             app.pipeline.pipeline_loop_edit_field = match app.pipeline.pipeline_loop_edit_field {
                 PipelineLoopEditField::Count => PipelineLoopEditField::Prompt,
-                PipelineLoopEditField::Prompt => PipelineLoopEditField::Count,
+                PipelineLoopEditField::Prompt => PipelineLoopEditField::BreakAgent,
+                PipelineLoopEditField::BreakAgent => PipelineLoopEditField::BreakCondition,
+                PipelineLoopEditField::BreakCondition => PipelineLoopEditField::Count,
             };
         }
         KeyCode::Enter => {
@@ -2371,6 +2399,10 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
                         {
                             lc.count = count;
                             lc.prompt = app.pipeline.pipeline_loop_edit_prompt_buf.clone();
+                            lc.break_condition =
+                                app.pipeline.pipeline_loop_edit_break_condition_buf.clone();
+                            lc.break_agent =
+                                app.pipeline.pipeline_loop_edit_break_agent_buf.clone();
                         }
                     }
                     app.pipeline.pipeline_show_loop_edit = false;
@@ -2380,6 +2412,17 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
                     insert_text(
                         &mut app.pipeline.pipeline_loop_edit_prompt_buf,
                         &mut app.pipeline.pipeline_loop_edit_prompt_cursor,
+                        "\n",
+                    );
+                }
+                PipelineLoopEditField::BreakAgent => {
+                    // No-op for single-line field
+                }
+                PipelineLoopEditField::BreakCondition => {
+                    // Insert newline in break condition field
+                    insert_text(
+                        &mut app.pipeline.pipeline_loop_edit_break_condition_buf,
+                        &mut app.pipeline.pipeline_loop_edit_break_condition_cursor,
                         "\n",
                     );
                 }
@@ -2427,6 +2470,20 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
                 handle_text_key(
                     &mut app.pipeline.pipeline_loop_edit_prompt_buf,
                     &mut app.pipeline.pipeline_loop_edit_prompt_cursor,
+                    key,
+                );
+            }
+            PipelineLoopEditField::BreakAgent => {
+                handle_text_key(
+                    &mut app.pipeline.pipeline_loop_edit_break_agent_buf,
+                    &mut app.pipeline.pipeline_loop_edit_break_agent_cursor,
+                    key,
+                );
+            }
+            PipelineLoopEditField::BreakCondition => {
+                handle_text_key(
+                    &mut app.pipeline.pipeline_loop_edit_break_condition_buf,
+                    &mut app.pipeline.pipeline_loop_edit_break_condition_cursor,
                     key,
                 );
             }

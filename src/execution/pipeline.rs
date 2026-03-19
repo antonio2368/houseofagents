@@ -258,6 +258,128 @@ fn loop_replica_filename(info: &RuntimeReplicaInfo, iteration: u32, loop_pass: u
     }
 }
 
+/// Parse an evaluator response: returns `true` if the first word is "BREAK"
+/// (case-insensitive, ignoring trailing punctuation).
+fn parse_break_decision(content: &str) -> bool {
+    content
+        .split_whitespace()
+        .next()
+        .map(|w| {
+            w.trim_end_matches(|c: char| c.is_ascii_punctuation())
+                .eq_ignore_ascii_case("BREAK")
+        })
+        .unwrap_or(false)
+}
+
+/// Evaluate whether a loop should break early by asking a dedicated agent.
+/// Returns `true` if the agent decides to BREAK, `false` for CONTINUE or on error.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_loop_break(
+    break_agent: &str,
+    break_condition: &str,
+    current_pass: u32,
+    total_passes: u32,
+    sub_dag_blocks: &HashSet<BlockId>,
+    rt: &RuntimeReplicaTable,
+    iteration: u32,
+    output: &crate::output::OutputManager,
+    agent_configs: &PipelineAgentConfigs,
+    provider_factory: &impl Fn(
+        ProviderKind,
+        &crate::config::ProviderConfig,
+    ) -> Box<dyn provider::Provider>,
+    cancel: &Arc<AtomicBool>,
+) -> bool {
+    let (kind, cfg, _) = match agent_configs.get(break_agent) {
+        Some(v) => v,
+        None => return false,
+    };
+
+    // Silently clamp break_condition to 4KB to prevent it from blowing the budget.
+    const MAX_CONDITION_LEN: usize = 4 * 1024;
+    let clamped_condition: &str = if break_condition.len() > MAX_CONDITION_LEN {
+        // Find a char boundary to avoid splitting a multi-byte char
+        let end = break_condition
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_CONDITION_LEN)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        &break_condition[..end]
+    } else {
+        break_condition
+    };
+
+    // Budget: 64KB total, minus fixed prompt overhead and clamped condition length
+    const TOTAL_BUDGET: usize = 64 * 1024;
+    let fixed_overhead = 250 + clamped_condition.len(); // prompt template + condition
+    let history_budget = TOTAL_BUDGET.saturating_sub(fixed_overhead);
+
+    // Sort block IDs for deterministic iteration
+    let mut sorted_blocks: Vec<BlockId> = sub_dag_blocks.iter().copied().collect();
+    sorted_blocks.sort_unstable();
+
+    // Collect pass history from disk (newest first for budget priority)
+    let mut entries: Vec<String> = Vec::new();
+    let mut used: usize = 0;
+    for pass in (0..=current_pass).rev() {
+        for &bid in &sorted_blocks {
+            if let Some(rids) = rt.logical_to_runtime.get(&bid) {
+                for &rid in rids {
+                    let info = &rt.entries[rid as usize];
+                    let fname = loop_replica_filename(info, iteration, pass);
+                    let path = output.run_dir().join(&fname);
+                    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+                        let entry =
+                            format!("\n--- Block {} (pass {}) ---\n{}", bid, pass + 1, content);
+                        if used + entry.len() > history_budget {
+                            continue; // skip oversized entry, keep scanning
+                        }
+                        used += entry.len();
+                        entries.push(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    // Reverse to chronological order for the evaluator prompt
+    entries.reverse();
+    let history: String = entries.concat();
+
+    let prompt = format!(
+        "You are evaluating whether an iterative loop should continue or stop early.\n\
+         This loop has completed pass {} of {} maximum.\n\n\
+         Break condition: {}\n\n\
+         === Pass history ===\n{}\n\n\
+         Based on the break condition, should the loop continue iterating or stop?\n\
+         Respond with exactly one word: CONTINUE or BREAK",
+        current_pass + 1,
+        total_passes,
+        clamped_condition,
+        history,
+    );
+
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+
+    let mut provider = provider_factory(*kind, cfg);
+    let result = tokio::select! {
+        res = provider.send(&prompt) => res,
+        _ = wait_for_cancel(cancel) => return false,
+    };
+    match result {
+        Ok(resp) => parse_break_decision(&resp.content),
+        // Evaluator is best-effort: on provider error, default to CONTINUE.
+        // The caller emits a LoopBreakEval progress event for visibility.
+        // We intentionally avoid append_error here because a non-empty
+        // _errors.log marks the entire run as failed, which is wrong for
+        // a non-fatal evaluator failure.
+        Err(_) => false,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PipelineBlock {
     pub id: BlockId,
@@ -382,6 +504,10 @@ pub struct LoopConnection {
     pub count: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub break_condition: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub break_agent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -481,6 +607,11 @@ impl PipelineDefinition {
                 if seen.insert(agent.clone()) {
                     agents.push(agent.clone());
                 }
+            }
+        }
+        for lc in &self.loop_connections {
+            if !lc.break_agent.is_empty() && seen.insert(lc.break_agent.clone()) {
+                agents.push(lc.break_agent.clone());
             }
         }
         agents
@@ -1309,6 +1440,13 @@ pub(crate) fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError
                     lc.from, lc.to
                 )));
             }
+            // break_agent and break_condition must both be set or both empty
+            if lc.break_agent.is_empty() != lc.break_condition.is_empty() {
+                return Err(AppError::Config(format!(
+                    "Loop {}→{}: break_agent and break_condition must both be set or both empty",
+                    lc.from, lc.to
+                )));
+            }
         }
 
         // Ancestry check and sub-DAG overlap validation
@@ -1554,7 +1692,10 @@ pub fn list_profile_files() -> io::Result<Vec<PathBuf>> {
 struct LoopRuntimeState {
     remaining: u32,
     current_pass: u32,
+    total_passes: u32,
     prompt: String,
+    break_condition: String,
+    break_agent: String,
     sub_dag: LoopSubDag,
     block_completed_this_pass: HashMap<BlockId, u32>,
     extra_tasks_remaining: usize,
@@ -1727,7 +1868,10 @@ where
                             LoopRuntimeState {
                                 remaining: lc.count,
                                 current_pass: 0,
+                                total_passes: lc.count + 1,
                                 prompt: lc.prompt.clone(),
+                                break_condition: lc.break_condition.clone(),
+                                break_agent: lc.break_agent.clone(),
                                 sub_dag,
                                 block_completed_this_pass: HashMap::new(),
                                 extra_tasks_remaining: extra,
@@ -2289,83 +2433,142 @@ where
                                             }
                                         }
                                     }
-                                } else if let Some(ls) = loop_state.get_mut(&key) {
-                                    if ls.remaining > 0 {
-                                        // More loop passes — reset sub-DAG and queue `to`
-                                        ls.remaining -= 1;
-                                        ls.current_pass += 1;
-                                        ls.block_completed_this_pass.clear();
-                                        // Clear stale failure/output state for sub-DAG blocks
-                                        // so that failures from pass N don't poison pass N+1.
-                                        // Keep `from`'s outputs — needed as feedback for `to`.
-                                        for &bid in &ls.sub_dag.blocks {
-                                            failed_logical.remove(&bid);
-                                            if let Some(rids) = rt.logical_to_runtime.get(&bid) {
-                                                for &rid in rids {
-                                                    failed_replicas.remove(&rid);
-                                                    if bid != loop_from {
-                                                        replica_outputs.remove(&rid);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        // Clear provider history for sub-DAG sessions with keep_across_loop_passes=false
+                                } else {
+                                    // --- Early-break evaluation ---
+                                    let should_break = if let Some(ls) = loop_state.get(&key) {
+                                        if ls.remaining > 0
+                                            && !ls.break_agent.is_empty()
+                                            && !ls.break_condition.is_empty()
                                         {
-                                            let mut cleared: HashSet<(String, String)> =
-                                                HashSet::new();
+                                            let agent = ls.break_agent.clone();
+                                            let condition = ls.break_condition.clone();
+                                            let pass = ls.current_pass;
+                                            let blocks = ls.sub_dag.blocks.clone();
+                                            let total = ls.total_passes;
+
+                                            let result = evaluate_loop_break(
+                                                &agent,
+                                                &condition,
+                                                pass,
+                                                total,
+                                                &blocks,
+                                                &rt,
+                                                iteration,
+                                                output,
+                                                &agent_configs,
+                                                &provider_factory,
+                                                &cancel,
+                                            )
+                                            .await;
+
+                                            let decision =
+                                                if result { "BREAK" } else { "CONTINUE" };
+                                            let _ =
+                                                progress_tx.send(ProgressEvent::LoopBreakEval {
+                                                    from: loop_from,
+                                                    to: loop_to,
+                                                    iteration,
+                                                    pass: pass + 1,
+                                                    agent_name: agent,
+                                                    decision: decision.into(),
+                                                });
+                                            result
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    };
+
+                                    if should_break {
+                                        if let Some(ls) = loop_state.get_mut(&key) {
+                                            ls.remaining = 0;
+                                        }
+                                    }
+
+                                    if let Some(ls) = loop_state.get_mut(&key) {
+                                        if ls.remaining > 0 {
+                                            // More loop passes — reset sub-DAG and queue `to`
+                                            ls.remaining -= 1;
+                                            ls.current_pass += 1;
+                                            ls.block_completed_this_pass.clear();
+                                            // Clear stale failure/output state for sub-DAG blocks
+                                            // so that failures from pass N don't poison pass N+1.
+                                            // Keep `from`'s outputs — needed as feedback for `to`.
                                             for &bid in &ls.sub_dag.blocks {
+                                                failed_logical.remove(&bid);
                                                 if let Some(rids) =
                                                     rt.logical_to_runtime.get(&bid)
                                                 {
                                                     for &rid in rids {
-                                                        let info =
-                                                            &rt.entries[rid as usize];
-                                                        let pool_key = (
-                                                            info.agent.clone(),
-                                                            info.session_key.clone(),
-                                                        );
-                                                        if cleared.contains(&pool_key) {
-                                                            continue;
-                                                        }
-                                                        let keep = rt
-                                                            .keep_loop_policy
-                                                            .get(&pool_key)
-                                                            .copied()
-                                                            .unwrap_or(true);
-                                                        if !keep {
-                                                            if let Some(p) =
-                                                                provider_pool.get(&pool_key)
-                                                            {
-                                                                let mut guard =
-                                                                    p.lock().await;
-                                                                guard.clear_history();
-                                                            }
-                                                            cleared.insert(pool_key);
+                                                        failed_replicas.remove(&rid);
+                                                        if bid != loop_from {
+                                                            replica_outputs.remove(&rid);
                                                         }
                                                     }
                                                 }
                                             }
-                                        }
-                                        // Reset all sub-DAG blocks' in-degrees
-                                        for (&bid, &deg) in &ls.sub_dag.internal_in_degree {
-                                            current_in_degree.insert(bid, deg);
-                                        }
-                                        // Queue `to` (in-degree 0)
-                                        let _ = ready_tx.send(loop_to);
-                                        // Do NOT propagate to from's external downstream
-                                    } else {
-                                        // Loop done — apply all deferred external edges
-                                        let all_deferred: Vec<(BlockId, usize)> = ls.sub_dag
-                                            .deferred_external_edges
-                                            .values()
-                                            .flatten()
-                                            .copied()
-                                            .collect();
-                                        for (child, weight) in all_deferred {
-                                            if let Some(deg) = current_in_degree.get_mut(&child) {
-                                                *deg = deg.saturating_sub(weight);
-                                                if *deg == 0 {
-                                                    let _ = ready_tx.send(child);
+                                            // Clear provider history for sub-DAG sessions with keep_across_loop_passes=false
+                                            {
+                                                let mut cleared: HashSet<(String, String)> =
+                                                    HashSet::new();
+                                                for &bid in &ls.sub_dag.blocks {
+                                                    if let Some(rids) =
+                                                        rt.logical_to_runtime.get(&bid)
+                                                    {
+                                                        for &rid in rids {
+                                                            let info =
+                                                                &rt.entries[rid as usize];
+                                                            let pool_key = (
+                                                                info.agent.clone(),
+                                                                info.session_key.clone(),
+                                                            );
+                                                            if cleared.contains(&pool_key) {
+                                                                continue;
+                                                            }
+                                                            let keep = rt
+                                                                .keep_loop_policy
+                                                                .get(&pool_key)
+                                                                .copied()
+                                                                .unwrap_or(true);
+                                                            if !keep {
+                                                                if let Some(p) =
+                                                                    provider_pool.get(&pool_key)
+                                                                {
+                                                                    let mut guard =
+                                                                        p.lock().await;
+                                                                    guard.clear_history();
+                                                                }
+                                                                cleared.insert(pool_key);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Reset all sub-DAG blocks' in-degrees
+                                            for (&bid, &deg) in &ls.sub_dag.internal_in_degree {
+                                                current_in_degree.insert(bid, deg);
+                                            }
+                                            // Queue `to` (in-degree 0)
+                                            let _ = ready_tx.send(loop_to);
+                                            // Do NOT propagate to from's external downstream
+                                        } else {
+                                            // Loop done — apply all deferred external edges
+                                            let all_deferred: Vec<(BlockId, usize)> = ls
+                                                .sub_dag
+                                                .deferred_external_edges
+                                                .values()
+                                                .flatten()
+                                                .copied()
+                                                .collect();
+                                            for (child, weight) in all_deferred {
+                                                if let Some(deg) =
+                                                    current_in_degree.get_mut(&child)
+                                                {
+                                                    *deg = deg.saturating_sub(weight);
+                                                    if *deg == 0 {
+                                                        let _ = ready_tx.send(child);
+                                                    }
                                                 }
                                             }
                                         }
@@ -5107,6 +5310,8 @@ keep_across_loop_passes = false
             to,
             count,
             prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
         }
     }
 
@@ -5150,6 +5355,8 @@ keep_across_loop_passes = false
                 to: 2,
                 count: 0,
                 prompt: String::new(),
+                break_condition: String::new(),
+                break_agent: String::new(),
             }],
         );
         let err = validate_pipeline(&def).unwrap_err();
@@ -5286,6 +5493,8 @@ keep_across_loop_passes = false
                 to: 2,
                 count: 1,
                 prompt: String::new(),
+                break_condition: String::new(),
+                break_agent: String::new(),
             }],
         );
         migrate_loop_direction(&mut def);
@@ -5455,6 +5664,8 @@ keep_across_loop_passes = false
                 to: 2,
                 count: 3,
                 prompt: "review again".into(),
+                break_condition: String::new(),
+                break_agent: String::new(),
             }],
         );
         let toml_str = toml::to_string(&def).expect("serialize");
@@ -5465,6 +5676,117 @@ keep_across_loop_passes = false
         assert_eq!(lc.to, 2);
         assert_eq!(lc.count, 3);
         assert_eq!(lc.prompt, "review again");
+    }
+
+    #[test]
+    fn test_loop_serde_roundtrip_with_break_fields() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![],
+            vec![LoopConnection {
+                from: 1,
+                to: 2,
+                count: 2,
+                prompt: "iterate".into(),
+                break_condition: "Stop when stable".into(),
+                break_agent: "Claude".into(),
+            }],
+        );
+        let toml_str = toml::to_string(&def).expect("serialize");
+        assert!(toml_str.contains("break_condition"));
+        assert!(toml_str.contains("break_agent"));
+        let loaded: PipelineDefinition = toml::from_str(&toml_str).expect("deserialize");
+        assert_eq!(loaded.loop_connections.len(), 1);
+        let lc = &loaded.loop_connections[0];
+        assert_eq!(lc.break_condition, "Stop when stable");
+        assert_eq!(lc.break_agent, "Claude");
+    }
+
+    #[test]
+    fn test_validate_rejects_break_agent_without_condition() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![conn(1, 2)],
+            vec![LoopConnection {
+                from: 2,
+                to: 1,
+                count: 1,
+                prompt: String::new(),
+                break_condition: String::new(),
+                break_agent: "Claude".into(),
+            }],
+        );
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(
+            format!("{err}").contains("both be set or both empty"),
+            "expected both-or-neither error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_break_condition_without_agent() {
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![conn(1, 2)],
+            vec![LoopConnection {
+                from: 2,
+                to: 1,
+                count: 1,
+                prompt: String::new(),
+                break_condition: "Stop when done".into(),
+                break_agent: String::new(),
+            }],
+        );
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(
+            format!("{err}").contains("both be set or both empty"),
+            "expected both-or-neither error, got: {err}"
+        );
+    }
+
+    // -- break evaluator response parsing tests --
+    // Tests exercise the shared `parse_break_decision` function directly.
+
+    #[test]
+    fn test_break_parsing_exact() {
+        assert!(parse_break_decision("BREAK"));
+        assert!(parse_break_decision("break"));
+        assert!(parse_break_decision("Break"));
+    }
+
+    #[test]
+    fn test_break_parsing_with_punctuation() {
+        assert!(parse_break_decision("BREAK."));
+        assert!(parse_break_decision("BREAK:"));
+        assert!(parse_break_decision("BREAK!"));
+        assert!(parse_break_decision("BREAK,"));
+    }
+
+    #[test]
+    fn test_break_parsing_with_trailing_text() {
+        assert!(parse_break_decision("BREAK the loop has converged"));
+        assert!(parse_break_decision("BREAK\n\nThe output is stable."));
+    }
+
+    #[test]
+    fn test_break_parsing_continue() {
+        assert!(!parse_break_decision("CONTINUE"));
+        assert!(!parse_break_decision("continue"));
+        assert!(!parse_break_decision("CONTINUE."));
+    }
+
+    #[test]
+    fn test_break_parsing_edge_cases() {
+        assert!(!parse_break_decision(""));
+        assert!(!parse_break_decision("   "));
+        assert!(!parse_break_decision("BREAKING NEWS"));
+        assert!(!parse_break_decision("Do not break yet"));
+    }
+
+    #[test]
+    fn test_break_parsing_whitespace() {
+        assert!(parse_break_decision("  BREAK  "));
+        assert!(parse_break_decision("\n\nBREAK\n\n"));
     }
 
     // -- loop execution tests --
@@ -6775,6 +7097,8 @@ position = [0, 0]
             to: 11,
             count: 1,
             prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
         });
         let err = validate_pipeline(&def).unwrap_err();
         assert!(

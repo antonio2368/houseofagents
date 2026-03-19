@@ -109,6 +109,28 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
             }
         }
     }
+    for lc in &app.pipeline.pipeline_def.loop_connections {
+        if lc.break_agent.is_empty() {
+            continue;
+        }
+        match avail_agents.get(&lc.break_agent) {
+            Some(true) => {}
+            Some(false) => {
+                app.error_modal = Some(format!(
+                    "Break agent '{}' is not available (loop {}→{})",
+                    lc.break_agent, lc.from, lc.to
+                ));
+                return;
+            }
+            None => {
+                app.error_modal = Some(format!(
+                    "Break agent '{}' not found (loop {}→{})",
+                    lc.break_agent, lc.from, lc.to
+                ));
+                return;
+            }
+        }
+    }
 
     // Set running state
     app.reset_running_state();
@@ -148,6 +170,24 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
                     ),
                 );
             }
+        }
+    }
+    for lc in &app.pipeline.pipeline_def.loop_connections {
+        if lc.break_agent.is_empty() || agent_configs.contains_key(&lc.break_agent) {
+            continue;
+        }
+        if let Some(agent_cfg) = app.config.agents.iter().find(|a| a.name == lc.break_agent) {
+            let agent_cfg = app
+                .effective_agent_config(&agent_cfg.name)
+                .unwrap_or(agent_cfg);
+            agent_configs.insert(
+                lc.break_agent.clone(),
+                (
+                    agent_cfg.provider,
+                    agent_cfg.to_provider_config(),
+                    agent_cfg.use_cli,
+                ),
+            );
         }
     }
 
@@ -1759,6 +1799,18 @@ pub(super) fn update_multi_run_state(app: &mut App, run_id: u32, event: &Progres
         }
         ProgressEvent::AgentStreamChunk { .. } => {}
         ProgressEvent::BlockStreamChunk { .. } => {}
+        ProgressEvent::LoopBreakEval {
+            from,
+            to,
+            pass,
+            decision,
+            agent_name,
+            ..
+        } => {
+            state.push_log(format!(
+                "Loop {from}\u{2192}{to} pass {pass} eval ({agent_name}): {decision}"
+            ));
+        }
         ProgressEvent::AllDone => {}
     }
 }

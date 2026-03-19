@@ -229,6 +229,14 @@ pub enum ProgressEvent {
         loop_pass: u32,
         chunk: String,
     },
+    LoopBreakEval {
+        from: u32,
+        to: u32,
+        iteration: u32,
+        pass: u32,
+        agent_name: String,
+        decision: String,
+    },
     AllDone,
 }
 

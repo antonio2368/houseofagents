@@ -926,6 +926,19 @@ fn build_event_items(app: &App) -> Vec<ListItem<'_>> {
             ProgressEvent::IterationComplete { iteration } => {
                 rows.push(Row::IterationComplete(*iteration));
             }
+            ProgressEvent::LoopBreakEval {
+                from,
+                to,
+                pass,
+                decision,
+                agent_name,
+                ..
+            } => {
+                rows.push(Row::Log {
+                    name: format!("Loop {from}\u{2192}{to}"),
+                    message: format!("Pass {pass} eval ({agent_name}): {decision}"),
+                });
+            }
             ProgressEvent::AllDone => rows.push(Row::AllDone),
             ProgressEvent::AgentLog { agent, message, .. } => {
                 if is_notable_log(message) {

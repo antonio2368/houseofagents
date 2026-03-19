@@ -2431,7 +2431,7 @@ fn draw_session_config_popup(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(50, 40, area);
+    let popup = centered_rect(55, 55, area);
     f.render_widget(Clear, popup);
 
     let (from_name, to_name) =
@@ -2487,6 +2487,10 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(2), // Count
             Constraint::Length(1), // spacer
             Constraint::Min(4),    // Prompt
+            Constraint::Length(1), // spacer
+            Constraint::Length(2), // Break Agent
+            Constraint::Length(1), // spacer
+            Constraint::Min(3),    // Break Condition
             Constraint::Length(1), // hint
         ])
         .split(inner);
@@ -2556,12 +2560,97 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
         f.set_cursor_position((cx, cy));
     }
 
+    // Break Agent field (single-line)
+    let ba_focus = app.pipeline.pipeline_loop_edit_field == PipelineLoopEditField::BreakAgent;
+    let ba_style = if ba_focus {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let ba_line = Line::from(vec![
+        Span::styled("Break Agent: ", Style::default().fg(Color::White)),
+        Span::styled("[", ba_style),
+        Span::raw(&app.pipeline.pipeline_loop_edit_break_agent_buf),
+        Span::styled("]", ba_style),
+        Span::styled(
+            " (agent name, optional)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(ba_line), chunks[4]);
+
+    if ba_focus
+        && chunks[4].width > 0
+        && chunks[4].height > 0
+        && app.error_modal.is_none()
+        && app.info_modal.is_none()
+    {
+        // "Break Agent: [" = 14 chars prefix
+        let prefix_len = 14u16;
+        let cursor_pos = app
+            .pipeline
+            .pipeline_loop_edit_break_agent_cursor
+            .min(app.pipeline.pipeline_loop_edit_break_agent_buf.len());
+        let cursor_in_buf = app.pipeline.pipeline_loop_edit_break_agent_buf[..cursor_pos]
+            .chars()
+            .count() as u16;
+        let cx = chunks[4].x + prefix_len + cursor_in_buf;
+        let cy = chunks[4].y;
+        if cx < chunks[4].x + chunks[4].width {
+            f.set_cursor_position((cx, cy));
+        }
+    }
+
+    // Break Condition textarea
+    let bc_focus = app.pipeline.pipeline_loop_edit_field == PipelineLoopEditField::BreakCondition;
+    let bc_style = if bc_focus {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let bc_block = Block::default()
+        .title(" Break Condition ")
+        .borders(Borders::ALL)
+        .border_style(bc_style);
+    let bc_inner = bc_block.inner(chunks[6]);
+    f.render_widget(bc_block, chunks[6]);
+
+    let (bc_scroll, bc_cursor_col, bc_cursor_row) = if bc_focus {
+        prompt_cursor_layout(
+            &app.pipeline.pipeline_loop_edit_break_condition_buf,
+            app.pipeline.pipeline_loop_edit_break_condition_cursor,
+            bc_inner.width as usize,
+            bc_inner.height as usize,
+        )
+    } else {
+        (0, 0, 0)
+    };
+
+    let bc_wrapped = char_wrap_text(
+        &app.pipeline.pipeline_loop_edit_break_condition_buf,
+        bc_inner.width as usize,
+    );
+    let bc_p = Paragraph::new(bc_wrapped.as_str()).scroll((bc_scroll, 0));
+    f.render_widget(bc_p, bc_inner);
+
+    if bc_focus
+        && bc_inner.width > 0
+        && bc_inner.height > 0
+        && app.error_modal.is_none()
+        && app.info_modal.is_none()
+    {
+        let visible_row = bc_cursor_row.saturating_sub(bc_scroll as usize);
+        let cx = bc_inner.x + (bc_cursor_col.min(bc_inner.width.saturating_sub(1) as usize) as u16);
+        let cy = bc_inner.y + (visible_row.min(bc_inner.height.saturating_sub(1) as usize) as u16);
+        f.set_cursor_position((cx, cy));
+    }
+
     // Hint
     let hint = Paragraph::new(
-        "  Tab: switch field  Enter: save (from Count) / newline (from Prompt)  Esc: cancel",
+        "  Tab: cycle fields  Enter: save (Count) / newline (Prompt/Condition)  Esc: cancel",
     )
     .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(hint, chunks[3]);
+    f.render_widget(hint, chunks[7]);
 }
 
 fn draw_feed_edit_popup(f: &mut Frame, app: &App, area: Rect) {

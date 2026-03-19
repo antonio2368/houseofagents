@@ -2098,6 +2098,8 @@ fn test_o_opens_edit_on_existing_loop() {
             to: 2,
             count: 3,
             prompt: "review again".into(),
+            break_condition: String::new(),
+            break_agent: String::new(),
         });
     app.pipeline.pipeline_block_cursor = Some(1);
     handle_key(&mut app, key(KeyCode::Char('o')));
@@ -2153,6 +2155,8 @@ fn test_delete_block_cleans_loops() {
             to: 2,
             count: 2,
             prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
         });
     // Delete block 1
     app.pipeline.pipeline_block_cursor = Some(1);
@@ -2172,6 +2176,8 @@ fn test_x_includes_loop_connections() {
             to: 2,
             count: 1,
             prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
         });
     app.pipeline.pipeline_block_cursor = Some(1);
     handle_key(&mut app, key(KeyCode::Char('x')));
@@ -2195,6 +2201,8 @@ fn test_regular_connect_allows_loop_pair() {
             to: 1,
             count: 1,
             prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
         });
     // Adding another regular connection between loop endpoint blocks is allowed
     // (as long as it doesn't create a cycle — but same-direction won't)
@@ -2219,6 +2227,8 @@ fn test_loop_edit_saves_on_enter() {
             to: 2,
             count: 1,
             prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
         });
     // Open loop edit popup via 'o' on block 1
     app.pipeline.pipeline_block_cursor = Some(1);
@@ -2244,6 +2254,8 @@ fn test_loop_edit_esc_discards() {
             to: 2,
             count: 3,
             prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
         });
     // Open loop edit popup via 'o' on block 1
     app.pipeline.pipeline_block_cursor = Some(1);
@@ -2916,6 +2928,8 @@ fn test_delete_internal_block_prunes_loop() {
         to: 1,
         count: 1,
         prompt: String::new(),
+        break_condition: String::new(),
+        break_agent: String::new(),
     }];
 
     // Select block 2 (internal to the loop sub-DAG) and press 'd'

@@ -424,6 +424,10 @@ pub(crate) struct PipelineState {
     pub(crate) pipeline_loop_edit_count_buf: String,
     pub(crate) pipeline_loop_edit_prompt_buf: String,
     pub(crate) pipeline_loop_edit_prompt_cursor: usize,
+    pub(crate) pipeline_loop_edit_break_condition_buf: String,
+    pub(crate) pipeline_loop_edit_break_condition_cursor: usize,
+    pub(crate) pipeline_loop_edit_break_agent_buf: String,
+    pub(crate) pipeline_loop_edit_break_agent_cursor: usize,
     pub(crate) pipeline_feed_connecting_from: Option<BlockId>,
     pub(crate) pipeline_show_feed_edit: bool,
     pub(crate) pipeline_feed_edit_target: Option<(BlockId, BlockId)>,
@@ -584,6 +588,8 @@ pub enum PipelineEditField {
 pub(crate) enum PipelineLoopEditField {
     Count,
     Prompt,
+    BreakAgent,
+    BreakCondition,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1281,6 +1287,19 @@ impl RunningState {
                     .or_insert_with(|| StreamBuffer::new(32 * 1024))
                     .push(chunk);
             }
+            ProgressEvent::LoopBreakEval {
+                from,
+                to,
+                pass,
+                decision,
+                agent_name,
+                ..
+            } => {
+                self.push_recent_activity_log(
+                    format!("Loop {from}\u{2192}{to}"),
+                    format!("[eval by {agent_name}] Pass {pass}: {decision}"),
+                );
+            }
             ProgressEvent::AllDone => {}
         }
     }
@@ -1428,6 +1447,10 @@ impl PipelineState {
             pipeline_loop_edit_count_buf: String::new(),
             pipeline_loop_edit_prompt_buf: String::new(),
             pipeline_loop_edit_prompt_cursor: 0,
+            pipeline_loop_edit_break_condition_buf: String::new(),
+            pipeline_loop_edit_break_condition_cursor: 0,
+            pipeline_loop_edit_break_agent_buf: String::new(),
+            pipeline_loop_edit_break_agent_cursor: 0,
             pipeline_feed_connecting_from: None,
             pipeline_show_feed_edit: false,
             pipeline_feed_edit_target: None,

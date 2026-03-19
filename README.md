@@ -457,9 +457,11 @@ from = 2
 to = 1
 count = 3
 prompt = "Refine based on feedback"
+break_agent = "Claude"
+break_condition = "Stop when the output is stable and no new improvements are suggested"
 ```
 
-`count` is the number of additional passes beyond the initial run. Each block in the sub-DAG runs `count + 1` times total. Loop wires are drawn as double-line in yellow on the canvas.
+`count` is the number of additional passes beyond the initial run. Each block in the sub-DAG runs `count + 1` times total. Loop wires are drawn as double-line in yellow on the canvas. Optionally set `break_agent` and `break_condition` to enable early termination — the agent evaluates outputs after each pass and can stop the loop before reaching `count`.
 
 ### Profiles
 

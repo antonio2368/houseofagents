@@ -102,6 +102,28 @@ pub(super) fn start_setup_analysis(app: &mut App) {
                     }
                 }
             }
+            // Validate break agents from loop connections
+            for lc in &app.pipeline.pipeline_def.loop_connections {
+                if lc.break_agent.is_empty() {
+                    continue;
+                }
+                let label = format!("{} (loop {}→{} break)", lc.break_agent, lc.from, lc.to);
+                match app.effective_agent_config(&lc.break_agent).cloned() {
+                    Some(cfg) => {
+                        if let Err(msg) = validate_agent_runtime(app, &label, &cfg) {
+                            app.setup_analysis.show_message(msg);
+                            return;
+                        }
+                    }
+                    None => {
+                        app.setup_analysis.show_message(format!(
+                            "Break agent '{}' not found (loop {}→{})",
+                            lc.break_agent, lc.from, lc.to
+                        ));
+                        return;
+                    }
+                }
+            }
         }
         _ => {}
     }
@@ -528,6 +550,16 @@ fn build_pipeline_prompt(app: &App, prompt: &mut String) {
                 let snippet = truncate_chars(&lc.prompt, 200);
                 line.push_str(&format!(", prompt: {snippet}"));
                 if lc.prompt.chars().count() > 200 {
+                    line.push_str("...");
+                }
+            }
+            if !lc.break_agent.is_empty() {
+                line.push_str(&format!(", break_agent: {}", lc.break_agent));
+            }
+            if !lc.break_condition.is_empty() {
+                let snippet = truncate_chars(&lc.break_condition, 100);
+                line.push_str(&format!(", break_condition: {snippet}"));
+                if lc.break_condition.chars().count() > 100 {
                     line.push_str("...");
                 }
             }

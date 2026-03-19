@@ -308,6 +308,16 @@ impl ProgressLogger {
             ProgressEvent::AgentStreamChunk { .. } | ProgressEvent::BlockStreamChunk { .. } => {
                 // Suppress stream chunks in text mode
             }
+            ProgressEvent::LoopBreakEval {
+                from,
+                to,
+                pass,
+                decision,
+                agent_name,
+                ..
+            } => {
+                eprintln!("[{now}] {prefix}Loop {from}\u{2192}{to} pass {pass} eval ({agent_name}): {decision}");
+            }
             ProgressEvent::AllDone => {}
         }
         self.accumulate_errors(event, run_id);
@@ -685,6 +695,22 @@ fn progress_event_to_json(event: &ProgressEvent, run_id: Option<u32>) -> Option<
             "iteration": iteration,
             "loop_pass": loop_pass,
             "chunk": chunk,
+        }),
+        ProgressEvent::LoopBreakEval {
+            from,
+            to,
+            iteration,
+            pass,
+            agent_name,
+            decision,
+        } => serde_json::json!({
+            "event": "loop_break_eval",
+            "from": from,
+            "to": to,
+            "iteration": iteration,
+            "pass": pass,
+            "agent": agent_name,
+            "decision": decision,
         }),
         ProgressEvent::AllDone => serde_json::json!({
             "event": "all_done",
@@ -1415,6 +1441,22 @@ async fn run_single_pipeline(
             rs::validate_agent_runtime(&cli_available, agent_name, agent_config)
                 .map_err(HeadlessError::Validation)?;
         }
+    }
+
+    for lc in &pipeline_def.loop_connections {
+        if lc.break_agent.is_empty() {
+            continue;
+        }
+        let agent_config =
+            rs::resolve_agent_config(&lc.break_agent, &session_overrides, &config.agents)
+                .ok_or_else(|| {
+                    HeadlessError::Validation(format!(
+                        "Loop {}→{} break agent '{}' is not configured",
+                        lc.from, lc.to, lc.break_agent
+                    ))
+                })?;
+        rs::validate_agent_runtime(&cli_available, &lc.break_agent, agent_config)
+            .map_err(HeadlessError::Validation)?;
     }
 
     let agent_configs =

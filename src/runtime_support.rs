@@ -155,6 +155,22 @@ pub(crate) fn build_pipeline_agent_configs(
             }
         }
     }
+    for lc in &pipeline_def.loop_connections {
+        if lc.break_agent.is_empty() || agent_configs.contains_key(&lc.break_agent) {
+            continue;
+        }
+        let agent_cfg = resolve_agent_config(&lc.break_agent, session_overrides, agents);
+        if let Some(agent_cfg) = agent_cfg {
+            agent_configs.insert(
+                lc.break_agent.clone(),
+                (
+                    agent_cfg.provider,
+                    agent_cfg.to_provider_config(),
+                    agent_cfg.use_cli,
+                ),
+            );
+        }
+    }
     agent_configs
 }
 

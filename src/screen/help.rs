@@ -405,6 +405,15 @@ pub fn pipeline_help_lines(tab: usize) -> &'static [Line<'static>] {
                 Line::from(""),
                 Line::from("  Count = additional passes beyond the initial run."),
                 Line::from(""),
+                Line::from(Span::styled(
+                    "  Break Evaluator",
+                    Style::default().fg(Color::Cyan),
+                )),
+                Line::from("  Optionally set a break agent and condition in the"),
+                Line::from("  loop edit popup to enable early termination. After"),
+                Line::from("  each pass, the agent evaluates outputs and responds"),
+                Line::from("  BREAK or CONTINUE."),
+                Line::from(""),
             ],
             // Tab 4: Sessions
             vec![
