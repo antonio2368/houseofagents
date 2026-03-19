@@ -280,6 +280,7 @@ fn draw_prompt_area(f: &mut Frame, app: &App, area: Rect) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Min(0),
         ])
         .split(cols[1]);
