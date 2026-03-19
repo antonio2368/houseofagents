@@ -286,7 +286,7 @@ pub(crate) struct RunningState {
     error_ledger: VecDeque<String>,
     recent_activity_logs: VecDeque<(String, String)>,
     last_error: Option<(String, String)>,
-    completed_steps: usize,
+    pub(crate) completed_steps: usize,
     completed_agent_steps: HashSet<(String, u32)>,
     completed_block_steps: HashSet<(u32, u32, u32)>,
     pub(crate) expected_total_steps: usize,
@@ -422,11 +422,13 @@ pub(crate) struct PipelineState {
     pub(crate) pipeline_loop_edit_field: PipelineLoopEditField,
     pub(crate) pipeline_loop_edit_target: Option<(BlockId, BlockId)>,
     pub(crate) pipeline_loop_edit_count_buf: String,
+    pub(crate) pipeline_loop_edit_count_fresh: bool, // true until first keypress; first digit replaces buffer
     pub(crate) pipeline_loop_edit_prompt_buf: String,
     pub(crate) pipeline_loop_edit_prompt_cursor: usize,
     pub(crate) pipeline_loop_edit_break_condition_buf: String,
     pub(crate) pipeline_loop_edit_break_condition_cursor: usize,
-    pub(crate) pipeline_loop_edit_break_agent_idx: usize, // 0 = (none), 1.. = config.agents index + 1, last = orphan
+    pub(crate) pipeline_loop_edit_break_agent_idx: usize, // cursor: 0 = (none), 1.. = config.agents index + 1, last = orphan
+    pub(crate) pipeline_loop_edit_break_agent_selected: usize, // confirmed selection (same scheme as idx)
     pub(crate) pipeline_loop_edit_break_agent_scroll: usize,
     pub(crate) pipeline_loop_edit_break_agent_visible: Cell<usize>,
     pub(crate) pipeline_loop_edit_break_agent_orphan: String, // non-empty if saved name not in config.agents
@@ -1039,6 +1041,7 @@ impl RunningState {
         self.recent_activity_logs.clear();
         self.last_error = None;
         self.completed_steps = 0;
+        self.expected_total_steps = 0;
         self.completed_agent_steps.clear();
         self.completed_block_steps.clear();
         self.active_agents.clear();
@@ -1447,11 +1450,13 @@ impl PipelineState {
             pipeline_loop_edit_field: PipelineLoopEditField::Count,
             pipeline_loop_edit_target: None,
             pipeline_loop_edit_count_buf: String::new(),
+            pipeline_loop_edit_count_fresh: false,
             pipeline_loop_edit_prompt_buf: String::new(),
             pipeline_loop_edit_prompt_cursor: 0,
             pipeline_loop_edit_break_condition_buf: String::new(),
             pipeline_loop_edit_break_condition_cursor: 0,
             pipeline_loop_edit_break_agent_idx: 0,
+            pipeline_loop_edit_break_agent_selected: 0,
             pipeline_loop_edit_break_agent_scroll: 0,
             pipeline_loop_edit_break_agent_visible: Cell::new(6),
             pipeline_loop_edit_break_agent_orphan: String::new(),

@@ -1588,6 +1588,13 @@ pub(super) fn handle_progress(app: &mut App, event: ProgressEvent) {
     if is_done {
         app.running.is_running = false;
         app.running.progress_rx = None;
+        // Normalize completed_steps so the progress bar reaches 100%
+        // even when early-break or cancellation skipped loop passes.
+        if app.running.expected_total_steps > 0
+            && app.running.completed_steps < app.running.expected_total_steps
+        {
+            app.running.completed_steps = app.running.expected_total_steps;
+        }
         maybe_start_memory_extraction(app);
         if should_offer_consolidation(app) {
             app.running.consolidation_active = true;

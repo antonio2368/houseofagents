@@ -2482,13 +2482,15 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let ba_focus = app.pipeline.pipeline_loop_edit_field == PipelineLoopEditField::BreakAgent;
-    let has_orphan = !app.pipeline.pipeline_loop_edit_break_agent_orphan.is_empty();
+    let has_orphan = !app
+        .pipeline
+        .pipeline_loop_edit_break_agent_orphan
+        .is_empty();
     let ba_list_h = if ba_focus {
         // label + items; cap so Prompt (Min 4) + Condition (Min 3) still fit
-        let total_items =
-            1 + app.config.agents.len() as u16 + u16::from(has_orphan); // (none) + agents + orphan?
-        // Fixed rows needed besides break-agent: Count(2) + spacers(4) + hint(1) = 7
-        // Prompt Min(4) + Condition Min(3) = 7 minimum.  So cap = inner.height - 7 - 7
+        let total_items = 1 + app.config.agents.len() as u16 + u16::from(has_orphan); // (none) + agents + orphan?
+                                                                                      // Fixed rows needed besides break-agent: Count(2) + spacers(4) + hint(1) = 7
+                                                                                      // Prompt Min(4) + Condition Min(3) = 7 minimum.  So cap = inner.height - 7 - 7
         let cap = (inner.height.saturating_sub(14)).max(2);
         1 + total_items.min(cap) // +1 for label
     } else {
@@ -2515,10 +2517,15 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    let count_display = if app.pipeline.pipeline_loop_edit_count_buf.is_empty() {
+        Span::styled("_", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::raw(&*app.pipeline.pipeline_loop_edit_count_buf)
+    };
     let count_line = Line::from(vec![
         Span::styled("Count: ", Style::default().fg(Color::White)),
         Span::styled("[", count_style),
-        Span::raw(&app.pipeline.pipeline_loop_edit_count_buf),
+        count_display,
         Span::styled("]", count_style),
         Span::styled(
             " (1-99, returns from target to source)",
@@ -2574,7 +2581,8 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Break Agent field (single-select list)
-    let ba_idx = app.pipeline.pipeline_loop_edit_break_agent_idx;
+    let ba_cursor = app.pipeline.pipeline_loop_edit_break_agent_idx;
+    let ba_sel = app.pipeline.pipeline_loop_edit_break_agent_selected;
     let orphan = &app.pipeline.pipeline_loop_edit_break_agent_orphan;
     if ba_focus {
         let avail_agents: std::collections::HashMap<&str, bool> = app
@@ -2586,7 +2594,9 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
 
         // "(none)" option at index 0
         {
-            let is_cursor = ba_idx == 0;
+            let is_cursor = ba_cursor == 0;
+            let is_selected = ba_sel == 0;
+            let marker = if is_selected { "● " } else { "  " };
             let style = if is_cursor {
                 Style::default()
                     .fg(Color::DarkGray)
@@ -2594,12 +2604,15 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            ba_lines.push(Line::from(Span::styled("  (none)", style)));
+            ba_lines.push(Line::from(Span::styled(format!("{marker}(none)"), style)));
         }
 
         // Agent options at index 1..
         for (i, a) in app.config.agents.iter().enumerate() {
-            let is_cursor = ba_idx == i + 1;
+            let item_idx = i + 1;
+            let is_cursor = ba_cursor == item_idx;
+            let is_selected = ba_sel == item_idx;
+            let marker = if is_selected { "● " } else { "  " };
             let is_avail = avail_agents.get(a.name.as_str()).copied().unwrap_or(false);
             let agent_color = if is_avail { Color::Green } else { Color::Red };
             let style = if is_cursor {
@@ -2609,13 +2622,18 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 Style::default().fg(agent_color)
             };
-            ba_lines.push(Line::from(Span::styled(format!("  {}", a.name), style)));
+            ba_lines.push(Line::from(Span::styled(
+                format!("{marker}{}", a.name),
+                style,
+            )));
         }
 
         // Orphan entry (agent no longer in config) at the end
         if !orphan.is_empty() {
             let orphan_idx = app.config.agents.len() + 1;
-            let is_cursor = ba_idx == orphan_idx;
+            let is_cursor = ba_cursor == orphan_idx;
+            let is_selected = ba_sel == orphan_idx;
+            let marker = if is_selected { "● " } else { "  " };
             let style = if is_cursor {
                 Style::default()
                     .fg(Color::Yellow)
@@ -2624,7 +2642,7 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::Yellow)
             };
             ba_lines.push(Line::from(Span::styled(
-                format!("  {} (missing)", orphan),
+                format!("{marker}{orphan} (missing)"),
                 style,
             )));
         }
@@ -2643,9 +2661,10 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
         let ba_p = Paragraph::new(all_ba_lines).scroll((scroll_offset, 0));
         f.render_widget(ba_p, chunks[4]);
     } else {
-        let ba_name: &str = if ba_idx == 0 {
+        // Unfocused: show the confirmed selection
+        let ba_name: &str = if ba_sel == 0 {
             "(none)"
-        } else if let Some(a) = app.config.agents.get(ba_idx - 1) {
+        } else if let Some(a) = app.config.agents.get(ba_sel - 1) {
             a.name.as_str()
         } else if !orphan.is_empty() {
             orphan.as_str()
@@ -2705,7 +2724,7 @@ fn draw_loop_edit_popup(f: &mut Frame, app: &App, area: Rect) {
 
     // Hint
     let hint = Paragraph::new(
-        "  Tab: cycle fields  Enter: save (Count) / newline (Prompt/Condition)  Esc: cancel",
+        "  Tab/Shift+Tab: cycle fields  Space: select agent  Enter: save (Count) / newline  Esc: cancel",
     )
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(hint, chunks[7]);

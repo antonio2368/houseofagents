@@ -2482,7 +2482,14 @@ where
 
                                     if should_break {
                                         if let Some(ls) = loop_state.get_mut(&key) {
-                                            ls.remaining = 0;
+                                            if !ls.abandoned {
+                                                // Account for the passes that will never run,
+                                                // mirroring the failure-abandon path.
+                                                completed += ls.abandoned_task_count();
+                                                ls.extra_tasks_remaining = 0;
+                                                ls.remaining = 0;
+                                                ls.abandoned = true;
+                                            }
                                         }
                                     }
 
@@ -7293,6 +7300,116 @@ position = [0, 0]
         assert!(
             !result_last.contains("initial output"),
             "LastPass should exclude pass-0 when loop variants exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_early_break_completes_and_emits_all_done() {
+        // A(1)→B(2)→C(3) with loop_back(B, A, count=5) and break_agent="Claude".
+        // The mock provider always returns "BREAK", so the evaluator breaks
+        // after pass 0.  Downstream block C must still execute, and AllDone
+        // must be emitted (proving completed reached total_tasks).
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("early-break")).unwrap();
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0), block(3, 2, 0)],
+            vec![conn(1, 2), conn(2, 3)],
+            vec![LoopConnection {
+                from: 2,
+                to: 1,
+                count: 5,
+                prompt: String::new(),
+                break_condition: "always break".into(),
+                break_agent: "Claude".into(),
+            }],
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        let recv_clone = received.clone();
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            move |_kind, _cfg| {
+                // All providers return "BREAK" — the evaluator will parse it
+                // as a break decision, and the block agents produce it as content.
+                Box::new(MockProvider::ok(
+                    ProviderKind::Anthropic,
+                    "BREAK",
+                    recv_clone.clone(),
+                ))
+            },
+        )
+        .await
+        .expect("pipeline should complete without error");
+
+        let events = collect_progress_events(rx);
+
+        // AllDone must be present — this is the regression guard against
+        // the hang where completed never reached total_tasks.
+        assert!(
+            events.iter().any(|e| matches!(e, ProgressEvent::AllDone)),
+            "AllDone event must be emitted after early break"
+        );
+
+        // A and B should each finish exactly once (pass 0 only).
+        let a_finished = events
+            .iter()
+            .filter(
+                |e| matches!(e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 0),
+            )
+            .count();
+        let b_finished = events
+            .iter()
+            .filter(
+                |e| matches!(e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 1),
+            )
+            .count();
+        assert_eq!(a_finished, 1, "A should finish once (only pass 0)");
+        assert_eq!(b_finished, 1, "B should finish once (only pass 0)");
+
+        // Downstream C (outside the loop) must also finish.
+        let c_finished = events
+            .iter()
+            .filter(
+                |e| matches!(e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 2),
+            )
+            .count();
+        assert_eq!(c_finished, 1, "downstream C should finish after loop exit");
+
+        // A LoopBreakEval event should have been emitted with decision BREAK.
+        let break_eval = events.iter().find(|e| {
+            matches!(
+                e,
+                ProgressEvent::LoopBreakEval { decision, .. } if decision == "BREAK"
+            )
+        });
+        assert!(
+            break_eval.is_some(),
+            "LoopBreakEval with BREAK decision must be emitted"
         );
     }
 }

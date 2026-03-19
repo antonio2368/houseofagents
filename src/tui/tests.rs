@@ -3727,3 +3727,280 @@ fn canvas_f_on_exec_with_multi_feeds_shows_error() {
     assert!(!app.pipeline.pipeline_show_feed_list);
     assert_eq!(app.pipeline.pipeline_def.data_feeds.len(), feed_count);
 }
+
+// ---------------------------------------------------------------------------
+// Loop edit: BackTab field cycling
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loop_edit_backtab_cycles_fields_backward() {
+    use crate::app::PipelineLoopEditField;
+    use crate::execution::pipeline::LoopConnection;
+
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 1,
+            prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
+        });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('o')));
+    assert!(app.pipeline.pipeline_show_loop_edit);
+    assert_eq!(
+        app.pipeline.pipeline_loop_edit_field,
+        PipelineLoopEditField::Count
+    );
+
+    // BackTab from Count → BreakCondition
+    handle_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(
+        app.pipeline.pipeline_loop_edit_field,
+        PipelineLoopEditField::BreakCondition
+    );
+    // BackTab from BreakCondition → BreakAgent
+    handle_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(
+        app.pipeline.pipeline_loop_edit_field,
+        PipelineLoopEditField::BreakAgent
+    );
+    // BackTab from BreakAgent → Prompt
+    handle_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(
+        app.pipeline.pipeline_loop_edit_field,
+        PipelineLoopEditField::Prompt
+    );
+    // BackTab from Prompt → Count (full cycle)
+    handle_key(&mut app, key(KeyCode::BackTab));
+    assert_eq!(
+        app.pipeline.pipeline_loop_edit_field,
+        PipelineLoopEditField::Count
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Loop edit: count field fresh-replacement behavior
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loop_edit_count_fresh_replaces_on_first_digit() {
+    use crate::execution::pipeline::LoopConnection;
+
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 1,
+            prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
+        });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('o')));
+    assert!(app.pipeline.pipeline_show_loop_edit);
+    assert_eq!(app.pipeline.pipeline_loop_edit_count_buf, "1");
+    assert!(app.pipeline.pipeline_loop_edit_count_fresh);
+
+    // Typing '5' should replace '1' with '5', not produce '15'
+    handle_key(&mut app, key(KeyCode::Char('5')));
+    assert_eq!(app.pipeline.pipeline_loop_edit_count_buf, "5");
+    assert!(!app.pipeline.pipeline_loop_edit_count_fresh);
+
+    // Subsequent digits should append normally
+    handle_key(&mut app, key(KeyCode::Char('3')));
+    assert_eq!(app.pipeline.pipeline_loop_edit_count_buf, "53");
+}
+
+#[test]
+fn loop_edit_count_empty_defaults_to_1_on_save() {
+    use crate::execution::pipeline::LoopConnection;
+
+    let mut app = pipeline_app_with_two_blocks();
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 5,
+            prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
+        });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('o')));
+
+    // Clear via backspace (fresh flag is consumed by backspace)
+    handle_key(&mut app, key(KeyCode::Backspace));
+    assert!(app.pipeline.pipeline_loop_edit_count_buf.is_empty());
+
+    // Save with empty buffer — should default to 1
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(!app.pipeline.pipeline_show_loop_edit);
+    assert_eq!(app.pipeline.pipeline_def.loop_connections[0].count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Loop edit: break agent cursor vs selected semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn loop_edit_break_agent_cursor_does_not_change_selection() {
+    use crate::app::PipelineLoopEditField;
+    use crate::execution::pipeline::LoopConnection;
+
+    let mut app = pipeline_app_with_two_blocks();
+    app.config.agents.push(test_agent(
+        "TestAgent",
+        ProviderKind::Anthropic,
+        "test",
+        false,
+        None,
+    ));
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 1,
+            prompt: String::new(),
+            break_condition: String::new(),
+            break_agent: String::new(),
+        });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('o')));
+
+    // Navigate to BreakAgent field
+    handle_key(&mut app, key(KeyCode::Tab));
+    handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(
+        app.pipeline.pipeline_loop_edit_field,
+        PipelineLoopEditField::BreakAgent
+    );
+
+    // Cursor at 0 ((none)), selected at 0
+    assert_eq!(app.pipeline.pipeline_loop_edit_break_agent_idx, 0);
+    assert_eq!(app.pipeline.pipeline_loop_edit_break_agent_selected, 0);
+
+    // Move cursor down — selection must not change
+    handle_key(&mut app, key(KeyCode::Down));
+    assert_eq!(app.pipeline.pipeline_loop_edit_break_agent_idx, 1);
+    assert_eq!(app.pipeline.pipeline_loop_edit_break_agent_selected, 0);
+
+    // Confirm with Space — now selection changes
+    handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(app.pipeline.pipeline_loop_edit_break_agent_selected, 1);
+}
+
+#[test]
+fn loop_edit_saves_confirmed_selection_not_cursor() {
+    use crate::app::PipelineLoopEditField;
+    use crate::execution::pipeline::LoopConnection;
+
+    let mut app = pipeline_app_with_two_blocks();
+    app.config.agents.push(test_agent(
+        "BreakBot",
+        ProviderKind::Anthropic,
+        "test",
+        false,
+        None,
+    ));
+    app.pipeline
+        .pipeline_def
+        .loop_connections
+        .push(LoopConnection {
+            from: 1,
+            to: 2,
+            count: 1,
+            prompt: String::new(),
+            break_condition: "stop when done".into(),
+            break_agent: "BreakBot".into(),
+        });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('o')));
+
+    // Verify it loaded with BreakBot selected (index 1)
+    assert_eq!(app.pipeline.pipeline_loop_edit_break_agent_selected, 1);
+
+    // Navigate to BreakAgent field and move cursor to (none)
+    handle_key(&mut app, key(KeyCode::Tab));
+    handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(
+        app.pipeline.pipeline_loop_edit_field,
+        PipelineLoopEditField::BreakAgent
+    );
+    handle_key(&mut app, key(KeyCode::Up));
+    assert_eq!(app.pipeline.pipeline_loop_edit_break_agent_idx, 0);
+    // Selection still at BreakBot
+    assert_eq!(app.pipeline.pipeline_loop_edit_break_agent_selected, 1);
+
+    // Tab away and save — should keep the confirmed BreakBot, not cursor (none)
+    handle_key(&mut app, key(KeyCode::BackTab));
+    handle_key(&mut app, key(KeyCode::BackTab));
+    // Now on Count — Enter saves
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(!app.pipeline.pipeline_show_loop_edit);
+    assert_eq!(
+        app.pipeline.pipeline_def.loop_connections[0].break_agent,
+        "BreakBot"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Progress normalization: cross-mode state leak regression test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn progress_normalization_does_not_leak_across_modes() {
+    // Regression: after a pipeline run, expected_total_steps was not reset.
+    // A subsequent relay/swarm run would inherit the stale pipeline total,
+    // causing the AllDone normalization to produce impossible counts (e.g., 14/3).
+    let mut app = test_app();
+
+    // Simulate a completed pipeline run with expected_total_steps = 14
+    app.running.expected_total_steps = 14;
+    app.running.completed_steps = 14;
+    app.running.is_running = true;
+    handle_progress(&mut app, ProgressEvent::AllDone);
+    assert!(!app.running.is_running);
+
+    // Now start a fresh relay run — reset_running_state calls clear_activity
+    app.reset_running_state();
+    assert_eq!(
+        app.running.expected_total_steps, 0,
+        "expected_total_steps must be reset between runs"
+    );
+    assert_eq!(
+        app.running.completed_steps, 0,
+        "completed_steps must be reset between runs"
+    );
+
+    // Simulate relay completing with 3 steps
+    app.running.is_running = true;
+    app.record_progress(ProgressEvent::AgentStarted {
+        agent: "Claude".into(),
+        kind: ProviderKind::Anthropic,
+        iteration: 1,
+    });
+    app.record_progress(ProgressEvent::AgentFinished {
+        agent: "Claude".into(),
+        kind: ProviderKind::Anthropic,
+        iteration: 1,
+    });
+    handle_progress(&mut app, ProgressEvent::AllDone);
+    // completed_steps should reflect relay reality (1), not stale pipeline total
+    assert_eq!(
+        app.completed_steps(),
+        1,
+        "completed_steps must not be inflated by stale expected_total_steps"
+    );
+}

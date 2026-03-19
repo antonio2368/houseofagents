@@ -1174,6 +1174,7 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     app.pipeline.pipeline_loop_edit_field = PipelineLoopEditField::Count;
                     app.pipeline.pipeline_loop_edit_target = Some((lc.from, lc.to));
                     app.pipeline.pipeline_loop_edit_count_buf = lc.count.to_string();
+                    app.pipeline.pipeline_loop_edit_count_fresh = true;
                     app.pipeline.pipeline_loop_edit_prompt_buf = lc.prompt.clone();
                     app.pipeline.pipeline_loop_edit_prompt_cursor = lc.prompt.len();
                     app.pipeline.pipeline_loop_edit_break_condition_buf =
@@ -1182,6 +1183,7 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                         lc.break_condition.len();
                     if lc.break_agent.is_empty() {
                         app.pipeline.pipeline_loop_edit_break_agent_idx = 0;
+                        app.pipeline.pipeline_loop_edit_break_agent_selected = 0;
                         app.pipeline.pipeline_loop_edit_break_agent_orphan = String::new();
                     } else if let Some(pos) = app
                         .config
@@ -1190,13 +1192,14 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                         .position(|a| a.name == lc.break_agent)
                     {
                         app.pipeline.pipeline_loop_edit_break_agent_idx = pos + 1;
+                        app.pipeline.pipeline_loop_edit_break_agent_selected = pos + 1;
                         app.pipeline.pipeline_loop_edit_break_agent_orphan = String::new();
                     } else {
                         // Agent no longer in config — show as orphan at end of list
-                        app.pipeline.pipeline_loop_edit_break_agent_orphan =
-                            lc.break_agent.clone();
-                        app.pipeline.pipeline_loop_edit_break_agent_idx =
-                            app.config.agents.len() + 1;
+                        app.pipeline.pipeline_loop_edit_break_agent_orphan = lc.break_agent.clone();
+                        let orphan_idx = app.config.agents.len() + 1;
+                        app.pipeline.pipeline_loop_edit_break_agent_idx = orphan_idx;
+                        app.pipeline.pipeline_loop_edit_break_agent_selected = orphan_idx;
                     }
                     // Scroll so the selected item is visible
                     let visible = app
@@ -2399,6 +2402,14 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
                 PipelineLoopEditField::BreakCondition => PipelineLoopEditField::Count,
             };
         }
+        KeyCode::BackTab => {
+            app.pipeline.pipeline_loop_edit_field = match app.pipeline.pipeline_loop_edit_field {
+                PipelineLoopEditField::Count => PipelineLoopEditField::BreakCondition,
+                PipelineLoopEditField::Prompt => PipelineLoopEditField::Count,
+                PipelineLoopEditField::BreakAgent => PipelineLoopEditField::Prompt,
+                PipelineLoopEditField::BreakCondition => PipelineLoopEditField::BreakAgent,
+            };
+        }
         KeyCode::Enter => {
             match app.pipeline.pipeline_loop_edit_field {
                 PipelineLoopEditField::Count => {
@@ -2421,17 +2432,18 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
                             lc.prompt = app.pipeline.pipeline_loop_edit_prompt_buf.clone();
                             lc.break_condition =
                                 app.pipeline.pipeline_loop_edit_break_condition_buf.clone();
-                            let ba_idx = app.pipeline.pipeline_loop_edit_break_agent_idx;
+                            let ba_idx = app.pipeline.pipeline_loop_edit_break_agent_selected;
                             lc.break_agent = if ba_idx == 0 {
                                 String::new()
                             } else if let Some(a) = app.config.agents.get(ba_idx - 1) {
                                 a.name.clone()
-                            } else if !app.pipeline.pipeline_loop_edit_break_agent_orphan.is_empty()
+                            } else if !app
+                                .pipeline
+                                .pipeline_loop_edit_break_agent_orphan
+                                .is_empty()
                             {
                                 // Orphan slot selected — preserve the original name
-                                app.pipeline
-                                    .pipeline_loop_edit_break_agent_orphan
-                                    .clone()
+                                app.pipeline.pipeline_loop_edit_break_agent_orphan.clone()
                             } else {
                                 String::new()
                             };
@@ -2463,6 +2475,11 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
         _ => match app.pipeline.pipeline_loop_edit_field {
             PipelineLoopEditField::Count => match key.code {
                 KeyCode::Char(c) if c.is_ascii_digit() => {
+                    if app.pipeline.pipeline_loop_edit_count_fresh {
+                        // First keypress replaces the loaded value
+                        app.pipeline.pipeline_loop_edit_count_buf.clear();
+                        app.pipeline.pipeline_loop_edit_count_fresh = false;
+                    }
                     app.pipeline.pipeline_loop_edit_count_buf.push(c);
                     let v: u32 = app
                         .pipeline
@@ -2473,12 +2490,11 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
                     app.pipeline.pipeline_loop_edit_count_buf = v.to_string();
                 }
                 KeyCode::Backspace => {
+                    app.pipeline.pipeline_loop_edit_count_fresh = false;
                     app.pipeline.pipeline_loop_edit_count_buf.pop();
-                    if app.pipeline.pipeline_loop_edit_count_buf.is_empty() {
-                        app.pipeline.pipeline_loop_edit_count_buf = "1".into();
-                    }
                 }
                 KeyCode::Up | KeyCode::Char('+') => {
+                    app.pipeline.pipeline_loop_edit_count_fresh = false;
                     let cur: u32 = app
                         .pipeline
                         .pipeline_loop_edit_count_buf
@@ -2488,6 +2504,7 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
                     app.pipeline.pipeline_loop_edit_count_buf = next.to_string();
                 }
                 KeyCode::Down | KeyCode::Char('-') => {
+                    app.pipeline.pipeline_loop_edit_count_fresh = false;
                     let cur: u32 = app
                         .pipeline
                         .pipeline_loop_edit_count_buf
@@ -2506,14 +2523,23 @@ fn handle_pipeline_loop_edit_key(app: &mut App, key: KeyEvent) {
                 );
             }
             PipelineLoopEditField::BreakAgent => {
-                let has_orphan =
-                    !app.pipeline.pipeline_loop_edit_break_agent_orphan.is_empty();
+                let has_orphan = !app
+                    .pipeline
+                    .pipeline_loop_edit_break_agent_orphan
+                    .is_empty();
                 let total = app.config.agents.len() + 1 + usize::from(has_orphan);
                 match key.code {
+                    KeyCode::Char(' ') => {
+                        // Confirm selection at current cursor position
+                        app.pipeline.pipeline_loop_edit_break_agent_selected =
+                            app.pipeline.pipeline_loop_edit_break_agent_idx;
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         if total > 0 {
-                            app.pipeline.pipeline_loop_edit_break_agent_idx =
-                                app.pipeline.pipeline_loop_edit_break_agent_idx.saturating_sub(1);
+                            app.pipeline.pipeline_loop_edit_break_agent_idx = app
+                                .pipeline
+                                .pipeline_loop_edit_break_agent_idx
+                                .saturating_sub(1);
                             if app.pipeline.pipeline_loop_edit_break_agent_idx
                                 < app.pipeline.pipeline_loop_edit_break_agent_scroll
                             {
