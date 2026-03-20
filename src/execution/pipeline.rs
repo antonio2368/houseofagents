@@ -610,6 +610,15 @@ impl PipelineConnection {
             scatter_delimiter: DEFAULT_SCATTER_DELIMITER.into(),
         }
     }
+
+    /// Returns the effective scatter delimiter, falling back to the default when empty.
+    pub fn effective_delimiter(&self) -> &str {
+        if self.scatter_delimiter.is_empty() {
+            DEFAULT_SCATTER_DELIMITER
+        } else {
+            &self.scatter_delimiter
+        }
+    }
 }
 
 pub(crate) struct ScatterItem {
@@ -951,6 +960,31 @@ impl PipelineDefinition {
         self.session_configs
             .dedup_by(|a, b| a.agent == b.agent && a.session_key == b.session_key);
     }
+
+    /// Returns the terminal finalization leaf (the block with no outgoing finalization connections).
+    /// Validation guarantees exactly one such block exists in sub-pipeline definitions.
+    pub fn finalization_leaf(&self) -> Option<&PipelineBlock> {
+        let outgoing: HashSet<BlockId> = self
+            .finalization_connections
+            .iter()
+            .map(|c| c.from)
+            .collect();
+        self.finalization_blocks
+            .iter()
+            .find(|b| !outgoing.contains(&b.id))
+    }
+
+    /// Mutable version of `finalization_leaf()`.
+    pub fn finalization_leaf_mut(&mut self) -> Option<&mut PipelineBlock> {
+        let outgoing: HashSet<BlockId> = self
+            .finalization_connections
+            .iter()
+            .map(|c| c.from)
+            .collect();
+        self.finalization_blocks
+            .iter_mut()
+            .find(|b| !outgoing.contains(&b.id))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -999,6 +1033,24 @@ fn upstream_of_non_scatter(def: &PipelineDefinition, id: BlockId) -> Vec<BlockId
         .filter(|c| c.to == id && !c.scatter)
         .map(|c| c.from)
         .collect()
+}
+
+/// If `id` has an outgoing scatter connection, returns the effective delimiter.
+/// Validation guarantees all outgoing scatter edges from a source share the same delimiter.
+fn outgoing_scatter_delimiter(def: &PipelineDefinition, id: BlockId) -> Option<&str> {
+    def.connections
+        .iter()
+        .find(|c| c.scatter && c.from == id)
+        .map(|c| c.effective_delimiter())
+}
+
+/// Build the scatter-source formatting instruction for the given delimiter.
+fn scatter_source_instruction(delim: &str) -> String {
+    format!(
+        "IMPORTANT: Your output will be split into individual work items and distributed to downstream agents.\n\
+         Separate each work item using this exact delimiter string between items: `{delim}`\n\
+         Do not wrap your output in code blocks or add text outside the work items."
+    )
 }
 
 /// Kahn's algorithm: returns parallelizable layers or Err on cycle.
@@ -1596,6 +1648,27 @@ pub(crate) fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError
                                 )));
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // All outgoing scatter edges from the same source must use the same effective delimiter
+        {
+            let mut source_delims: HashMap<BlockId, &str> = HashMap::new();
+            for conn in &def.connections {
+                if conn.scatter {
+                    let delim = conn.effective_delimiter();
+                    if let Some(&existing) = source_delims.get(&conn.from) {
+                        if existing != delim {
+                            return Err(AppError::Config(format!(
+                                "Block {} has outgoing scatter connections with different delimiters: \
+                                 \"{}\" vs \"{}\"; all scatter edges from the same source must use the same delimiter",
+                                conn.from, existing, delim
+                            )));
+                        }
+                    } else {
+                        source_delims.insert(conn.from, delim);
                     }
                 }
             }
@@ -2559,6 +2632,21 @@ async fn run_pipeline_with_provider_factory(
                             }
                             sub_def_ctx.initial_prompt = final_prompt;
 
+                            // If this sub-pipeline has an outgoing scatter connection,
+                            // inject the delimiter instruction into the finalization leaf's
+                            // prompt — that block's output is what gets scattered downstream.
+                            if let Some(delim) = outgoing_scatter_delimiter(def, block_id) {
+                                let leaf = sub_def_ctx
+                                    .finalization_leaf_mut()
+                                    .expect("validated: exactly one finalization leaf");
+                                if leaf.prompt.is_empty() {
+                                    leaf.prompt = scatter_source_instruction(delim);
+                                } else {
+                                    leaf.prompt.push_str("\n\n");
+                                    leaf.prompt.push_str(&scatter_source_instruction(delim));
+                                }
+                            }
+
                             // Per-replica sub-run directory
                             let sub_run_dir = if block.replicas > 1 {
                                 output.run_dir().join(format!(
@@ -3241,12 +3329,7 @@ async fn run_pipeline_with_provider_factory(
                                         if conn.scatter && conn.from == sid {
                                             if let Some(rids) = rt.logical_to_runtime.get(&sid) {
                                                 if let Some(text) = replica_outputs.get(&rids[0]) {
-                                                    let delim = if conn.scatter_delimiter.is_empty() {
-                                                        DEFAULT_SCATTER_DELIMITER
-                                                    } else {
-                                                        &conn.scatter_delimiter
-                                                    };
-                                                    let queue = ScatterQueue::from_output(text, delim);
+                                                    let queue = ScatterQueue::from_output(text, conn.effective_delimiter());
                                                     let _ = progress_tx.send(ProgressEvent::BlockLog {
                                                         block_id: runtime_id,
                                                         agent_name: entry_agent.clone(),
@@ -3662,15 +3745,8 @@ fn read_sub_pipeline_terminal_output(
     output_root: &Path,
 ) -> Result<String, AppError> {
     // Find terminal finalization leaf (validated: exactly one)
-    let outgoing: HashSet<BlockId> = def
-        .finalization_connections
-        .iter()
-        .map(|c| c.from)
-        .collect();
     let terminal_block = def
-        .finalization_blocks
-        .iter()
-        .find(|b| !outgoing.contains(&b.id))
+        .finalization_leaf()
         .expect("validated: exactly one finalization leaf");
 
     // Derive filename from the same code path that writes it
@@ -3810,6 +3886,13 @@ fn build_pipeline_block_message(
             }
             format!("{prefix}--- Upstream outputs ---\n{upstream_content}")
         }
+    };
+
+    // If this block has an outgoing scatter connection, tell it to format output with delimiters
+    let base_message = if let Some(delim) = outgoing_scatter_delimiter(context.def, block.id) {
+        format!("{base_message}\n\n{}", scatter_source_instruction(delim))
+    } else {
+        base_message
     };
 
     let profile_prefix = resolve_profile_instructions(&block.profiles, use_cli);
@@ -4092,6 +4175,12 @@ fn build_loop_rerun_message_v2(
                 }
             }
         }
+    }
+
+    // If this block has an outgoing scatter connection, tell it to format output with delimiters
+    if let Some(delim) = outgoing_scatter_delimiter(def, block.id) {
+        message.push_str("\n\n");
+        message.push_str(&scatter_source_instruction(delim));
     }
 
     let profile_prefix = resolve_profile_instructions(&block.profiles, use_cli);
@@ -10088,5 +10177,454 @@ position = [0, 0]
         };
         let err = validate_pipeline(&def).unwrap_err();
         assert!(err.to_string().contains("logical_task_count"));
+    }
+
+    // -- scatter source delimiter auto-injection tests --
+
+    #[test]
+    fn scatter_source_gets_delimiter_instruction_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("scatter-src")).unwrap();
+
+        let source = block(1, 0, 0);
+        let mut target = block(2, 1, 0);
+        target.replicas = 3;
+
+        let mut sc = PipelineConnection::new(1, 2);
+        sc.scatter = true;
+
+        let def = def_with(vec![source, target], vec![sc]);
+        let ctx = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let block_outputs = HashMap::new();
+        let rt = build_runtime_table(&def);
+        let btl = HashMap::new();
+        let blp = HashMap::new();
+        let msg_ctx = PipelineMessageContext {
+            def: &def,
+            block_outputs: &block_outputs,
+            output: &output,
+            prompt_context: &ctx,
+            runtime_table: &rt,
+            block_to_loop: &btl,
+            block_loop_pass: &blp,
+            scatter_injection: None,
+        };
+
+        let source_msg = build_pipeline_block_message(&def.blocks[0], false, &msg_ctx);
+        assert!(
+            source_msg.contains(DEFAULT_SCATTER_DELIMITER),
+            "source must contain default delimiter: {source_msg}"
+        );
+        assert!(
+            source_msg.contains("split into individual work items"),
+            "source must contain scatter instruction: {source_msg}"
+        );
+        assert!(
+            source_msg.contains("Do not wrap"),
+            "source must contain wrap warning: {source_msg}"
+        );
+
+        // Target should NOT get the source instruction
+        let target_msg = build_pipeline_block_message(&def.blocks[1], false, &msg_ctx);
+        assert!(
+            !target_msg.contains("split into individual work items"),
+            "target must NOT contain scatter source instruction: {target_msg}"
+        );
+    }
+
+    #[test]
+    fn scatter_source_gets_custom_delimiter_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("scatter-cust")).unwrap();
+
+        let source = block(1, 0, 0);
+        let mut target = block(2, 1, 0);
+        target.replicas = 3;
+
+        let mut sc = PipelineConnection::new(1, 2);
+        sc.scatter = true;
+        sc.scatter_delimiter = "|||".into();
+
+        let def = def_with(vec![source, target], vec![sc]);
+        let ctx = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let block_outputs = HashMap::new();
+        let rt = build_runtime_table(&def);
+        let btl = HashMap::new();
+        let blp = HashMap::new();
+        let msg_ctx = PipelineMessageContext {
+            def: &def,
+            block_outputs: &block_outputs,
+            output: &output,
+            prompt_context: &ctx,
+            runtime_table: &rt,
+            block_to_loop: &btl,
+            block_loop_pass: &blp,
+            scatter_injection: None,
+        };
+
+        let source_msg = build_pipeline_block_message(&def.blocks[0], false, &msg_ctx);
+        assert!(
+            source_msg.contains("|||"),
+            "source must contain custom delimiter: {source_msg}"
+        );
+        assert!(
+            source_msg.contains("split into individual work items"),
+            "source must contain scatter instruction: {source_msg}"
+        );
+        assert!(
+            !source_msg.contains(DEFAULT_SCATTER_DELIMITER),
+            "source must NOT contain default delimiter: {source_msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_mixed_effective_delimiters() {
+        let source = block(1, 0, 0);
+        let mut t1 = block(2, 1, 0);
+        t1.replicas = 2;
+        let mut t2 = block(3, 2, 0);
+        t2.replicas = 2;
+
+        let mut sc1 = PipelineConnection::new(1, 2);
+        sc1.scatter = true;
+        sc1.scatter_delimiter = "|||".into();
+
+        let mut sc2 = PipelineConnection::new(1, 3);
+        sc2.scatter = true;
+        // Default delimiter — different from "|||"
+
+        let def = def_with(vec![source, t1, t2], vec![sc1, sc2]);
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(
+            err.to_string().contains("different delimiters"),
+            "expected mixed-delimiter error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_same_effective_delimiter_empty_vs_explicit() {
+        let source = block(1, 0, 0);
+        let mut t1 = block(2, 1, 0);
+        t1.replicas = 2;
+        let mut t2 = block(3, 2, 0);
+        t2.replicas = 2;
+
+        let mut sc1 = PipelineConnection::new(1, 2);
+        sc1.scatter = true;
+        sc1.scatter_delimiter = String::new(); // empty → maps to default
+
+        let mut sc2 = PipelineConnection::new(1, 3);
+        sc2.scatter = true;
+        sc2.scatter_delimiter = DEFAULT_SCATTER_DELIMITER.into(); // explicit default
+
+        let def = def_with(vec![source, t1, t2], vec![sc1, sc2]);
+        assert!(
+            validate_pipeline(&def).is_ok(),
+            "empty and explicit default delimiters should be treated as identical"
+        );
+    }
+
+    #[tokio::test]
+    async fn scatter_source_to_sub_pipeline_target_e2e() {
+        // Block 1 (regular, scatter source) → Block 2 (sub-pipeline, scatter target)
+        let sub_def = minimal_sub_def();
+        let mut sub_block = sub_pipeline_block(2, 1, 0, sub_def);
+        sub_block.replicas = 2;
+
+        let source = block(1, 0, 0);
+
+        let mut sc = PipelineConnection::new(1, 2);
+        sc.scatter = true;
+
+        let def = def_with(vec![source, sub_block], vec![sc]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("scatter-sub")).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let factory: ProviderFactory = Arc::new(move |_kind, _cfg| {
+            Box::new(MockProvider::ok(
+                ProviderKind::Anthropic,
+                "item1\n===SCATTER_ITEM===\nitem2",
+                received_clone.clone(),
+            ))
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let ctx = crate::execution::PromptRuntimeContext::new("test prompt", false);
+
+        run_pipeline_with_provider_factory(&def, 4, configs, &ctx, &output, tx, cancel, factory)
+            .await
+            .unwrap();
+
+        let _events = collect_progress_events(rx);
+
+        // The first captured prompt (block 1's agent) must contain the delimiter instruction
+        let calls = received.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|p| p.contains("split into individual work items")
+                    && p.contains(DEFAULT_SCATTER_DELIMITER)),
+            "scatter source block prompt must contain delimiter instruction; prompts: {:?}",
+            calls
+                .iter()
+                .map(|c| &c[..c.len().min(200)])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn loop_rerun_message_includes_scatter_source_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("loop-scatter")).unwrap();
+
+        // Block 1 (loop restart target & scatter source) → Block 2 (scatter target)
+        // Loop: 2 → 1
+        let source = block(1, 0, 0);
+        let mut target = block(2, 1, 0);
+        target.replicas = 3;
+        let evaluator = block(3, 2, 0);
+
+        let mut sc = PipelineConnection::new(1, 2);
+        sc.scatter = true;
+        let reg_conn2 = PipelineConnection::new(2, 3);
+
+        let def = PipelineDefinition {
+            initial_prompt: "test".into(),
+            blocks: vec![source, target, evaluator],
+            connections: vec![sc, reg_conn2],
+            session_configs: Vec::new(),
+            loop_connections: vec![LoopConnection {
+                from: 3,
+                to: 1,
+                count: 2,
+                prompt: "iterate".into(),
+                break_condition: String::new(),
+                break_agent: String::new(),
+            }],
+            finalization_blocks: Vec::new(),
+            finalization_connections: Vec::new(),
+            data_feeds: Vec::new(),
+        };
+
+        let ctx = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let rt = build_runtime_table(&def);
+        let replica_outputs = HashMap::new();
+        let btl = HashMap::from([(1, (3, 1)), (2, (3, 1)), (3, (3, 1))]);
+        let blp = HashMap::from([(1, 1u32), (2, 1u32), (3, 1u32)]);
+        let loop_sub_dag: HashSet<BlockId> = [1, 2, 3].into_iter().collect();
+
+        let msg = build_loop_rerun_message_v2(
+            &def.blocks[0], // block 1
+            false,
+            &def,
+            &loop_sub_dag,
+            3, // from_block_id
+            1, // current_pass
+            2, // total_passes
+            "iterate",
+            &replica_outputs,
+            &rt,
+            &output,
+            &ctx,
+            &btl,
+            &blp,
+            None,
+        );
+
+        assert!(
+            msg.contains("split into individual work items"),
+            "loop rerun message must contain scatter source instruction: {msg}"
+        );
+        assert!(
+            msg.contains(DEFAULT_SCATTER_DELIMITER),
+            "loop rerun message must contain default delimiter: {msg}"
+        );
+    }
+
+    #[test]
+    fn sub_pipeline_as_scatter_source_injects_into_finalization_leaf() {
+        // Sub-pipeline block 1 (scatter source) → block 2 (scatter target, replicas=2)
+        // The sub-pipeline's finalization leaf prompt should get the delimiter instruction.
+        let sub_def = minimal_sub_def();
+        let mut sub_block = sub_pipeline_block(1, 0, 0, sub_def);
+        sub_block.replicas = 1;
+
+        let mut target = block(2, 1, 0);
+        target.replicas = 2;
+
+        let mut sc = PipelineConnection::new(1, 2);
+        sc.scatter = true;
+
+        let def = def_with(vec![sub_block.clone(), target], vec![sc]);
+
+        // Simulate the dispatch path: clone sub_def, apply outgoing scatter injection
+        let mut sub_def_ctx = sub_block.sub_pipeline.unwrap().clone();
+        if let Some(delim) = outgoing_scatter_delimiter(&def, 1) {
+            let leaf = sub_def_ctx
+                .finalization_leaf_mut()
+                .expect("validated: exactly one finalization leaf");
+            if leaf.prompt.is_empty() {
+                leaf.prompt = scatter_source_instruction(delim);
+            } else {
+                leaf.prompt.push_str("\n\n");
+                leaf.prompt.push_str(&scatter_source_instruction(delim));
+            }
+        }
+
+        // The finalization leaf (block 200 in minimal_sub_def) should have the instruction
+        let leaf = sub_def_ctx
+            .finalization_leaf()
+            .expect("finalization leaf must exist");
+        assert!(
+            leaf.prompt.contains("split into individual work items"),
+            "finalization leaf prompt must contain scatter source instruction: {}",
+            leaf.prompt
+        );
+        assert!(
+            leaf.prompt.contains(DEFAULT_SCATTER_DELIMITER),
+            "finalization leaf prompt must contain default delimiter: {}",
+            leaf.prompt
+        );
+    }
+
+    #[test]
+    fn sub_pipeline_scatter_source_empty_prompt_finalization_leaf() {
+        // Same as above but with empty finalization leaf prompt — tests the `if is_empty()` branch
+        let mut sub_def = minimal_sub_def();
+        // Clear the finalization leaf's prompt
+        sub_def.finalization_leaf_mut().unwrap().prompt.clear();
+
+        let mut sub_block = sub_pipeline_block(1, 0, 0, sub_def);
+        sub_block.replicas = 1;
+
+        let mut target = block(2, 1, 0);
+        target.replicas = 2;
+
+        let mut sc = PipelineConnection::new(1, 2);
+        sc.scatter = true;
+
+        let def = def_with(vec![sub_block.clone(), target], vec![sc]);
+
+        let mut sub_def_ctx = sub_block.sub_pipeline.unwrap().clone();
+        if let Some(delim) = outgoing_scatter_delimiter(&def, 1) {
+            let leaf = sub_def_ctx
+                .finalization_leaf_mut()
+                .expect("validated: exactly one finalization leaf");
+            if leaf.prompt.is_empty() {
+                leaf.prompt = scatter_source_instruction(delim);
+            } else {
+                leaf.prompt.push_str("\n\n");
+                leaf.prompt.push_str(&scatter_source_instruction(delim));
+            }
+        }
+
+        let leaf = sub_def_ctx
+            .finalization_leaf()
+            .expect("finalization leaf must exist");
+        // With empty prompt, the instruction should BE the prompt (no leading \n\n)
+        assert!(
+            leaf.prompt.starts_with("IMPORTANT:"),
+            "empty-prompt leaf should start with instruction directly: {}",
+            leaf.prompt
+        );
+        assert!(
+            leaf.prompt.contains(DEFAULT_SCATTER_DELIMITER),
+            "finalization leaf prompt must contain default delimiter: {}",
+            leaf.prompt
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_pipeline_scatter_source_e2e_finalization_receives_instruction() {
+        // Block 1 (sub-pipeline, scatter source) → Block 2 (regular target, replicas=2)
+        // Verify the inner pipeline's finalization leaf actually receives the delimiter instruction.
+        let sub_def = minimal_sub_def();
+        let sub_block = sub_pipeline_block(1, 0, 0, sub_def);
+
+        let mut target = block(2, 1, 0);
+        target.replicas = 2;
+
+        let mut sc = PipelineConnection::new(1, 2);
+        sc.scatter = true;
+
+        let def = def_with(vec![sub_block, target], vec![sc]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("sub-src")).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let factory: ProviderFactory = Arc::new(move |_kind, _cfg| {
+            Box::new(MockProvider::ok(
+                ProviderKind::Anthropic,
+                "item1\n===SCATTER_ITEM===\nitem2",
+                received_clone.clone(),
+            ))
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let ctx = crate::execution::PromptRuntimeContext::new("test prompt", false);
+
+        run_pipeline_with_provider_factory(&def, 4, configs, &ctx, &output, tx, cancel, factory)
+            .await
+            .unwrap();
+
+        let _events = collect_progress_events(rx);
+
+        // At least one prompt (the finalization leaf inside the sub-pipeline) must contain
+        // the scatter source instruction
+        let calls = received.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|p| p.contains("split into individual work items")
+                    && p.contains(DEFAULT_SCATTER_DELIMITER)),
+            "sub-pipeline finalization leaf must receive scatter source instruction; prompts: {:?}",
+            calls
+                .iter()
+                .map(|c| &c[..c.len().min(200)])
+                .collect::<Vec<_>>()
+        );
     }
 }

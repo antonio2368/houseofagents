@@ -2,7 +2,7 @@ use crate::app::{
     App, PipelineDialogMode, PipelineEditField, PipelineFeedEditField, PipelineFocus,
     PipelineLoopEditField,
 };
-use crate::execution::pipeline::{BlockId, DEFAULT_SCATTER_DELIMITER};
+use crate::execution::pipeline::BlockId;
 use crate::execution::{fit_display_width, truncate_chars};
 use crate::screen::centered_rect;
 use crate::screen::help;
@@ -1218,11 +1218,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         for c in &app.pipeline.pipeline_def.connections {
             if c.from == sel || c.to == sel {
                 if conn_idx == app.pipeline.pipeline_conn_cursor && c.scatter {
-                    let delim = if c.scatter_delimiter.is_empty() {
-                        DEFAULT_SCATTER_DELIMITER
-                    } else {
-                        &c.scatter_delimiter
-                    };
+                    let delim = c.effective_delimiter();
                     status_text.push_str(&format!("  [scatter: on, delim: \"{delim}\"]"));
                     break;
                 }

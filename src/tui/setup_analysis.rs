@@ -512,11 +512,7 @@ fn build_pipeline_prompt(app: &App, prompt: &mut String) {
                 .map(pipeline_block_label)
                 .unwrap_or_else(|| format!("Block {}", conn.to));
             if conn.scatter {
-                let delim = if conn.scatter_delimiter.is_empty() {
-                    crate::execution::pipeline::DEFAULT_SCATTER_DELIMITER
-                } else {
-                    &conn.scatter_delimiter
-                };
+                let delim = conn.effective_delimiter();
                 prompt.push_str(&format!(
                     "  {} \"{}\" -> {} \"{}\" [SCATTER, delim: \"{}\"]\n",
                     conn.from, from_label, conn.to, to_label, delim

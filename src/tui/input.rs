@@ -2488,7 +2488,7 @@ fn handle_pipeline_scatter_edit_key(app: &mut App, key: KeyEvent) {
             }
             app.pipeline.pipeline_scatter_edit = false;
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if c != '`' => {
             let pos = app.pipeline.pipeline_scatter_delimiter_cursor;
             app.pipeline.pipeline_scatter_delimiter_buf.insert(pos, c);
             app.pipeline.pipeline_scatter_delimiter_cursor += c.len_utf8();

@@ -434,6 +434,8 @@ pub fn pipeline_help_lines(tab: usize) -> &'static [Line<'static>] {
                 Line::from("    Replicas loop until the queue is drained."),
                 Line::from("    In a loop, scatter target must be the restart block."),
                 Line::from("    Sub-pipeline blocks support scatter distribution."),
+                Line::from("    Source blocks auto-receive delimiter formatting instructions."),
+                Line::from("    All scatter edges from one source must use the same delimiter."),
                 Line::from(""),
                 Line::from("  Scatter wires are drawn as dashed (\u{254C}\u{254E}) in cyan."),
                 Line::from("  Default delimiter: ===SCATTER_ITEM==="),
