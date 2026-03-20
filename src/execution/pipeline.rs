@@ -84,25 +84,45 @@ pub(crate) fn build_runtime_table(def: &PipelineDefinition) -> RuntimeReplicaTab
     let mut next_id: u32 = 0;
 
     for block in &def.blocks {
-        // Sub-pipeline blocks: single opaque runtime entry
+        // Sub-pipeline blocks: one runtime entry per replica
         if block.is_sub_pipeline() {
             let blabel = block_label(block);
-            entries.push(RuntimeReplicaInfo {
-                runtime_id: next_id,
-                source_block_id: block.id,
-                replica_index: 0,
-                phase: RuntimePhase::Execution,
-                run_scope: None,
-                agent: format!("[{}]", block.name),
-                display_label: format!("{blabel} [sub-pipeline]"),
-                session_key: format!("__sub_{}", block.id),
-                filename_stem: format!("sub_b{}_pipeline", block.id),
-            });
+            let multi_replica = block.replicas > 1;
+            let mut runtime_ids = Vec::new();
+            for ri in 0..block.replicas {
+                let display_label = if multi_replica {
+                    format!("{} [sub-pipeline] (r{})", blabel, ri + 1)
+                } else {
+                    format!("{blabel} [sub-pipeline]")
+                };
+                let filename_stem = if multi_replica {
+                    format!("sub_b{}_pipeline_r{}", block.id, ri + 1)
+                } else {
+                    format!("sub_b{}_pipeline", block.id)
+                };
+                let session_key = if multi_replica {
+                    format!("__sub_{}_r{}", block.id, ri + 1)
+                } else {
+                    format!("__sub_{}", block.id)
+                };
+                entries.push(RuntimeReplicaInfo {
+                    runtime_id: next_id,
+                    source_block_id: block.id,
+                    replica_index: ri,
+                    phase: RuntimePhase::Execution,
+                    run_scope: None,
+                    agent: format!("[{}]", block.name),
+                    display_label,
+                    session_key,
+                    filename_stem,
+                });
+                runtime_ids.push(next_id);
+                next_id += 1;
+            }
             logical_to_runtime
                 .entry(block.id)
                 .or_default()
-                .push(next_id);
-            next_id += 1;
+                .extend(runtime_ids);
             continue;
         }
 
@@ -547,10 +567,10 @@ impl PipelineBlock {
         self.sub_pipeline.is_some()
     }
 
-    /// Logical task count for scheduling: sub-pipelines count as 1 opaque unit.
+    /// Logical task count for scheduling: each sub-pipeline replica is one opaque unit.
     pub fn logical_task_count(&self) -> u32 {
         if self.is_sub_pipeline() {
-            1
+            self.replicas
         } else {
             self.agents.len() as u32 * self.replicas
         }
@@ -1562,20 +1582,6 @@ pub(crate) fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError
             }
         }
 
-        // Scatter target must not be a sub-pipeline block
-        for conn in &def.connections {
-            if conn.scatter {
-                if let Some(block) = def.blocks.iter().find(|b| b.id == conn.to) {
-                    if block.is_sub_pipeline() {
-                        return Err(AppError::Config(format!(
-                            "Scatter target block {} is a sub-pipeline; scatter not supported for sub-pipelines",
-                            conn.to
-                        )));
-                    }
-                }
-            }
-        }
-
         // Scatter target inside a loop must be the loop restart block (`to`)
         if def.connections.iter().any(|c| c.scatter) && !def.loop_connections.is_empty() {
             let graph = RegularGraph::from_def(def);
@@ -1917,14 +1923,6 @@ pub(crate) fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError
         if block.session_id.is_some() {
             return Err(AppError::Config(format!(
                 "Sub-pipeline block '{}' must not have a session_id",
-                block.name
-            )));
-        }
-
-        // 13e: Parent sub-pipeline block replicas must be 1
-        if block.replicas != 1 {
-            return Err(AppError::Config(format!(
-                "Sub-pipeline block '{}' must have replicas = 1",
                 block.name
             )));
         }
@@ -2460,247 +2458,348 @@ async fn run_pipeline_with_provider_factory(
 
                     // Sub-pipeline dispatch
                     if block.is_sub_pipeline() {
-                        let sub_def = block.sub_pipeline.as_ref().unwrap().clone();
-                        let rid = rids[0];
                         let parent_iteration: u32 = iteration;
                         let parent_loop_pass: u32 = *block_loop_pass.get(&block_id).unwrap_or(&0);
                         let parent_block_name = block.name.clone();
-                        let parent_label = rt.entries[rid as usize].display_label.clone();
-
                         let upstream_context = assemble_raw_upstream_context(
                             block, def, &rt, &replica_outputs,
                         );
-                        let mut sub_def_ctx = sub_def;
-                        if !upstream_context.is_empty() {
-                            if sub_def_ctx.initial_prompt.is_empty() {
-                                sub_def_ctx.initial_prompt = upstream_context;
-                            } else {
-                                sub_def_ctx.initial_prompt = format!(
-                                    "{}\n\n--- Input from parent pipeline ---\n{}",
-                                    sub_def_ctx.initial_prompt, upstream_context
+
+                        for &rid in rids {
+                            let info = &rt.entries[rid as usize];
+                            let parent_label = info.display_label.clone();
+                            let replica_index = info.replica_index;
+
+                            // --- Scatter: pop item from queue ---
+                            let incoming_scatter: Option<&PipelineConnection> = def
+                                .connections
+                                .iter()
+                                .find(|c| c.scatter && c.to == block_id);
+
+                            let scatter_item: Option<ScatterItem> =
+                                if let Some(sc) = incoming_scatter {
+                                    scatter_queues
+                                        .get_mut(&(sc.from, block_id))
+                                        .and_then(|q| q.pop())
+                                } else {
+                                    None
+                                };
+
+                            let scatter_total = incoming_scatter
+                                .and_then(|sc| scatter_queues.get(&(sc.from, block_id)))
+                                .map(|q| q.total())
+                                .unwrap_or(0);
+
+                            // Queue exhausted → no-op task
+                            if incoming_scatter.is_some() && scatter_item.is_none() {
+                                let _ = progress_tx.send(ProgressEvent::BlockFinished {
+                                    block_id: rid,
+                                    agent_name: info.agent.clone(),
+                                    label: info.display_label.clone(),
+                                    iteration,
+                                    loop_pass: current_loop_pass,
+                                });
+                                scatter_done_replicas.entry(block_id).or_default().insert(rid);
+                                let task_handle = tasks.spawn(async move { (rid, Ok(String::new())) });
+                                task_metadata.insert(
+                                    task_handle.id(),
+                                    PipelineTaskMetadata {
+                                        runtime_id: rid,
+                                        source_block_id: block_id,
+                                        agent_name: info.agent.clone(),
+                                        label: info.display_label.clone(),
+                                        iteration,
+                                        loop_pass: current_loop_pass,
+                                    },
                                 );
+                                continue;
                             }
-                        }
 
-                        let sub_run_dir = output.run_dir().join(format!("sub_{}", block.id));
-                        let parent_run_dir = output.run_dir().to_path_buf();
-                        let parent_filename = loop_replica_filename(
-                            &rt.entries[rid as usize],
-                            parent_loop_pass,
-                        );
-                        // Wrap the parent factory so CLI providers inside the
-                        // sub-pipeline get --add-dir for the sub-run directory.
-                        let parent_factory = provider_factory.clone();
-                        let sub_dir_str = sub_run_dir.display().to_string();
-                        let sub_factory: ProviderFactory = Arc::new(move |kind, cfg| {
-                            let mut p = parent_factory(kind, cfg);
-                            p.add_allowed_dir(sub_dir_str.clone());
-                            p
-                        });
-                        let agent_configs_clone = agent_configs.clone();
-                        let prompt_context_clone = prompt_context.clone();
-                        let cancel_clone = cancel.clone();
-                        let sem_clone = concurrency_sem.clone();
-                        let max_conc = max_block_concurrency;
+                            // Scatter log
+                            if let Some(ref item) = scatter_item {
+                                let _ = progress_tx.send(ProgressEvent::BlockLog {
+                                    block_id: rid,
+                                    agent_name: info.agent.clone(),
+                                    iteration,
+                                    loop_pass: current_loop_pass,
+                                    message: format!(
+                                        "[scatter] Processing item {}/{}",
+                                        item.index + 1,
+                                        scatter_total,
+                                    ),
+                                });
+                            }
 
-                        // Private child progress channel + forwarder
-                        let (child_tx, mut child_rx) = mpsc::unbounded_channel::<ProgressEvent>();
-                        let parent_tx = progress_tx.clone();
-                        let fwd_block_name = parent_block_name.clone();
-                        let fwd_parent_label = parent_label.clone();
-                        tokio::spawn(async move {
-                            while let Some(event) = child_rx.recv().await {
-                                match &event {
-                                    ProgressEvent::BlockStarted {
-                                        block_id: inner_bid,
-                                        label: inner_label,
-                                        loop_pass: inner_lp,
-                                        ..
-                                    } => {
-                                        let _ = parent_tx.send(ProgressEvent::SubBlockStarted {
-                                            parent_block_id: rid,
-                                            inner_block_id: *inner_bid,
-                                            inner_label: inner_label.clone(),
-                                            parent_label: fwd_parent_label.clone(),
-                                            iteration: parent_iteration,
-                                            loop_pass: parent_loop_pass,
-                                            inner_loop_pass: *inner_lp,
-                                        });
-                                    }
-                                    ProgressEvent::BlockFinished {
-                                        block_id: inner_bid,
-                                        label: inner_label,
-                                        loop_pass: inner_lp,
-                                        ..
-                                    } => {
-                                        let _ = parent_tx.send(ProgressEvent::SubBlockFinished {
-                                            parent_block_id: rid,
-                                            inner_block_id: *inner_bid,
-                                            inner_label: inner_label.clone(),
-                                            parent_label: fwd_parent_label.clone(),
-                                            iteration: parent_iteration,
-                                            loop_pass: parent_loop_pass,
-                                            inner_loop_pass: *inner_lp,
-                                        });
-                                    }
-                                    ProgressEvent::BlockError {
-                                        block_id: inner_bid,
-                                        label: inner_label,
-                                        loop_pass: inner_lp,
-                                        error,
-                                        details,
-                                        ..
-                                    } => {
-                                        let _ = parent_tx.send(ProgressEvent::SubBlockError {
-                                            parent_block_id: rid,
-                                            inner_block_id: *inner_bid,
-                                            inner_label: inner_label.clone(),
-                                            parent_label: fwd_parent_label.clone(),
-                                            iteration: parent_iteration,
-                                            loop_pass: parent_loop_pass,
-                                            inner_loop_pass: *inner_lp,
-                                            error: error.clone(),
-                                            details: details.clone(),
-                                            is_skip: false,
-                                        });
-                                    }
-                                    ProgressEvent::BlockSkipped {
-                                        block_id: inner_bid,
-                                        label: inner_label,
-                                        loop_pass: inner_lp,
-                                        reason,
-                                        ..
-                                    } => {
-                                        let _ = parent_tx.send(ProgressEvent::SubBlockError {
-                                            parent_block_id: rid,
-                                            inner_block_id: *inner_bid,
-                                            inner_label: inner_label.clone(),
-                                            parent_label: fwd_parent_label.clone(),
-                                            iteration: parent_iteration,
-                                            loop_pass: parent_loop_pass,
-                                            inner_loop_pass: *inner_lp,
-                                            error: format!("SKIPPED: {reason}"),
-                                            details: None,
-                                            is_skip: true,
-                                        });
-                                    }
-                                    ProgressEvent::BlockLog {
-                                        agent_name: inner_agent,
-                                        message,
-                                        ..
-                                    } => {
-                                        let _ = parent_tx.send(ProgressEvent::BlockLog {
-                                            block_id: rid,
-                                            agent_name: format!("[{fwd_block_name}]"),
-                                            iteration: parent_iteration,
-                                            loop_pass: parent_loop_pass,
-                                            message: format!("[{inner_agent}] {message}"),
-                                        });
-                                    }
-                                    ProgressEvent::AllDone => { /* Do not forward */ }
-                                    // TODO: SubBlock* events from depth ≥2 are discarded here.
-                                    // If nested sub-pipelines are ever allowed, these should be
-                                    // forwarded (possibly with depth tracking).
-                                    _ => { /* Discard other inner events */ }
+                            // Clone sub_def and inject upstream + scatter into initial_prompt
+                            let sub_def = block.sub_pipeline.as_ref().unwrap().clone();
+                            let mut sub_def_ctx = sub_def;
+                            let mut final_prompt = sub_def_ctx.initial_prompt.clone();
+                            if !upstream_context.is_empty() {
+                                if final_prompt.is_empty() {
+                                    final_prompt = upstream_context.clone();
+                                } else {
+                                    final_prompt = format!(
+                                        "{final_prompt}\n\n--- Input from parent pipeline ---\n{upstream_context}",
+                                    );
                                 }
                             }
-                        });
+                            if let Some(ref item) = scatter_item {
+                                let scatter_header = format!(
+                                    "--- Scatter item {}/{} ---\n{}",
+                                    item.index + 1,
+                                    scatter_total,
+                                    item.content,
+                                );
+                                if final_prompt.is_empty() {
+                                    final_prompt = scatter_header;
+                                } else {
+                                    final_prompt =
+                                        format!("{final_prompt}\n\n{scatter_header}");
+                                }
+                            }
+                            sub_def_ctx.initial_prompt = final_prompt;
 
-                        // BlockStarted for the parent sub-pipeline row
-                        let _ = progress_tx.send(ProgressEvent::BlockStarted {
-                            block_id: rid,
-                            agent_name: format!("[{}]", block.name),
-                            label: parent_label.clone(),
-                            iteration,
-                            loop_pass: current_loop_pass,
-                        });
+                            // Per-replica sub-run directory
+                            let sub_run_dir = if block.replicas > 1 {
+                                output.run_dir().join(format!(
+                                    "sub_{}_r{}",
+                                    block.id,
+                                    replica_index + 1
+                                ))
+                            } else {
+                                output.run_dir().join(format!("sub_{}", block.id))
+                            };
+                            let parent_run_dir = output.run_dir().to_path_buf();
+                            let parent_filename = loop_replica_filename(
+                                &rt.entries[rid as usize],
+                                parent_loop_pass,
+                            );
+                            // Wrap the parent factory so CLI providers inside the
+                            // sub-pipeline get --add-dir for the sub-run directory.
+                            let parent_factory = provider_factory.clone();
+                            let sub_dir_str = sub_run_dir.display().to_string();
+                            let sub_factory: ProviderFactory = Arc::new(move |kind, cfg| {
+                                let mut p = parent_factory(kind, cfg);
+                                p.add_allowed_dir(sub_dir_str.clone());
+                                p
+                            });
+                            let agent_configs_clone = agent_configs.clone();
+                            let prompt_context_clone = prompt_context.clone();
+                            let cancel_clone = cancel.clone();
+                            let sem_clone = concurrency_sem.clone();
+                            let max_conc = max_block_concurrency;
 
-                        let rt_handle = tokio::runtime::Handle::current();
-                        let task_handle = tasks.spawn(async move {
-                            let _permit = sem_clone.acquire().await.expect("semaphore closed");
-
-                            // run_pipeline_with_provider_factory returns a !Send future
-                            // (tokio::select! state machine internals), so we run it on
-                            // a dedicated blocking thread via Handle::block_on.
-                            let result = tokio::task::spawn_blocking(move || {
-                                rt_handle.block_on(async {
-                                    if let Err(e) = std::fs::create_dir_all(&sub_run_dir) {
-                                        return (rid, Err(e.to_string()));
-                                    }
-                                    let sub_output = match OutputManager::from_existing(sub_run_dir.clone()) {
-                                        Ok(o) => o,
-                                        Err(e) => return (rid, Err(e.to_string())),
-                                    };
-
-                                    // Execution phase
-                                    if let Err(e) = run_pipeline_with_provider_factory(
-                                        &sub_def_ctx,
-                                        max_conc,
-                                        agent_configs_clone.clone(),
-                                        &prompt_context_clone,
-                                        &sub_output,
-                                        child_tx.clone(),
-                                        cancel_clone.clone(),
-                                        sub_factory.clone(),
-                                    )
-                                    .await
-                                    {
-                                        return (rid, Err(e.to_string()));
-                                    }
-
-                                    // Finalization phase
-                                    let exec_rt = build_runtime_table(&sub_def_ctx);
-                                    let fin_scope = FinalizationRunScope::SingleRun {
-                                        run_id: 1,
-                                        run_dir: sub_run_dir.clone(),
-                                    };
-                                    if let Err(e) = run_pipeline_finalization(
-                                        &sub_def_ctx,
-                                        fin_scope,
-                                        &exec_rt,
-                                        agent_configs_clone,
-                                        &sub_run_dir,
-                                        child_tx,
-                                        cancel_clone,
-                                        sub_factory,
-                                    )
-                                    .await
-                                    {
-                                        return (rid, Err(e.to_string()));
-                                    }
-
-                                    // Read terminal output and write it as a parent-level file
-                                    // so that downstream blocks, feeds, and post-run discovery
-                                    // can find it on disk.
-                                    match read_sub_pipeline_terminal_output(&sub_def_ctx, &sub_run_dir) {
-                                        Ok(text) => {
-                                            let parent_path = parent_run_dir.join(&parent_filename);
-                                            if let Err(e) = std::fs::write(&parent_path, &text) {
-                                                return (rid, Err(format!(
-                                                    "Failed to write sub-pipeline output: {e}"
-                                                )));
-                                            }
-                                            (rid, Ok(text))
+                            // Private child progress channel + forwarder
+                            let (child_tx, mut child_rx) =
+                                mpsc::unbounded_channel::<ProgressEvent>();
+                            let parent_tx = progress_tx.clone();
+                            let fwd_block_name = parent_block_name.clone();
+                            let fwd_parent_label = parent_label.clone();
+                            tokio::spawn(async move {
+                                while let Some(event) = child_rx.recv().await {
+                                    match &event {
+                                        ProgressEvent::BlockStarted {
+                                            block_id: inner_bid,
+                                            label: inner_label,
+                                            loop_pass: inner_lp,
+                                            ..
+                                        } => {
+                                            let _ =
+                                                parent_tx.send(ProgressEvent::SubBlockStarted {
+                                                    parent_block_id: rid,
+                                                    inner_block_id: *inner_bid,
+                                                    inner_label: inner_label.clone(),
+                                                    parent_label: fwd_parent_label.clone(),
+                                                    iteration: parent_iteration,
+                                                    loop_pass: parent_loop_pass,
+                                                    inner_loop_pass: *inner_lp,
+                                                });
                                         }
-                                        Err(e) => (rid, Err(e.to_string())),
+                                        ProgressEvent::BlockFinished {
+                                            block_id: inner_bid,
+                                            label: inner_label,
+                                            loop_pass: inner_lp,
+                                            ..
+                                        } => {
+                                            let _ =
+                                                parent_tx.send(ProgressEvent::SubBlockFinished {
+                                                    parent_block_id: rid,
+                                                    inner_block_id: *inner_bid,
+                                                    inner_label: inner_label.clone(),
+                                                    parent_label: fwd_parent_label.clone(),
+                                                    iteration: parent_iteration,
+                                                    loop_pass: parent_loop_pass,
+                                                    inner_loop_pass: *inner_lp,
+                                                });
+                                        }
+                                        ProgressEvent::BlockError {
+                                            block_id: inner_bid,
+                                            label: inner_label,
+                                            loop_pass: inner_lp,
+                                            error,
+                                            details,
+                                            ..
+                                        } => {
+                                            let _ =
+                                                parent_tx.send(ProgressEvent::SubBlockError {
+                                                    parent_block_id: rid,
+                                                    inner_block_id: *inner_bid,
+                                                    inner_label: inner_label.clone(),
+                                                    parent_label: fwd_parent_label.clone(),
+                                                    iteration: parent_iteration,
+                                                    loop_pass: parent_loop_pass,
+                                                    inner_loop_pass: *inner_lp,
+                                                    error: error.clone(),
+                                                    details: details.clone(),
+                                                    is_skip: false,
+                                                });
+                                        }
+                                        ProgressEvent::BlockSkipped {
+                                            block_id: inner_bid,
+                                            label: inner_label,
+                                            loop_pass: inner_lp,
+                                            reason,
+                                            ..
+                                        } => {
+                                            let _ =
+                                                parent_tx.send(ProgressEvent::SubBlockError {
+                                                    parent_block_id: rid,
+                                                    inner_block_id: *inner_bid,
+                                                    inner_label: inner_label.clone(),
+                                                    parent_label: fwd_parent_label.clone(),
+                                                    iteration: parent_iteration,
+                                                    loop_pass: parent_loop_pass,
+                                                    inner_loop_pass: *inner_lp,
+                                                    error: format!("SKIPPED: {reason}"),
+                                                    details: None,
+                                                    is_skip: true,
+                                                });
+                                        }
+                                        ProgressEvent::BlockLog {
+                                            agent_name: inner_agent,
+                                            message,
+                                            ..
+                                        } => {
+                                            let _ = parent_tx.send(ProgressEvent::BlockLog {
+                                                block_id: rid,
+                                                agent_name: format!("[{fwd_block_name}]"),
+                                                iteration: parent_iteration,
+                                                loop_pass: parent_loop_pass,
+                                                message: format!("[{inner_agent}] {message}"),
+                                            });
+                                        }
+                                        ProgressEvent::AllDone => { /* Do not forward */ }
+                                        _ => { /* Discard other inner events */ }
                                     }
-                                })
-                            }).await.unwrap_or_else(|e| (rid, Err(format!("sub-pipeline panicked: {e}"))));
+                                }
+                            });
 
-                            result
-                        });
-
-                        task_metadata.insert(
-                            task_handle.id(),
-                            PipelineTaskMetadata {
-                                runtime_id: rid,
-                                source_block_id: block_id,
+                            // BlockStarted for the parent sub-pipeline row
+                            let _ = progress_tx.send(ProgressEvent::BlockStarted {
+                                block_id: rid,
                                 agent_name: format!("[{}]", block.name),
-                                label: parent_label,
+                                label: parent_label.clone(),
                                 iteration,
                                 loop_pass: current_loop_pass,
-                            },
-                        );
+                            });
+
+                            let rt_handle = tokio::runtime::Handle::current();
+                            let task_handle = tasks.spawn(async move {
+                                let _permit =
+                                    sem_clone.acquire().await.expect("semaphore closed");
+
+                                let result = tokio::task::spawn_blocking(move || {
+                                    rt_handle.block_on(async {
+                                        if let Err(e) = std::fs::create_dir_all(&sub_run_dir) {
+                                            return (rid, Err(e.to_string()));
+                                        }
+                                        let sub_output =
+                                            match OutputManager::from_existing(sub_run_dir.clone())
+                                            {
+                                                Ok(o) => o,
+                                                Err(e) => return (rid, Err(e.to_string())),
+                                            };
+
+                                        // Execution phase
+                                        if let Err(e) = run_pipeline_with_provider_factory(
+                                            &sub_def_ctx,
+                                            max_conc,
+                                            agent_configs_clone.clone(),
+                                            &prompt_context_clone,
+                                            &sub_output,
+                                            child_tx.clone(),
+                                            cancel_clone.clone(),
+                                            sub_factory.clone(),
+                                        )
+                                        .await
+                                        {
+                                            return (rid, Err(e.to_string()));
+                                        }
+
+                                        // Finalization phase
+                                        let exec_rt = build_runtime_table(&sub_def_ctx);
+                                        let fin_scope = FinalizationRunScope::SingleRun {
+                                            run_id: 1,
+                                            run_dir: sub_run_dir.clone(),
+                                        };
+                                        if let Err(e) = run_pipeline_finalization(
+                                            &sub_def_ctx,
+                                            fin_scope,
+                                            &exec_rt,
+                                            agent_configs_clone,
+                                            &sub_run_dir,
+                                            child_tx,
+                                            cancel_clone,
+                                            sub_factory,
+                                        )
+                                        .await
+                                        {
+                                            return (rid, Err(e.to_string()));
+                                        }
+
+                                        match read_sub_pipeline_terminal_output(
+                                            &sub_def_ctx,
+                                            &sub_run_dir,
+                                        ) {
+                                            Ok(text) => {
+                                                let parent_path =
+                                                    parent_run_dir.join(&parent_filename);
+                                                if let Err(e) =
+                                                    std::fs::write(&parent_path, &text)
+                                                {
+                                                    return (
+                                                        rid,
+                                                        Err(format!(
+                                                        "Failed to write sub-pipeline output: {e}"
+                                                    )),
+                                                    );
+                                                }
+                                                (rid, Ok(text))
+                                            }
+                                            Err(e) => (rid, Err(e.to_string())),
+                                        }
+                                    })
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    (rid, Err(format!("sub-pipeline panicked: {e}")))
+                                });
+
+                                result
+                            });
+
+                            task_metadata.insert(
+                                task_handle.id(),
+                                PipelineTaskMetadata {
+                                    runtime_id: rid,
+                                    source_block_id: block_id,
+                                    agent_name: format!("[{}]", block.name),
+                                    label: parent_label,
+                                    iteration,
+                                    loop_pass: current_loop_pass,
+                                },
+                            );
+                        }
                         continue;
                     }
 
@@ -3167,8 +3266,11 @@ async fn run_pipeline_with_provider_factory(
                                 // Emit BlockFinished for sub-pipeline blocks (normal
                                 // tasks emit this inside the spawned task; sub-pipelines
                                 // emit it here because the inner run does not know the
-                                // parent runtime_id).
-                                if block_map.get(&sid).is_some_and(|b| b.is_sub_pipeline()) {
+                                // parent runtime_id). Skip for scatter-exhausted no-ops
+                                // which already emitted BlockFinished in the dispatch loop.
+                                if block_map.get(&sid).is_some_and(|b| b.is_sub_pipeline())
+                                    && !is_scatter_done
+                                {
                                     let _ = progress_tx.send(ProgressEvent::BlockFinished {
                                         block_id: runtime_id,
                                         agent_name: entry_agent,
@@ -8672,12 +8774,11 @@ position = [0, 0]
     }
 
     #[test]
-    fn test_validate_parent_sub_block_replicas_1() {
+    fn test_validate_parent_sub_block_multi_replicas() {
         let mut sub_block = sub_pipeline_block(1, 0, 0, minimal_sub_def());
         sub_block.replicas = 2;
         let def = def_with(vec![sub_block], vec![]);
-        let err = validate_pipeline(&def).unwrap_err();
-        assert!(err.to_string().contains("replicas = 1"));
+        assert!(validate_pipeline(&def).is_ok());
     }
 
     #[test]
@@ -9528,18 +9629,23 @@ position = [0, 0]
     }
 
     #[test]
-    fn scatter_validation_target_not_sub_pipeline() {
-        let mut def = def_with(vec![block(1, 0, 0)], vec![]);
-        let mut sub_block = block(2, 1, 0);
-        sub_block.sub_pipeline = Some(PipelineDefinition::default());
-        def.blocks.push(sub_block);
+    fn scatter_validation_allows_sub_pipeline_target() {
+        let source = block(1, 0, 0);
+        let mut target = sub_pipeline_block(2, 1, 0, minimal_sub_def());
+        target.replicas = 2;
         let mut c = PipelineConnection::new(1, 2);
         c.scatter = true;
-        def.connections = vec![c];
-        let result = validate_pipeline(&def);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("sub-pipeline"));
+        let def = PipelineDefinition {
+            initial_prompt: "test".into(),
+            blocks: vec![source, target],
+            connections: vec![c],
+            session_configs: Vec::new(),
+            loop_connections: Vec::new(),
+            finalization_blocks: Vec::new(),
+            finalization_connections: Vec::new(),
+            data_feeds: Vec::new(),
+        };
+        assert!(validate_pipeline(&def).is_ok());
     }
 
     #[test]
@@ -9896,5 +10002,91 @@ position = [0, 0]
         // Verify numeric ordering: item3 before item4
         assert!(files[0].contains("_item3_loop2"));
         assert!(files[1].contains("_item4_loop2"));
+    }
+
+    // ── Multi-replica sub-pipeline tests ──
+
+    #[test]
+    fn logical_task_count_sub_pipeline_scales_with_replicas() {
+        let mut sub = sub_pipeline_block(1, 0, 0, minimal_sub_def());
+        assert_eq!(sub.logical_task_count(), 1);
+        sub.replicas = 4;
+        assert_eq!(sub.logical_task_count(), 4);
+    }
+
+    #[test]
+    fn runtime_table_sub_pipeline_multi_replica() {
+        let mut sub_block = sub_pipeline_block(2, 1, 0, minimal_sub_def());
+        sub_block.replicas = 3;
+        let def = def_with(vec![block(1, 0, 0), sub_block], vec![conn(1, 2)]);
+        let rt = build_runtime_table(&def);
+        assert_eq!(rt.entries.len(), 4); // 1 regular + 3 sub-pipeline
+        let sub_rids = rt.logical_to_runtime.get(&2).unwrap();
+        assert_eq!(sub_rids.len(), 3);
+        for (i, &rid) in sub_rids.iter().enumerate() {
+            let info = &rt.entries[rid as usize];
+            assert_eq!(info.source_block_id, 2);
+            assert_eq!(info.replica_index, i as u32);
+            assert_eq!(info.filename_stem, format!("sub_b2_pipeline_r{}", i + 1));
+        }
+    }
+
+    #[test]
+    fn sub_pipeline_multi_replica_filename_passes_output_contract() {
+        let mut sub_block = sub_pipeline_block(1, 0, 0, minimal_sub_def());
+        sub_block.replicas = 2;
+        let def = def_with(vec![sub_block], vec![]);
+        let rt = build_runtime_table(&def);
+        for rid in rt.logical_to_runtime.get(&1).unwrap() {
+            let stem = &rt.entries[*rid as usize].filename_stem;
+            let filename = format!("{stem}.md");
+            assert!(
+                crate::post_run::is_pipeline_output_filename(&filename),
+                "Multi-replica sub-pipeline filename '{filename}' must pass is_pipeline_output_filename",
+            );
+            let loop_filename = format!("{stem}_loop3.md");
+            assert!(
+                crate::post_run::is_pipeline_output_filename(&loop_filename),
+                "Loop variant '{loop_filename}' must pass is_pipeline_output_filename",
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_table_sub_pipeline_multi_replica_loop_filenames() {
+        let mut sub = sub_pipeline_block(2, 0, 0, minimal_sub_def());
+        sub.replicas = 2;
+        let def = def_with(vec![block(1, 0, 0), sub], vec![conn(1, 2)]);
+        let rt = build_runtime_table(&def);
+        let rids = rt.logical_to_runtime.get(&2).unwrap();
+        assert_eq!(
+            loop_replica_filename(&rt.entries[rids[0] as usize], 0),
+            "sub_b2_pipeline_r1.md"
+        );
+        assert_eq!(
+            loop_replica_filename(&rt.entries[rids[1] as usize], 2),
+            "sub_b2_pipeline_r2_loop2.md"
+        );
+    }
+
+    #[test]
+    fn scatter_source_multi_replica_sub_pipeline_rejected() {
+        let mut source = sub_pipeline_block(1, 0, 0, minimal_sub_def());
+        source.replicas = 2; // logical_task_count() == 2
+        let target = block(2, 1, 0);
+        let mut c = PipelineConnection::new(1, 2);
+        c.scatter = true;
+        let def = PipelineDefinition {
+            initial_prompt: "test".into(),
+            blocks: vec![source, target],
+            connections: vec![c],
+            session_configs: Vec::new(),
+            loop_connections: Vec::new(),
+            finalization_blocks: Vec::new(),
+            finalization_connections: Vec::new(),
+            data_feeds: Vec::new(),
+        };
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("logical_task_count"));
     }
 }

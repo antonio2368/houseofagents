@@ -459,6 +459,10 @@ pub(crate) struct PipelineState {
     pub(crate) pipeline_scatter_edit_conn_idx: usize,
     /// True when editing a newly enabled scatter (Esc reverts), false for re-edit (Esc cancels).
     pub(crate) pipeline_scatter_edit_is_new: bool,
+    pub(crate) pipeline_replica_edit: bool,
+    pub(crate) pipeline_replica_edit_buf: String,
+    pub(crate) pipeline_replica_edit_block: Option<BlockId>,
+    pub(crate) pipeline_replica_edit_fresh: bool,
 }
 
 pub(crate) struct PendingSingleExecution {
@@ -1612,6 +1616,10 @@ impl PipelineState {
             pipeline_scatter_delimiter_cursor: 0,
             pipeline_scatter_edit_conn_idx: 0,
             pipeline_scatter_edit_is_new: false,
+            pipeline_replica_edit: false,
+            pipeline_replica_edit_buf: String::new(),
+            pipeline_replica_edit_block: None,
+            pipeline_replica_edit_fresh: false,
         }
     }
 }

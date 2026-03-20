@@ -208,6 +208,9 @@ pub fn draw(f: &mut Frame, app: &App) {
     if app.pipeline.pipeline_scatter_edit {
         draw_scatter_edit_popup(f, app, area);
     }
+    if app.pipeline.pipeline_replica_edit {
+        draw_replica_edit_popup(f, app, area);
+    }
     if app.help_popup.active {
         let tab = app.help_popup.tab;
         let name = help::PIPELINE_TAB_NAMES[tab];
@@ -304,6 +307,7 @@ fn draw_prompt_area(f: &mut Frame, app: &App, area: Rect) {
         || app.pipeline.pipeline_show_feed_edit
         || app.pipeline.pipeline_show_feed_list
         || app.pipeline.pipeline_scatter_edit
+        || app.pipeline.pipeline_replica_edit
         || app.error_modal.is_some()
         || app.info_modal.is_some()
         || app.help_popup.active
@@ -2979,6 +2983,54 @@ fn draw_scatter_edit_popup(f: &mut Frame, app: &App, area: Rect) {
     };
     let hint = Paragraph::new(hint_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(hint, chunks[3]);
+}
+
+fn draw_replica_edit_popup(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(35, 15, area);
+    f.render_widget(Clear, popup);
+
+    let block_name = app
+        .pipeline
+        .pipeline_replica_edit_block
+        .and_then(|bid| {
+            app.pipeline
+                .pipeline_def
+                .blocks
+                .iter()
+                .chain(app.pipeline.pipeline_def.finalization_blocks.iter())
+                .find(|b| b.id == bid)
+        })
+        .map(|b| b.name.as_str())
+        .unwrap_or("?");
+    let title = format!(" Replicas \u{2014} {block_name} ");
+
+    let block_widget = Block::default()
+        .title(title.as_str())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightCyan));
+    let inner = block_widget.inner(popup);
+    f.render_widget(block_widget, popup);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // input
+            Constraint::Length(1), // gap
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    let buf = &app.pipeline.pipeline_replica_edit_buf;
+    let visible =
+        Paragraph::new(buf.as_str()).style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    f.render_widget(visible, chunks[0]);
+
+    let char_offset = buf.chars().count() as u16;
+    f.set_cursor_position((chunks[0].x + char_offset, chunks[0].y));
+
+    let hint = Paragraph::new("Enter=save  Esc=cancel  \u{2191}\u{2193}=adjust")
+        .style(Style::default().fg(Color::DarkGray));
+    f.render_widget(hint, chunks[2]);
 }
 
 fn draw_feed_edit_popup(f: &mut Frame, app: &App, area: Rect) {

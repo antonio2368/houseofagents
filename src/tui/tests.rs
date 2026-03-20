@@ -4355,3 +4355,183 @@ fn n_key_opens_rename_popup_for_sub_pipeline_block() {
         "agents must remain empty after save"
     );
 }
+
+// ── Replica edit popup tests ──
+
+#[test]
+fn replica_edit_popup_open_and_save() {
+    use crate::execution::pipeline::PipelineBlock;
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+    app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+        id: 1,
+        name: "Test".into(),
+        agents: vec!["agent".into()],
+        prompt: String::new(),
+        profiles: vec![],
+        session_id: None,
+        position: (0, 0),
+        replicas: 1,
+        sub_pipeline: None,
+    });
+    app.pipeline.pipeline_next_id = 2;
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('r')));
+    assert!(app.pipeline.pipeline_replica_edit);
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "1");
+    assert!(app.pipeline.pipeline_replica_edit_fresh);
+    // First digit replaces the buffer (fresh behavior), not appends
+    handle_key(&mut app, key(KeyCode::Char('4')));
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "4");
+    assert!(!app.pipeline.pipeline_replica_edit_fresh);
+    // Second digit appends normally
+    handle_key(&mut app, key(KeyCode::Char('2')));
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "42");
+    // Backspace to get to just "4"
+    handle_key(&mut app, key(KeyCode::Backspace));
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(!app.pipeline.pipeline_replica_edit);
+    assert_eq!(app.pipeline.pipeline_def.blocks[0].replicas, 4);
+}
+
+#[test]
+fn replica_edit_popup_cancel() {
+    use crate::execution::pipeline::PipelineBlock;
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+    app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+        id: 1,
+        name: "Test".into(),
+        agents: vec!["agent".into()],
+        prompt: String::new(),
+        profiles: vec![],
+        session_id: None,
+        position: (0, 0),
+        replicas: 2,
+        sub_pipeline: None,
+    });
+    app.pipeline.pipeline_next_id = 2;
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('r')));
+    handle_key(&mut app, key(KeyCode::Char('9')));
+    handle_key(&mut app, key(KeyCode::Esc));
+    assert!(!app.pipeline.pipeline_replica_edit);
+    assert_eq!(app.pipeline.pipeline_def.blocks[0].replicas, 2); // unchanged
+}
+
+#[test]
+fn replica_edit_popup_sub_pipeline_max_32() {
+    use crate::execution::pipeline::{PipelineBlock, PipelineDefinition};
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+    app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+        id: 1,
+        name: "MySub".into(),
+        agents: vec![],
+        prompt: String::new(),
+        profiles: vec![],
+        session_id: None,
+        position: (0, 0),
+        replicas: 1,
+        sub_pipeline: Some(PipelineDefinition::default()),
+    });
+    app.pipeline.pipeline_next_id = 2;
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('r')));
+    handle_key(&mut app, key(KeyCode::Backspace));
+    handle_key(&mut app, key(KeyCode::Char('9')));
+    handle_key(&mut app, key(KeyCode::Char('9')));
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(app.pipeline.pipeline_def.blocks[0].replicas, 32); // clamped
+}
+
+#[test]
+fn discover_final_outputs_sub_pipeline_multi_replica() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude.md"), "block 1").unwrap();
+    fs::write(dir.path().join("sub_b2_pipeline_r1.md"), "replica 1").unwrap();
+    fs::write(dir.path().join("sub_b2_pipeline_r2.md"), "replica 2").unwrap();
+    let files = discover_final_outputs(dir.path(), crate::execution::ExecutionMode::Pipeline, &[]);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"sub_b2_pipeline_r1.md"));
+    assert!(names.contains(&"sub_b2_pipeline_r2.md"));
+    assert_eq!(files.len(), 3);
+}
+
+#[tokio::test]
+async fn discover_final_outputs_async_sub_pipeline_multi_replica() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("sub_b2_pipeline_r1.md"), "replica 1").unwrap();
+    fs::write(dir.path().join("sub_b2_pipeline_r2.md"), "replica 2").unwrap();
+    let files =
+        discover_final_outputs_async(dir.path(), crate::execution::ExecutionMode::Pipeline, &[])
+            .await;
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"sub_b2_pipeline_r1.md"));
+    assert!(names.contains(&"sub_b2_pipeline_r2.md"));
+    assert_eq!(files.len(), 2);
+}
+
+#[test]
+fn replica_edit_paste_respects_fresh_flag() {
+    use crate::execution::pipeline::PipelineBlock;
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+    app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+        id: 1,
+        name: "Test".into(),
+        agents: vec!["agent".into()],
+        prompt: String::new(),
+        profiles: vec![],
+        session_id: None,
+        position: (0, 0),
+        replicas: 1,
+        sub_pipeline: None,
+    });
+    app.pipeline.pipeline_next_id = 2;
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('r')));
+    assert!(app.pipeline.pipeline_replica_edit_fresh);
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "1");
+    // Paste "4" while fresh — should replace "1" with "4", not append to "14"
+    handle_paste(&mut app, "4");
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "4");
+    assert!(!app.pipeline.pipeline_replica_edit_fresh);
+    // Second paste appends normally
+    handle_paste(&mut app, "2");
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "42");
+}
+
+#[test]
+fn replica_edit_up_arrow_respects_per_block_max() {
+    use crate::execution::pipeline::PipelineBlock;
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+    // Block with 4 agents — max replicas = 32/4 = 8
+    app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+        id: 1,
+        name: "Test".into(),
+        agents: vec!["a1".into(), "a2".into(), "a3".into(), "a4".into()],
+        prompt: String::new(),
+        profiles: vec![],
+        session_id: None,
+        position: (0, 0),
+        replicas: 7,
+        sub_pipeline: None,
+    });
+    app.pipeline.pipeline_next_id = 2;
+    app.pipeline.pipeline_block_cursor = Some(1);
+    handle_key(&mut app, key(KeyCode::Char('r')));
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "7");
+    // Up once: 7 → 8 (at max for 4-agent block)
+    handle_key(&mut app, key(KeyCode::Up));
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "8");
+    // Up again: should stay at 8 (clamped to 32/4)
+    handle_key(&mut app, key(KeyCode::Up));
+    assert_eq!(app.pipeline.pipeline_replica_edit_buf, "8");
+}

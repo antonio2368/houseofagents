@@ -355,6 +355,7 @@ Fields vary by mode for options, but every prompt flow includes Prompt, Session 
 | `a` | Add a new block |
 | `d` | Delete selected block |
 | `e` | Edit selected block (name, agents, prompt, session ID, replicas) |
+| `r` | Edit replica count for selected block (quick popup) |
 | `c` | Enter connect mode — select a second block to create a connection |
 | `x` | Enter connection-action mode — pick a connection to delete (`Enter`) or toggle scatter (`s`) |
 | `o` | Create loop-back connection — press on the downstream feedback block, then select the upstream restart target; set count and prompt; press on existing loop to edit |
@@ -376,9 +377,9 @@ Fields vary by mode for options, but every prompt flow includes Prompt, Session 
 
 Inside the **edit popup**: `Tab` cycles between Name, Agents (multiselect list — `Up`/`Down` to navigate, `Space` to toggle), Profiles (multiselect list of reusable instruction files), Prompt (text area), Session ID, and Replicas fields. `Esc` closes the popup. Each block can have one or more agents selected. Setting Replicas > 1 spawns that many copies per agent. Total tasks per block = agents × replicas (max 32).
 
-**Sub-pipeline blocks**: Press `p` to create a sub-pipeline block. Press `Enter` or `e` to drill into it and edit its inner DAG. Press `Esc` to pop back to the parent. Sub-pipelines execute as a single opaque unit — the inner DAG's terminal finalization block output becomes the sub-pipeline's output to the parent pipeline. Limitations: one level of nesting only (sub-pipelines cannot contain sub-pipelines), the inner pipeline must have exactly one finalization leaf with a single agent and `replicas = 1`. Save (Ctrl+S) and Run (F5) are disabled while inside a sub-pipeline. Tab cycles between the initial prompt and the builder canvas.
+**Sub-pipeline blocks**: Press `p` to create a sub-pipeline block. Press `Enter` or `e` to drill into it and edit its inner DAG. Press `Esc` to pop back to the parent. Sub-pipelines execute as opaque units. The parent block can have replicas > 1, in which case each replica runs an independent copy of the inner DAG with its own sub-run directory. The inner DAG's terminal finalization block output becomes the sub-pipeline's output to the parent pipeline. Limitations: one level of nesting only (sub-pipelines cannot contain sub-pipelines), the inner pipeline must have exactly one finalization leaf with a single agent and `replicas = 1`. Save (Ctrl+S) and Run (F5) are disabled while inside a sub-pipeline. Tab cycles between the initial prompt and the builder canvas.
 
-**Scatter connections**: A scatter connection splits an upstream block's output into discrete work items using a configurable delimiter (default `===SCATTER_ITEM===`) and distributes them across replicas of the downstream block. To toggle scatter: press `x` to enter connection-action mode, navigate to the connection, and press `s`. Each replica pops one item at a time from an in-memory queue. Combine with a loop connection for full queue drain — replicas keep processing items until the queue is empty, at which point the loop terminates automatically (loop count acts as a safety cap). The scatter target must be the loop's restart block (the block the loop feeds back into). Scatter wires render as dashed lines (`╌╎`) in cyan. Constraints: source must have exactly 1 agent and 1 replica, target cannot be a sub-pipeline block, max 1 scatter input per block.
+**Scatter connections**: A scatter connection splits an upstream block's output into discrete work items using a configurable delimiter (default `===SCATTER_ITEM===`) and distributes them across replicas of the downstream block. To toggle scatter: press `x` to enter connection-action mode, navigate to the connection, and press `s`. Each replica pops one item at a time from an in-memory queue. Combine with a loop connection for full queue drain — replicas keep processing items until the queue is empty, at which point the loop terminates automatically (loop count acts as a safety cap). The scatter target must be the loop's restart block (the block the loop feeds back into). Sub-pipeline blocks can be scatter targets (each replica receives one work item). Scatter wires render as dashed lines (`╌╎`) in cyan. Constraints: source must have exactly 1 logical task (1 agent × 1 replica, or a single-replica sub-pipeline), max 1 scatter input per block.
 
 ### Order Screen (relay with 2+ agents)
 
@@ -470,6 +471,23 @@ my_session/
     InnerBlock_b100_Gemini.md         # Inner execution block
     finalization/
       Consolidate_b200_Claude.md      # Terminal output → parent pipeline
+```
+
+With `replicas > 1`, each replica creates its own sub-directory and parent-level output:
+
+```
+my_session/
+  Analyzer_b1_Claude.md
+  sub_b2_pipeline_r1.md               # Replica 1 parent-level output
+  sub_b2_pipeline_r2.md               # Replica 2 parent-level output
+  sub_2_r1/                            # Replica 1 inner artifacts
+    InnerBlock_b100_Gemini.md
+    finalization/
+      Consolidate_b200_Claude.md
+  sub_2_r2/                            # Replica 2 inner artifacts
+    InnerBlock_b100_Gemini.md
+    finalization/
+      Consolidate_b200_Claude.md
 ```
 
 Loop-back connections create iterative refinement cycles. `from` is the downstream feedback source and `to` is the upstream restart target. All blocks on regular-graph paths between the two endpoints form the loop sub-DAG and re-run on each pass. In saved pipeline TOML files they appear as:
