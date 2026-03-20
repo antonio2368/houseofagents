@@ -154,7 +154,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         ])
         .split(area);
 
-    draw_title(f, chunks[0]);
+    draw_title(f, app, chunks[0]);
     draw_prompt_area(f, app, chunks[1]);
     draw_canvas(f, app, chunks[2]);
     draw_help_bar(f, app, chunks[3]);
@@ -195,9 +195,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     // Error/info modals are rendered globally by screen::draw()
 }
 
-fn draw_title(f: &mut Frame, area: Rect) {
+fn draw_title(f: &mut Frame, app: &App, area: Rect) {
+    let title = if let Some(entry) = app.pipeline.sub_pipeline_stack.last() {
+        format!(" Pipeline > {} ", entry.name)
+    } else {
+        " Custom Pipeline ".to_string()
+    };
     let block = Block::default()
-        .title(" Custom Pipeline ")
+        .title(title)
         .title_alignment(ratatui::layout::Alignment::Center)
         .borders(Borders::ALL)
         .border_style(
@@ -413,6 +418,49 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         let is_connect_src = app.pipeline.pipeline_connecting_from == Some(block.id);
         let is_loop_connect_src = app.pipeline.pipeline_loop_connecting_from == Some(block.id);
 
+        // Sub-pipeline blocks: special rendering
+        if block.is_sub_pipeline() {
+            let border_type = if is_selected {
+                BorderType::Double
+            } else {
+                BorderType::Thick
+            };
+            let border_color = if is_connect_src {
+                Color::Green
+            } else {
+                Color::LightCyan
+            };
+            let title = format!(
+                " [{}] ",
+                if block.name.is_empty() {
+                    "Sub-Pipeline"
+                } else {
+                    &block.name
+                }
+            );
+            let block_widget = Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .border_style(Style::default().fg(border_color));
+            let inner = block_widget.inner(block_area);
+            f.render_widget(block_widget, block_area);
+
+            if inner.height > 0 && inner.width > 0 {
+                let sub = block.sub_pipeline.as_ref().unwrap();
+                let count_text = format!("{} blocks", sub.blocks.len());
+                let line1 = truncate_chars(&count_text, inner.width as usize);
+                let p = Paragraph::new(Span::styled(line1, Style::default().fg(Color::White)));
+                f.render_widget(p, Rect::new(inner.x, inner.y, inner.width, 1));
+            }
+            if inner.height > 1 && inner.width > 0 {
+                let hint = truncate_chars("Enter to edit", inner.width as usize);
+                let p = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+                f.render_widget(p, Rect::new(inner.x, inner.y + 1, inner.width, 1));
+            }
+            continue;
+        }
+
         let border_type = if is_selected {
             BorderType::Double
         } else {
@@ -431,7 +479,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         } else {
             block.name.clone()
         };
-        let total_tasks = block.agents.len() as u32 * block.replicas;
+        let total_tasks = block.logical_task_count();
         let title = if total_tasks > 1 {
             format!(" {base_title} \u{00d7}{total_tasks} ")
         } else {
@@ -855,7 +903,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 block.name.clone()
             };
-            let total_tasks = block.agents.len() as u32 * block.replicas;
+            let total_tasks = block.logical_task_count();
             let title = if total_tasks > 1 {
                 format!(" {base_title} \u{00d7}{total_tasks} ")
             } else {
@@ -1535,7 +1583,7 @@ pub(crate) fn render_dag_readonly(
         } else {
             block.name.clone()
         };
-        let total_tasks = block.agents.len() as u32 * block.replicas;
+        let total_tasks = block.logical_task_count();
         let title = if total_tasks > 1 {
             format!(" {base_title} \u{00d7}{total_tasks} ")
         } else {
@@ -1821,17 +1869,67 @@ fn collapse_summary(names: &[&str], max_width: usize, empty_label: &str) -> Stri
 }
 
 fn draw_edit_popup(f: &mut Frame, app: &App, area: Rect) {
-    let popup = centered_rect(60, 80, area);
+    let is_sub = app
+        .pipeline
+        .pipeline_block_cursor
+        .and_then(|sel| {
+            app.pipeline
+                .pipeline_def
+                .blocks
+                .iter()
+                .find(|b| b.id == sel)
+        })
+        .is_some_and(|b| b.is_sub_pipeline());
+
+    let popup = if is_sub {
+        centered_rect(50, 30, area)
+    } else {
+        centered_rect(60, 80, area)
+    };
     f.render_widget(Clear, popup);
 
+    let title = if is_sub {
+        " Rename Sub-Pipeline "
+    } else {
+        " Edit Block "
+    };
     let block = Block::default()
-        .title(" Edit Block ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
-    if inner.width < 10 || inner.height < 10 {
+    if inner.width < 10 || inner.height < 4 {
+        return;
+    }
+
+    // Sub-pipeline blocks: show only Name + hint
+    if is_sub {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2), // Name
+                Constraint::Length(1), // spacer
+                Constraint::Length(1), // hint
+            ])
+            .split(inner);
+        let name_line = Line::from(vec![
+            Span::styled("Name: ", Style::default().fg(Color::White)),
+            Span::styled("[", Style::default().fg(Color::Cyan)),
+            Span::raw(&app.pipeline.pipeline_edit_name_buf),
+            Span::styled("]", Style::default().fg(Color::Cyan)),
+        ]);
+        f.render_widget(Paragraph::new(name_line), chunks[0]);
+        let hint = Line::from(Span::styled(
+            "Enter: save | Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(Paragraph::new(hint), chunks[2]);
+        return;
+    }
+
+    if inner.height < 10 {
         return;
     }
 
@@ -2976,6 +3074,7 @@ mod routing_tests {
             session_id: None,
             position: (col, row),
             replicas: 1,
+            sub_pipeline: None,
         }
     }
 

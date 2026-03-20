@@ -1484,6 +1484,7 @@ fn pipeline_move_selected_block_moves_into_empty_cell() {
         session_id: None,
         position: (2, 2),
         replicas: 1,
+        sub_pipeline: None,
     }];
     app.pipeline.pipeline_block_cursor = Some(1);
 
@@ -1506,6 +1507,7 @@ fn pipeline_move_selected_block_swaps_when_target_occupied() {
             session_id: None,
             position: (2, 2),
             replicas: 1,
+            sub_pipeline: None,
         },
         pipeline_mod::PipelineBlock {
             id: 2,
@@ -1516,6 +1518,7 @@ fn pipeline_move_selected_block_swaps_when_target_occupied() {
             session_id: None,
             position: (3, 2),
             replicas: 1,
+            sub_pipeline: None,
         },
     ];
     app.pipeline.pipeline_block_cursor = Some(1);
@@ -1553,6 +1556,7 @@ fn pipeline_builder_arrow_navigates_shift_arrow_moves_block() {
             session_id: None,
             position: (2, 2),
             replicas: 1,
+            sub_pipeline: None,
         },
         pipeline_mod::PipelineBlock {
             id: 2,
@@ -1563,6 +1567,7 @@ fn pipeline_builder_arrow_navigates_shift_arrow_moves_block() {
             session_id: None,
             position: (3, 2),
             replicas: 1,
+            sub_pipeline: None,
         },
     ];
     app.pipeline.pipeline_block_cursor = Some(1);
@@ -1704,6 +1709,7 @@ fn pipeline_app_with_block() -> App {
         session_id: None,
         position: (0, 0),
         replicas: 1,
+        sub_pipeline: None,
     });
     app.pipeline.pipeline_block_cursor = Some(1);
     app.pipeline.pipeline_next_id = 2;
@@ -2136,6 +2142,7 @@ fn pipeline_step_labels_expands_replicas() {
                 session_id: None,
                 position: (0, 0),
                 replicas: 3,
+                sub_pipeline: None,
             },
             PipelineBlock {
                 id: 2,
@@ -2146,6 +2153,7 @@ fn pipeline_step_labels_expands_replicas() {
                 session_id: None,
                 position: (1, 0),
                 replicas: 1,
+                sub_pipeline: None,
             },
         ],
         connections: vec![],
@@ -2178,6 +2186,7 @@ fn pipeline_step_labels_unnamed_blocks_no_agent_duplication() {
             session_id: None,
             position: (0, 0),
             replicas: 1,
+            sub_pipeline: None,
         }],
         connections: vec![],
         session_configs: vec![],
@@ -2206,6 +2215,7 @@ fn pipeline_step_labels_multi_agent_no_duplication() {
             session_id: None,
             position: (0, 0),
             replicas: 1,
+            sub_pipeline: None,
         }],
         connections: vec![],
         session_configs: vec![],
@@ -2239,6 +2249,7 @@ fn pipeline_app_with_two_blocks() -> App {
         session_id: None,
         position: (0, 0),
         replicas: 1,
+        sub_pipeline: None,
     });
     app.pipeline.pipeline_def.blocks.push(PipelineBlock {
         id: 2,
@@ -2249,6 +2260,7 @@ fn pipeline_app_with_two_blocks() -> App {
         session_id: None,
         position: (1, 0),
         replicas: 1,
+        sub_pipeline: None,
     });
     app.pipeline.pipeline_block_cursor = Some(1);
     app.pipeline.pipeline_next_id = 3;
@@ -2620,6 +2632,7 @@ fn setup_analysis_prompt_pipeline() {
             session_id: None,
             position: (0, 0),
             replicas: 1,
+            sub_pipeline: None,
         },
         PipelineBlock {
             id: 2,
@@ -2630,6 +2643,7 @@ fn setup_analysis_prompt_pipeline() {
             session_id: Some("shared-1".into()),
             position: (1, 0),
             replicas: 1,
+            sub_pipeline: None,
         },
     ];
     app.pipeline.pipeline_def.connections = vec![PipelineConnection { from: 1, to: 2 }];
@@ -2663,6 +2677,7 @@ fn setup_analysis_prompt_pipeline_with_replicas() {
         session_id: None,
         position: (0, 0),
         replicas: 3,
+        sub_pipeline: None,
     }];
 
     let prompt = build_setup_analysis_prompt(&app);
@@ -2859,6 +2874,7 @@ fn setup_analysis_pipeline_agent_invalid_runtime() {
         session_id: None,
         position: (0, 0),
         replicas: 1,
+        sub_pipeline: None,
     }];
     start_setup_analysis(&mut app);
     assert!(app.setup_analysis.active);
@@ -2910,6 +2926,7 @@ fn setup_analysis_invalid_pipeline() {
         session_id: None,
         position: (0, 0),
         replicas: 1,
+        sub_pipeline: None,
     }];
     // Self-edge
     app.pipeline.pipeline_def.connections = vec![PipelineConnection { from: 1, to: 1 }];
@@ -2943,6 +2960,7 @@ fn setup_analysis_empty_pipeline_initial_prompt() {
         session_id: None,
         position: (0, 0),
         replicas: 1,
+        sub_pipeline: None,
     }];
     app.pipeline.pipeline_def.initial_prompt.clear();
     start_setup_analysis(&mut app);
@@ -2976,6 +2994,7 @@ fn setup_analysis_pipeline_unavailable_agent() {
         session_id: None,
         position: (0, 0),
         replicas: 1,
+        sub_pipeline: None,
     }];
     start_setup_analysis(&mut app);
     assert!(app.setup_analysis.active);
@@ -3074,6 +3093,7 @@ fn test_delete_internal_block_prunes_loop() {
             session_id: None,
             position: (0, 0),
             replicas: 1,
+            sub_pipeline: None,
         },
         PipelineBlock {
             id: 2,
@@ -3084,6 +3104,7 @@ fn test_delete_internal_block_prunes_loop() {
             session_id: None,
             position: (1, 0),
             replicas: 1,
+            sub_pipeline: None,
         },
         PipelineBlock {
             id: 3,
@@ -3094,6 +3115,7 @@ fn test_delete_internal_block_prunes_loop() {
             session_id: None,
             position: (2, 0),
             replicas: 1,
+            sub_pipeline: None,
         },
     ];
     app.pipeline.pipeline_def.connections = vec![
@@ -3611,6 +3633,7 @@ fn pipeline_app_with_fin_and_feeds(n: usize) -> App {
             session_id: None,
             position: ((i - 1) as u16, 0),
             replicas: 1,
+            sub_pipeline: None,
         });
         app.pipeline.pipeline_def.data_feeds.push(DataFeed {
             from: i as u32,
@@ -3632,6 +3655,7 @@ fn pipeline_app_with_fin_and_feeds(n: usize) -> App {
             session_id: None,
             position: (0, 1),
             replicas: 1,
+            sub_pipeline: None,
         });
 
     app.pipeline.pipeline_block_cursor = Some(fin_id);
@@ -3888,6 +3912,7 @@ fn canvas_f_on_exec_with_multi_feeds_shows_error() {
             session_id: None,
             position: (1, 1),
             replicas: 1,
+            sub_pipeline: None,
         });
     app.pipeline.pipeline_def.data_feeds.push(DataFeed {
         from: 1,
@@ -4179,5 +4204,93 @@ fn progress_normalization_does_not_leak_across_modes() {
         app.completed_steps(),
         1,
         "completed_steps must not be inflated by stale expected_total_steps"
+    );
+}
+
+#[test]
+fn discover_final_outputs_sub_pipeline_filename() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Analyzer_b1_Claude.md"), "block 1").unwrap();
+    fs::write(dir.path().join("sub_b2_pipeline.md"), "sub output").unwrap();
+
+    let files = discover_final_outputs(dir.path(), ExecutionMode::Pipeline, &[]);
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"sub_b2_pipeline.md"),
+        "should discover sub-pipeline output file: {names:?}"
+    );
+    assert_eq!(files.len(), 2);
+}
+
+#[tokio::test]
+async fn discover_final_outputs_async_sub_pipeline_loop_variants() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("sub_b3_pipeline.md"), "pass 0").unwrap();
+    fs::write(dir.path().join("sub_b3_pipeline_loop1.md"), "pass 1").unwrap();
+    fs::write(dir.path().join("sub_b3_pipeline_loop2.md"), "pass 2").unwrap();
+
+    let files = discover_final_outputs_async(dir.path(), ExecutionMode::Pipeline, &[]).await;
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"sub_b3_pipeline_loop2.md"),
+        "should keep highest loop pass for sub-pipeline: {names:?}"
+    );
+    assert!(
+        !names.contains(&"sub_b3_pipeline.md"),
+        "loop dedup should exclude base: {names:?}"
+    );
+    assert!(
+        !names.contains(&"sub_b3_pipeline_loop1.md"),
+        "loop dedup should exclude lower passes: {names:?}"
+    );
+    assert_eq!(files.len(), 1);
+}
+
+#[test]
+fn n_key_opens_rename_popup_for_sub_pipeline_block() {
+    use crate::execution::pipeline::{PipelineBlock, PipelineDefinition};
+    let mut app = test_app();
+    app.screen = Screen::Pipeline;
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+    app.pipeline.pipeline_def.blocks.push(PipelineBlock {
+        id: 1,
+        name: "MySub".into(),
+        agents: vec![],
+        prompt: String::new(),
+        profiles: vec![],
+        session_id: None,
+        position: (0, 0),
+        replicas: 1,
+        sub_pipeline: Some(PipelineDefinition::default()),
+    });
+    app.pipeline.pipeline_block_cursor = Some(1);
+    app.pipeline.pipeline_next_id = 2;
+
+    // 'n' on sub-pipeline block opens name-only edit popup
+    handle_key(&mut app, key(KeyCode::Char('n')));
+    assert!(app.pipeline.pipeline_show_edit, "edit popup should open");
+    assert_eq!(
+        app.pipeline.pipeline_edit_field,
+        PipelineEditField::Name,
+        "edit field should be Name"
+    );
+    assert_eq!(app.pipeline.pipeline_edit_name_buf, "MySub");
+
+    // Tab should NOT cycle to Agent (stays on Name for sub-pipelines)
+    handle_key(&mut app, key(KeyCode::Tab));
+    assert_eq!(
+        app.pipeline.pipeline_edit_field,
+        PipelineEditField::Name,
+        "Tab should not cycle for sub-pipeline blocks"
+    );
+
+    // Type a new name, confirm with Enter — only name should change
+    app.pipeline.pipeline_edit_name_buf = "Renamed".into();
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(!app.pipeline.pipeline_show_edit, "popup should close");
+    assert_eq!(app.pipeline.pipeline_def.blocks[0].name, "Renamed");
+    assert!(
+        app.pipeline.pipeline_def.blocks[0].agents.is_empty(),
+        "agents must remain empty after save"
     );
 }

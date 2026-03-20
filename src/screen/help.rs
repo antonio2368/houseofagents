@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use std::sync::LazyLock;
 
-pub const PIPELINE_TAB_COUNT: usize = 7;
+pub const PIPELINE_TAB_COUNT: usize = 8;
 pub const PIPELINE_TAB_NAMES: [&str; PIPELINE_TAB_COUNT] = [
     "Overview",
     "Canvas Navigation",
@@ -17,6 +17,7 @@ pub const PIPELINE_TAB_NAMES: [&str; PIPELINE_TAB_COUNT] = [
     "Sessions",
     "Prompt & Settings",
     "Finalization",
+    "Sub-Pipelines",
 ];
 
 // ---------------------------------------------------------------------------
@@ -526,6 +527,45 @@ pub fn pipeline_help_lines(tab: usize) -> &'static [Line<'static>] {
                 Line::from("  allowed — use data feeds instead."),
                 Line::from(""),
                 Line::from("  Loops (o) are only available for execution blocks."),
+                Line::from(""),
+            ],
+            // Tab 7: Sub-Pipelines
+            vec![
+                Line::from(Span::styled("Sub-Pipelines", h)),
+                Line::from(""),
+                Line::from("  A sub-pipeline block contains a full inner pipeline DAG"),
+                Line::from("  that executes as a single opaque unit within the parent."),
+                Line::from(""),
+                Line::from(Span::styled("  Keys", h)),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  p", k),
+                    Span::raw(": Create a new sub-pipeline block at the next position"),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Enter/e", k),
+                    Span::raw(": Drill into the sub-pipeline to edit its inner DAG"),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Esc", k),
+                    Span::raw(": Pop back out to the parent pipeline"),
+                ]),
+                Line::from(vec![
+                    Span::styled("  n", k),
+                    Span::raw(": Rename the sub-pipeline block"),
+                ]),
+                Line::from(""),
+                Line::from(Span::styled("  Rules", h)),
+                Line::from(""),
+                Line::from("  One level of nesting only — sub-pipelines cannot"),
+                Line::from("  contain sub-pipelines."),
+                Line::from(""),
+                Line::from("  A sub-pipeline must have exactly one finalization leaf"),
+                Line::from("  block with a single agent and replicas=1. That block's"),
+                Line::from("  output becomes the sub-pipeline's output to the parent."),
+                Line::from(""),
+                Line::from("  Save/Load (Ctrl+S/Ctrl+L), Run (F5), and Tab"),
+                Line::from("  switching are disabled inside a sub-pipeline."),
                 Line::from(""),
             ],
         ]

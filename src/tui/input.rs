@@ -691,27 +691,35 @@ pub(super) fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
     // Normal pipeline keys
     match key.code {
         KeyCode::Esc => {
-            sync_pipeline_runs_buf(app);
-            sync_pipeline_concurrency_buf(app);
-            app.screen = Screen::Home;
+            if !app.pipeline.sub_pipeline_stack.is_empty() {
+                pop_sub_pipeline_context(app);
+            } else {
+                sync_pipeline_runs_buf(app);
+                sync_pipeline_concurrency_buf(app);
+                app.screen = Screen::Home;
+            }
         }
         KeyCode::Tab => {
-            app.pipeline.pipeline_focus = match app.pipeline.pipeline_focus {
-                PipelineFocus::InitialPrompt => PipelineFocus::SessionName,
-                PipelineFocus::SessionName => PipelineFocus::Runs,
-                PipelineFocus::Runs => PipelineFocus::Concurrency,
-                PipelineFocus::Concurrency => PipelineFocus::Builder,
-                PipelineFocus::Builder => PipelineFocus::InitialPrompt,
-            };
+            if app.pipeline.sub_pipeline_stack.is_empty() {
+                app.pipeline.pipeline_focus = match app.pipeline.pipeline_focus {
+                    PipelineFocus::InitialPrompt => PipelineFocus::SessionName,
+                    PipelineFocus::SessionName => PipelineFocus::Runs,
+                    PipelineFocus::Runs => PipelineFocus::Concurrency,
+                    PipelineFocus::Concurrency => PipelineFocus::Builder,
+                    PipelineFocus::Builder => PipelineFocus::InitialPrompt,
+                };
+            }
         }
         KeyCode::BackTab => {
-            app.pipeline.pipeline_focus = match app.pipeline.pipeline_focus {
-                PipelineFocus::InitialPrompt => PipelineFocus::Builder,
-                PipelineFocus::SessionName => PipelineFocus::InitialPrompt,
-                PipelineFocus::Runs => PipelineFocus::SessionName,
-                PipelineFocus::Concurrency => PipelineFocus::Runs,
-                PipelineFocus::Builder => PipelineFocus::Concurrency,
-            };
+            if app.pipeline.sub_pipeline_stack.is_empty() {
+                app.pipeline.pipeline_focus = match app.pipeline.pipeline_focus {
+                    PipelineFocus::InitialPrompt => PipelineFocus::Builder,
+                    PipelineFocus::SessionName => PipelineFocus::InitialPrompt,
+                    PipelineFocus::Runs => PipelineFocus::SessionName,
+                    PipelineFocus::Concurrency => PipelineFocus::Runs,
+                    PipelineFocus::Builder => PipelineFocus::Concurrency,
+                };
+            }
         }
         KeyCode::Char('?')
             if !ctrl
@@ -724,6 +732,9 @@ pub(super) fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
         }
         // Ctrl+S: save — always open dialog, prefill with current name
         KeyCode::Char('s') if ctrl => {
+            if !app.pipeline.sub_pipeline_stack.is_empty() {
+                return;
+            }
             app.pipeline.pipeline_file_dialog = Some(PipelineDialogMode::Save);
             app.pipeline.pipeline_file_input = app
                 .pipeline
@@ -755,6 +766,9 @@ pub(super) fn handle_pipeline_key(app: &mut App, key: KeyEvent) {
         }
         // F5: run
         KeyCode::F(5) => {
+            if !app.pipeline.sub_pipeline_stack.is_empty() {
+                return;
+            }
             start_pipeline_execution(app);
         }
         KeyCode::Char('e') if ctrl => {
@@ -869,6 +883,7 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     session_id: None,
                     position: pos,
                     replicas: 1,
+                    sub_pipeline: None,
                 });
             app.pipeline.pipeline_block_cursor = Some(id);
             pipeline_ensure_visible(app);
@@ -896,6 +911,32 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                     session_id: None,
                     position: pos,
                     replicas: 1,
+                    sub_pipeline: None,
+                });
+            app.pipeline.pipeline_block_cursor = Some(id);
+            pipeline_ensure_visible(app);
+        }
+        KeyCode::Char('p') => {
+            // Add sub-pipeline block (disabled inside sub-pipelines)
+            if !app.pipeline.sub_pipeline_stack.is_empty() {
+                return;
+            }
+            let pos = pipeline_mod::next_free_position(&app.pipeline.pipeline_def.blocks);
+            let id = app.pipeline.pipeline_next_id;
+            app.pipeline.pipeline_next_id += 1;
+            app.pipeline
+                .pipeline_def
+                .blocks
+                .push(pipeline_mod::PipelineBlock {
+                    id,
+                    name: format!("Sub#{id}"),
+                    agents: vec![],
+                    prompt: String::new(),
+                    profiles: vec![],
+                    session_id: None,
+                    position: pos,
+                    replicas: 1,
+                    sub_pipeline: Some(pipeline_mod::PipelineDefinition::default()),
                 });
             app.pipeline.pipeline_block_cursor = Some(id);
             pipeline_ensure_visible(app);
@@ -1048,8 +1089,36 @@ pub(super) fn handle_pipeline_builder_key(app: &mut App, key: KeyEvent) {
                 }
             }
         }
+        KeyCode::Char('n') => {
+            // Rename sub-pipeline block (name-only edit popup)
+            if let Some(sel) = app.pipeline.pipeline_block_cursor {
+                if let Some(block) = app
+                    .pipeline
+                    .pipeline_def
+                    .blocks
+                    .iter()
+                    .find(|b| b.id == sel && b.is_sub_pipeline())
+                {
+                    app.pipeline.pipeline_show_edit = true;
+                    app.pipeline.pipeline_edit_field = PipelineEditField::Name;
+                    app.pipeline.pipeline_edit_name_buf = block.name.clone();
+                    app.pipeline.pipeline_edit_name_cursor = block.name.len();
+                }
+            }
+        }
         KeyCode::Char('e') | KeyCode::Enter => {
             if let Some(sel) = app.pipeline.pipeline_block_cursor {
+                // Drill into sub-pipeline
+                if app
+                    .pipeline
+                    .pipeline_def
+                    .blocks
+                    .iter()
+                    .any(|b| b.id == sel && b.is_sub_pipeline())
+                {
+                    push_sub_pipeline_context(app, sel);
+                    return;
+                }
                 if let Some(block) = app
                     .pipeline
                     .pipeline_def
@@ -1483,6 +1552,63 @@ pub(super) fn pipeline_spatial_nav(app: &mut App, axis: NavAxis, negative: bool)
     }
 }
 
+fn push_sub_pipeline_context(app: &mut App, block_id: pipeline_mod::BlockId) {
+    let block = app
+        .pipeline
+        .pipeline_def
+        .blocks
+        .iter()
+        .find(|b| b.id == block_id)
+        .unwrap();
+    let name = block.name.clone();
+    let sub_def = block.sub_pipeline.clone().unwrap_or_default();
+    let max_id = sub_def
+        .blocks
+        .iter()
+        .chain(sub_def.finalization_blocks.iter())
+        .map(|b| b.id)
+        .max()
+        .unwrap_or(0);
+
+    let entry = crate::app::SubPipelineStackEntry {
+        name,
+        block_id,
+        parent_def: app.pipeline.pipeline_def.clone(),
+        parent_cursor: app.pipeline.pipeline_block_cursor,
+        parent_canvas_offset: app.pipeline.pipeline_canvas_offset,
+        parent_focus: app.pipeline.pipeline_focus,
+        parent_next_id: app.pipeline.pipeline_next_id,
+    };
+    app.pipeline.sub_pipeline_stack.push(entry);
+    app.pipeline.pipeline_def = sub_def;
+    app.pipeline.pipeline_next_id = max_id + 1;
+    app.pipeline.pipeline_block_cursor = app.pipeline.pipeline_def.blocks.first().map(|b| b.id);
+    app.pipeline.pipeline_canvas_offset = (0, 0);
+    app.pipeline.pipeline_focus = PipelineFocus::Builder;
+}
+
+fn pop_sub_pipeline_context(app: &mut App) {
+    let entry = app.pipeline.sub_pipeline_stack.pop().unwrap();
+    let edited_sub_def = app.pipeline.pipeline_def.clone();
+
+    app.pipeline.pipeline_def = entry.parent_def;
+    app.pipeline.pipeline_block_cursor = entry.parent_cursor;
+    app.pipeline.pipeline_canvas_offset = entry.parent_canvas_offset;
+    app.pipeline.pipeline_focus = entry.parent_focus;
+    app.pipeline.pipeline_next_id = entry.parent_next_id;
+
+    // Write edited sub-def back into the parent block
+    if let Some(block) = app
+        .pipeline
+        .pipeline_def
+        .blocks
+        .iter_mut()
+        .find(|b| b.id == entry.block_id)
+    {
+        block.sub_pipeline = Some(edited_sub_def);
+    }
+}
+
 pub(super) fn pipeline_ensure_visible(app: &mut App) {
     use crate::screen::pipeline::{separator_y_offset, BLOCK_H, BLOCK_W, CELL_H, CELL_W};
 
@@ -1554,6 +1680,15 @@ pub(super) fn handle_pipeline_edit_key(app: &mut App, key: KeyEvent) {
             app.pipeline.pipeline_show_edit = false;
         }
         KeyCode::Tab | KeyCode::BackTab => {
+            // Sub-pipeline blocks only expose the Name field — don't cycle.
+            let is_sub = app
+                .pipeline
+                .pipeline_block_cursor
+                .and_then(|sel| app.pipeline.pipeline_def.blocks.iter().find(|b| b.id == sel))
+                .is_some_and(|b| b.is_sub_pipeline());
+            if is_sub {
+                return;
+            }
             let is_fin_block = app
                 .pipeline
                 .pipeline_block_cursor
@@ -1607,6 +1742,12 @@ pub(super) fn handle_pipeline_edit_key(app: &mut App, key: KeyEvent) {
                             })
                         {
                             block.name = app.pipeline.pipeline_edit_name_buf.clone();
+                            // Sub-pipeline blocks: only save name — agents, prompt,
+                            // profiles etc. are managed inside the nested definition.
+                            if block.is_sub_pipeline() {
+                                app.pipeline.pipeline_show_edit = false;
+                                return;
+                            }
                             block.agents = app
                                 .config
                                 .agents
@@ -2027,11 +2168,18 @@ fn load_pipeline_by_filtered_cursor(app: &mut App) {
     if let Some(filename) = filename {
         let path = pipeline_mod::pipelines_dir().join(&filename);
         match pipeline_mod::load_pipeline(&path) {
-            Ok(def) => {
+            Ok(mut def) => {
+                let in_sub = !app.pipeline.sub_pipeline_stack.is_empty();
+                if in_sub {
+                    // Discard top-level fields that don't apply inside a sub-pipeline
+                    def.initial_prompt.clear();
+                }
                 let max_id = def.all_blocks().map(|b| b.id).max().unwrap_or(0);
                 app.pipeline.pipeline_next_id = max_id + 1;
                 app.pipeline.pipeline_def = def;
-                app.pipeline.pipeline_save_path = Some(path);
+                if !in_sub {
+                    app.pipeline.pipeline_save_path = Some(path);
+                }
                 app.pipeline.pipeline_block_cursor =
                     app.pipeline.pipeline_def.all_blocks().next().map(|b| b.id);
                 // Reset overlay state that may reference old definition

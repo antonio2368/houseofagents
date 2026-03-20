@@ -82,53 +82,31 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
         .into_iter()
         .map(|(a, avail)| (a.name.clone(), avail))
         .collect();
-    for block in app
-        .pipeline
-        .pipeline_def
-        .blocks
-        .iter()
-        .chain(app.pipeline.pipeline_def.finalization_blocks.iter())
     {
-        for agent_name in &block.agents {
-            match avail_agents.get(agent_name) {
-                Some(true) => {}
-                Some(false) => {
-                    app.error_modal = Some(format!(
-                        "{} is not available (block {})",
-                        agent_name, block.id
-                    ));
+        let mut agent_error: Option<String> = None;
+        app.pipeline
+            .pipeline_def
+            .visit_all_agent_refs(&mut |agent_name, block_id| {
+                if agent_error.is_some() {
                     return;
                 }
-                None => {
-                    app.error_modal = Some(format!(
-                        "Agent '{}' not found (block {})",
-                        agent_name, block.id
-                    ));
-                    return;
+                match avail_agents.get(agent_name) {
+                    Some(true) => {}
+                    Some(false) => {
+                        agent_error = Some(format!(
+                            "{agent_name} is not available (block {block_id})"
+                        ));
+                    }
+                    None => {
+                        agent_error = Some(format!(
+                            "Agent '{agent_name}' not found (block {block_id})"
+                        ));
+                    }
                 }
-            }
-        }
-    }
-    for lc in &app.pipeline.pipeline_def.loop_connections {
-        if lc.break_agent.is_empty() {
-            continue;
-        }
-        match avail_agents.get(&lc.break_agent) {
-            Some(true) => {}
-            Some(false) => {
-                app.error_modal = Some(format!(
-                    "Break agent '{}' is not available (loop {}→{})",
-                    lc.break_agent, lc.from, lc.to
-                ));
-                return;
-            }
-            None => {
-                app.error_modal = Some(format!(
-                    "Break agent '{}' not found (loop {}→{})",
-                    lc.break_agent, lc.from, lc.to
-                ));
-                return;
-            }
+            });
+        if let Some(err) = agent_error {
+            app.error_modal = Some(err);
+            return;
         }
     }
 
@@ -146,49 +124,28 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
     let mut agent_configs: std::collections::HashMap<String, (ProviderKind, ProviderConfig, bool)> =
         std::collections::HashMap::new();
 
-    for block in app
-        .pipeline
-        .pipeline_def
-        .blocks
-        .iter()
-        .chain(app.pipeline.pipeline_def.finalization_blocks.iter())
     {
-        for agent_name in &block.agents {
-            if agent_configs.contains_key(agent_name) {
-                continue;
-            }
-            if let Some(agent_cfg) = app.config.agents.iter().find(|a| a.name == *agent_name) {
-                let agent_cfg = app
-                    .effective_agent_config(&agent_cfg.name)
-                    .unwrap_or(agent_cfg);
-                agent_configs.insert(
-                    agent_name.clone(),
-                    (
-                        agent_cfg.provider,
-                        agent_cfg.to_provider_config(),
-                        agent_cfg.use_cli,
-                    ),
-                );
-            }
-        }
-    }
-    for lc in &app.pipeline.pipeline_def.loop_connections {
-        if lc.break_agent.is_empty() || agent_configs.contains_key(&lc.break_agent) {
-            continue;
-        }
-        if let Some(agent_cfg) = app.config.agents.iter().find(|a| a.name == lc.break_agent) {
-            let agent_cfg = app
-                .effective_agent_config(&agent_cfg.name)
-                .unwrap_or(agent_cfg);
-            agent_configs.insert(
-                lc.break_agent.clone(),
-                (
-                    agent_cfg.provider,
-                    agent_cfg.to_provider_config(),
-                    agent_cfg.use_cli,
-                ),
-            );
-        }
+        let config_agents = &app.config.agents;
+        app.pipeline
+            .pipeline_def
+            .visit_all_agent_refs(&mut |agent_name, _block_id| {
+                if agent_configs.contains_key(agent_name) {
+                    return;
+                }
+                if let Some(agent_cfg) = config_agents.iter().find(|a| a.name == agent_name) {
+                    let agent_cfg = app
+                        .effective_agent_config(&agent_cfg.name)
+                        .unwrap_or(agent_cfg);
+                    agent_configs.insert(
+                        agent_name.to_string(),
+                        (
+                            agent_cfg.provider,
+                            agent_cfg.to_provider_config(),
+                            agent_cfg.use_cli,
+                        ),
+                    );
+                }
+            });
     }
 
     // Pre-seed block rows from runtime replica table so IDs match the execution engine
@@ -384,15 +341,13 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
                     run_id: 1,
                     run_dir: run_dir.clone(),
                 };
-                if let Err(e) = crate::execution::pipeline::run_pipeline_finalization(
-                    &pipeline_def,
-                    fin_scope,
-                    &exec_rt,
-                    agent_configs,
-                    &run_dir,
-                    progress_tx.clone(),
-                    cancel,
-                    |kind, cfg| {
+                let fin_factory: crate::execution::pipeline::ProviderFactory = {
+                    let run_dir = run_dir.clone();
+                    let client = client.clone();
+                    let default_max_tokens = config.default_max_tokens;
+                    let max_history_messages = config.max_history_messages;
+                    let max_history_bytes = config.max_history_bytes;
+                    Arc::new(move |kind, cfg| {
                         let mut dirs = vec![run_dir.display().to_string()];
                         let pdir = pipeline_mod::profiles_dir();
                         if pdir.is_dir() {
@@ -402,13 +357,23 @@ pub(super) fn start_pipeline_execution(app: &mut App) {
                             kind,
                             cfg,
                             client.clone(),
-                            config.default_max_tokens,
-                            config.max_history_messages,
-                            config.max_history_bytes,
+                            default_max_tokens,
+                            max_history_messages,
+                            max_history_bytes,
                             cli_timeout,
                             dirs,
                         )
-                    },
+                    })
+                };
+                if let Err(e) = crate::execution::pipeline::run_pipeline_finalization(
+                    &pipeline_def,
+                    fin_scope,
+                    &exec_rt,
+                    agent_configs,
+                    &run_dir,
+                    progress_tx.clone(),
+                    cancel,
+                    fin_factory,
                 )
                 .await
                 {
@@ -950,7 +915,30 @@ pub(super) fn start_multi_pipeline_execution(
                 let (fin_tx, mut fin_rx) = mpsc::unbounded_channel();
                 let drain = tokio::spawn(async move { while fin_rx.recv().await.is_some() {} });
 
-                let fin_client = client_for_fin.clone();
+                let fin_factory: crate::execution::pipeline::ProviderFactory = {
+                    let batch_root = batch_root_for_fin.clone();
+                    let client = client_for_fin.clone();
+                    let default_max_tokens = config_for_fin.default_max_tokens;
+                    let max_history_messages = config_for_fin.max_history_messages;
+                    let max_history_bytes = config_for_fin.max_history_bytes;
+                    Arc::new(move |kind, cfg| {
+                        let mut dirs = vec![batch_root.display().to_string()];
+                        let pdir = pipeline_mod::profiles_dir();
+                        if pdir.is_dir() {
+                            dirs.push(pdir.display().to_string());
+                        }
+                        provider::create_provider(
+                            kind,
+                            cfg,
+                            client.clone(),
+                            default_max_tokens,
+                            max_history_messages,
+                            max_history_bytes,
+                            cli_timeout,
+                            dirs,
+                        )
+                    })
+                };
                 let fin_result = crate::execution::pipeline::run_pipeline_finalization(
                     &pipeline_def_for_fin,
                     crate::execution::pipeline::FinalizationRunScope::Batch { successful_runs },
@@ -959,23 +947,7 @@ pub(super) fn start_multi_pipeline_execution(
                     &batch_root_for_fin,
                     fin_tx,
                     cancel_for_fin,
-                    |kind, cfg| {
-                        let mut dirs = vec![batch_root_for_fin.display().to_string()];
-                        let pdir = pipeline_mod::profiles_dir();
-                        if pdir.is_dir() {
-                            dirs.push(pdir.display().to_string());
-                        }
-                        provider::create_provider(
-                            kind,
-                            cfg,
-                            fin_client.clone(),
-                            config_for_fin.default_max_tokens,
-                            config_for_fin.max_history_messages,
-                            config_for_fin.max_history_bytes,
-                            cli_timeout,
-                            dirs,
-                        )
-                    },
+                    fin_factory,
                 )
                 .await;
                 let _ = drain.await;

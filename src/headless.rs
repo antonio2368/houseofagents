@@ -1424,39 +1424,31 @@ async fn run_single_pipeline(
     let cli_available = rs::detect_cli_availability();
     let session_overrides = rs::compute_session_overrides(&config.agents, &cli_available);
 
-    // Validate all referenced agents (execution + finalization blocks)
-    for block in pipeline_def
-        .blocks
-        .iter()
-        .chain(pipeline_def.finalization_blocks.iter())
+    // Validate all referenced agents (execution + finalization + sub-pipelines)
     {
-        for agent_name in &block.agents {
-            let agent_config =
-                rs::resolve_agent_config(agent_name, &session_overrides, &config.agents)
-                    .ok_or_else(|| {
-                        HeadlessError::Validation(format!(
-                            "Pipeline agent '{agent_name}' is not configured"
-                        ))
-                    })?;
-            rs::validate_agent_runtime(&cli_available, agent_name, agent_config)
-                .map_err(HeadlessError::Validation)?;
+        let mut agent_validation_error: Option<HeadlessError> = None;
+        pipeline_def.visit_all_agent_refs(&mut |agent_name, _block_id| {
+            if agent_validation_error.is_some() {
+                return;
+            }
+            match rs::resolve_agent_config(agent_name, &session_overrides, &config.agents) {
+                Some(agent_config) => {
+                    if let Err(msg) =
+                        rs::validate_agent_runtime(&cli_available, agent_name, agent_config)
+                    {
+                        agent_validation_error = Some(HeadlessError::Validation(msg));
+                    }
+                }
+                None => {
+                    agent_validation_error = Some(HeadlessError::Validation(format!(
+                        "Pipeline agent '{agent_name}' is not configured"
+                    )));
+                }
+            }
+        });
+        if let Some(err) = agent_validation_error {
+            return Err(err);
         }
-    }
-
-    for lc in &pipeline_def.loop_connections {
-        if lc.break_agent.is_empty() {
-            continue;
-        }
-        let agent_config =
-            rs::resolve_agent_config(&lc.break_agent, &session_overrides, &config.agents)
-                .ok_or_else(|| {
-                    HeadlessError::Validation(format!(
-                        "Loop {}→{} break agent '{}' is not configured",
-                        lc.from, lc.to, lc.break_agent
-                    ))
-                })?;
-        rs::validate_agent_runtime(&cli_available, &lc.break_agent, agent_config)
-            .map_err(HeadlessError::Validation)?;
     }
 
     let agent_configs =
@@ -1576,16 +1568,14 @@ async fn run_single_pipeline(
                         run_id: 1,
                         run_dir: run_dir_path,
                     };
-                    if let Err(e) = pipeline_mod::run_pipeline_finalization(
-                        &pipeline_def,
-                        fin_scope,
-                        &exec_rt,
-                        agent_configs,
-                        output.run_dir(),
-                        progress_tx.clone(),
-                        task_cancel,
-                        |kind, cfg| {
-                            let mut dirs = vec![output.run_dir().display().to_string()];
+                    let fin_factory: pipeline_mod::ProviderFactory = {
+                        let run_dir_str = output.run_dir().display().to_string();
+                        let client = client.clone();
+                        let default_max_tokens = config.default_max_tokens;
+                        let max_history_messages = config.max_history_messages;
+                        let max_history_bytes = config.max_history_bytes;
+                        Arc::new(move |kind, cfg| {
+                            let mut dirs = vec![run_dir_str.clone()];
                             let pdir = pipeline_mod::profiles_dir();
                             if pdir.is_dir() {
                                 dirs.push(pdir.display().to_string());
@@ -1594,13 +1584,23 @@ async fn run_single_pipeline(
                                 kind,
                                 cfg,
                                 client.clone(),
-                                config.default_max_tokens,
-                                config.max_history_messages,
-                                config.max_history_bytes,
+                                default_max_tokens,
+                                max_history_messages,
+                                max_history_bytes,
                                 cli_timeout_secs,
                                 dirs,
                             )
-                        },
+                        })
+                    };
+                    if let Err(e) = pipeline_mod::run_pipeline_finalization(
+                        &pipeline_def,
+                        fin_scope,
+                        &exec_rt,
+                        agent_configs,
+                        output.run_dir(),
+                        progress_tx.clone(),
+                        task_cancel,
+                        fin_factory,
                     )
                     .await
                     {
@@ -1963,21 +1963,29 @@ async fn run_batch_pipeline(
     let cli_available = rs::detect_cli_availability();
     let session_overrides = rs::compute_session_overrides(&config.agents, &cli_available);
 
-    for block in pipeline_def
-        .blocks
-        .iter()
-        .chain(pipeline_def.finalization_blocks.iter())
     {
-        for agent_name in &block.agents {
-            let agent_config =
-                rs::resolve_agent_config(agent_name, &session_overrides, &config.agents)
-                    .ok_or_else(|| {
-                        HeadlessError::Validation(format!(
-                            "Pipeline agent '{agent_name}' is not configured"
-                        ))
-                    })?;
-            rs::validate_agent_runtime(&cli_available, agent_name, agent_config)
-                .map_err(HeadlessError::Validation)?;
+        let mut agent_validation_error: Option<HeadlessError> = None;
+        pipeline_def.visit_all_agent_refs(&mut |agent_name, _block_id| {
+            if agent_validation_error.is_some() {
+                return;
+            }
+            match rs::resolve_agent_config(agent_name, &session_overrides, &config.agents) {
+                Some(agent_config) => {
+                    if let Err(msg) =
+                        rs::validate_agent_runtime(&cli_available, agent_name, agent_config)
+                    {
+                        agent_validation_error = Some(HeadlessError::Validation(msg));
+                    }
+                }
+                None => {
+                    agent_validation_error = Some(HeadlessError::Validation(format!(
+                        "Pipeline agent '{agent_name}' is not configured"
+                    )));
+                }
+            }
+        });
+        if let Some(err) = agent_validation_error {
+            return Err(err);
         }
     }
 
@@ -2229,7 +2237,30 @@ async fn run_batch_pipeline(
                 let (fin_tx, mut fin_rx) = mpsc::unbounded_channel();
                 let drain = tokio::spawn(async move { while fin_rx.recv().await.is_some() {} });
 
-                let fin_client = client_for_fin.clone();
+                let fin_factory: pipeline_mod::ProviderFactory = {
+                    let batch_root = batch_root_for_fin.clone();
+                    let client = client_for_fin.clone();
+                    let default_max_tokens = config_for_fin.default_max_tokens;
+                    let max_history_messages = config_for_fin.max_history_messages;
+                    let max_history_bytes = config_for_fin.max_history_bytes;
+                    Arc::new(move |kind, cfg| {
+                        let mut dirs = vec![batch_root.display().to_string()];
+                        let pdir = pipeline_mod::profiles_dir();
+                        if pdir.is_dir() {
+                            dirs.push(pdir.display().to_string());
+                        }
+                        provider::create_provider(
+                            kind,
+                            cfg,
+                            client.clone(),
+                            default_max_tokens,
+                            max_history_messages,
+                            max_history_bytes,
+                            cli_timeout_secs,
+                            dirs,
+                        )
+                    })
+                };
                 let fin_result = pipeline_mod::run_pipeline_finalization(
                     &pipeline_def_for_fin,
                     pipeline_mod::FinalizationRunScope::Batch { successful_runs },
@@ -2238,23 +2269,7 @@ async fn run_batch_pipeline(
                     &batch_root_for_fin,
                     fin_tx,
                     cancel_for_fin,
-                    |kind, cfg| {
-                        let mut dirs = vec![batch_root_for_fin.display().to_string()];
-                        let pdir = pipeline_mod::profiles_dir();
-                        if pdir.is_dir() {
-                            dirs.push(pdir.display().to_string());
-                        }
-                        provider::create_provider(
-                            kind,
-                            cfg,
-                            fin_client.clone(),
-                            config_for_fin.default_max_tokens,
-                            config_for_fin.max_history_messages,
-                            config_for_fin.max_history_bytes,
-                            cli_timeout_secs,
-                            dirs,
-                        )
-                    },
+                    fin_factory,
                 )
                 .await;
                 let _ = drain.await;

@@ -204,6 +204,8 @@ pub trait Provider: Send {
     fn send_streaming(&mut self, message: &str, _chunk_tx: mpsc::Sender<String>) -> SendFuture<'_> {
         self.send(message)
     }
+    /// Add an allowed directory for CLI-mode providers. No-op for API providers.
+    fn add_allowed_dir(&mut self, _dir: String) {}
 }
 
 /// Prune message history by byte budget — remove oldest messages until total fits.

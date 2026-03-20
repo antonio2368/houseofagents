@@ -368,12 +368,23 @@ pub(crate) struct EditPopupState {
     pub(crate) config_save_rx: Option<mpsc::UnboundedReceiver<Result<AppConfig, String>>>,
 }
 
+pub(crate) struct SubPipelineStackEntry {
+    pub(crate) name: String,
+    pub(crate) block_id: BlockId,
+    pub(crate) parent_def: PipelineDefinition,
+    pub(crate) parent_cursor: Option<BlockId>,
+    pub(crate) parent_canvas_offset: (i16, i16),
+    pub(crate) parent_focus: PipelineFocus,
+    pub(crate) parent_next_id: BlockId,
+}
+
 pub(crate) struct PipelineState {
     pub(crate) pipeline_def: PipelineDefinition,
     pub(crate) pipeline_next_id: BlockId,
     pub(crate) pipeline_block_cursor: Option<BlockId>,
     pub(crate) pipeline_focus: PipelineFocus,
     pub(crate) pipeline_canvas_offset: (i16, i16),
+    pub(crate) sub_pipeline_stack: Vec<SubPipelineStackEntry>,
     pub(crate) pipeline_prompt_cursor: usize,
     pub(crate) pipeline_session_name: String,
     pub(crate) pipeline_runs: u32,
@@ -1404,6 +1415,7 @@ impl PipelineState {
             pipeline_block_cursor: None,
             pipeline_focus: PipelineFocus::InitialPrompt,
             pipeline_canvas_offset: (0, 0),
+            sub_pipeline_stack: Vec::new(),
             pipeline_prompt_cursor: 0,
             pipeline_session_name: String::new(),
             pipeline_runs: 1,

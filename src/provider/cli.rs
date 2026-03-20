@@ -501,6 +501,12 @@ impl Provider for CliProvider {
         self.kind
     }
 
+    fn add_allowed_dir(&mut self, dir: String) {
+        if !self.add_dirs.contains(&dir) {
+            self.add_dirs.push(dir);
+        }
+    }
+
     fn clear_history(&mut self) {
         self.history.clear();
         self.session_started = false;

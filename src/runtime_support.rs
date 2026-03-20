@@ -133,36 +133,14 @@ pub(crate) fn build_pipeline_agent_configs(
     session_overrides: &HashMap<String, AgentConfig>,
 ) -> HashMap<String, (ProviderKind, crate::config::ProviderConfig, bool)> {
     let mut agent_configs = HashMap::new();
-    for block in pipeline_def
-        .blocks
-        .iter()
-        .chain(pipeline_def.finalization_blocks.iter())
-    {
-        for agent_name in &block.agents {
-            if agent_configs.contains_key(agent_name) {
-                continue;
-            }
-            let agent_cfg = resolve_agent_config(agent_name, session_overrides, agents);
-            if let Some(agent_cfg) = agent_cfg {
-                agent_configs.insert(
-                    agent_name.clone(),
-                    (
-                        agent_cfg.provider,
-                        agent_cfg.to_provider_config(),
-                        agent_cfg.use_cli,
-                    ),
-                );
-            }
+    pipeline_def.visit_all_agent_refs(&mut |agent_name, _block_id| {
+        if agent_configs.contains_key(agent_name) {
+            return;
         }
-    }
-    for lc in &pipeline_def.loop_connections {
-        if lc.break_agent.is_empty() || agent_configs.contains_key(&lc.break_agent) {
-            continue;
-        }
-        let agent_cfg = resolve_agent_config(&lc.break_agent, session_overrides, agents);
+        let agent_cfg = resolve_agent_config(agent_name, session_overrides, agents);
         if let Some(agent_cfg) = agent_cfg {
             agent_configs.insert(
-                lc.break_agent.clone(),
+                agent_name.to_string(),
                 (
                     agent_cfg.provider,
                     agent_cfg.to_provider_config(),
@@ -170,7 +148,7 @@ pub(crate) fn build_pipeline_agent_configs(
                 ),
             );
         }
-    }
+    });
     agent_configs
 }
 

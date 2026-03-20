@@ -142,6 +142,30 @@ fn load_results_sync(
                     Some(path)
                 })
                 .collect::<Vec<_>>();
+
+            // Collect files from sub_* (sub-pipeline) directories and their finalization/ subdirs
+            for sub_dir in crate::post_run::sub_pipeline_directories(&path) {
+                if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_file() && !is_memory_internal_file(&p) {
+                            files.push(p);
+                        }
+                    }
+                }
+                let sub_fin = sub_dir.join("finalization");
+                if sub_fin.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&sub_fin) {
+                        for entry in entries.flatten() {
+                            let p = entry.path();
+                            if p.is_file() && !is_memory_internal_file(&p) {
+                                files.push(p);
+                            }
+                        }
+                    }
+                }
+            }
+
             files.sort();
             run_groups.push(BatchRunGroup { run_id, files });
         }
@@ -194,6 +218,29 @@ fn load_results_sync(
                 let path = entry.path();
                 if path.is_file() && !is_memory_internal_file(&path) {
                     files.push(path);
+                }
+            }
+        }
+    }
+
+    // Collect files from sub_* (sub-pipeline) directories and their finalization/ subdirs
+    for sub_dir in crate::post_run::sub_pipeline_directories(&run_dir) {
+        if let Ok(entries) = std::fs::read_dir(&sub_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && !is_memory_internal_file(&path) {
+                    files.push(path);
+                }
+            }
+        }
+        let sub_fin = sub_dir.join("finalization");
+        if sub_fin.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&sub_fin) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() && !is_memory_internal_file(&path) {
+                        files.push(path);
+                    }
                 }
             }
         }

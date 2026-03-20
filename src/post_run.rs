@@ -682,9 +682,17 @@ pub(crate) fn collect_report_files(run_dir: &std::path::Path) -> Vec<std::path::
         dirs.extend(batch_run_directories(run_dir));
     }
 
-    // Also include finalization/ subdirectories when present
+    // Also include sub_* (sub-pipeline) and finalization/ subdirectories when present
     let base_dirs = dirs.clone();
     for dir in &base_dirs {
+        let sub_dirs = sub_pipeline_directories(dir);
+        for sub_dir in &sub_dirs {
+            let sub_fin = sub_dir.join("finalization");
+            if sub_fin.is_dir() {
+                dirs.push(sub_fin);
+            }
+        }
+        dirs.extend(sub_dirs);
         let fin_dir = dir.join("finalization");
         if fin_dir.is_dir() {
             dirs.push(fin_dir);
@@ -729,6 +737,12 @@ pub(crate) fn collect_application_errors(
     let mut dirs = vec![run_dir.to_path_buf()];
     if OutputManager::is_batch_root(run_dir) {
         dirs.extend(batch_run_directories(run_dir));
+    }
+
+    // Also include sub_* (sub-pipeline) directories
+    let base_dirs = dirs.clone();
+    for dir in &base_dirs {
+        dirs.extend(sub_pipeline_directories(dir));
     }
 
     for dir in dirs {
@@ -835,6 +849,26 @@ pub(crate) fn build_diagnostic_prompt(
 // ---------------------------------------------------------------------------
 // Batch run directory discovery
 // ---------------------------------------------------------------------------
+
+pub(crate) fn sub_pipeline_directories(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?;
+            if name.starts_with("sub_") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
 
 pub(crate) fn batch_run_directories(run_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut dirs = std::fs::read_dir(run_dir)
@@ -998,5 +1032,47 @@ mod tests {
         assert!(!names.contains(&"_recalled_memories.md".to_string()));
         assert!(!names.contains(&"prompt.md".to_string()));
         assert!(!names.contains(&"errors.md".to_string()));
+    }
+
+    #[test]
+    fn collect_report_files_includes_sub_pipeline_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Root-level file
+        std::fs::write(dir.path().join("agent_iter1.md"), "root").unwrap();
+
+        // sub_1/ with an .md file
+        let sub1 = dir.path().join("sub_1");
+        std::fs::create_dir_all(&sub1).unwrap();
+        std::fs::write(sub1.join("block1_claude.md"), "sub output").unwrap();
+
+        // sub_1/finalization/ with an .md file
+        let sub1_fin = sub1.join("finalization");
+        std::fs::create_dir_all(&sub1_fin).unwrap();
+        std::fs::write(sub1_fin.join("summary.md"), "sub finalization").unwrap();
+
+        let files = collect_report_files(dir.path());
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"agent_iter1.md".to_string()));
+        assert!(names.contains(&"block1_claude.md".to_string()));
+        assert!(names.contains(&"summary.md".to_string()));
+    }
+
+    #[test]
+    fn collect_application_errors_includes_sub_pipeline_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Root-level error log
+        std::fs::write(dir.path().join("_errors.log"), "root error\n").unwrap();
+
+        // sub_1/ with an error log
+        let sub1 = dir.path().join("sub_1");
+        std::fs::create_dir_all(&sub1).unwrap();
+        std::fs::write(sub1.join("_errors.log"), "sub error\n").unwrap();
+
+        let errors = collect_application_errors(&[], dir.path());
+        assert!(errors.contains(&"root error".to_string()));
+        assert!(errors.contains(&"sub error".to_string()));
     }
 }

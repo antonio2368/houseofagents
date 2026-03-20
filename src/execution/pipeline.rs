@@ -21,6 +21,11 @@ pub const WILDCARD_BLOCK_ID: BlockId = 0;
 type ProviderPool = HashMap<(String, String), Arc<Mutex<Box<dyn provider::Provider>>>>;
 pub(crate) type PipelineAgentConfigs =
     HashMap<String, (ProviderKind, crate::config::ProviderConfig, bool)>;
+pub(crate) type ProviderFactory = Arc<
+    dyn Fn(ProviderKind, &crate::config::ProviderConfig) -> Box<dyn provider::Provider>
+        + Send
+        + Sync,
+>;
 
 #[derive(Debug, Clone)]
 struct PipelineTaskMetadata {
@@ -78,6 +83,28 @@ pub(crate) fn build_runtime_table(def: &PipelineDefinition) -> RuntimeReplicaTab
     let mut next_id: u32 = 0;
 
     for block in &def.blocks {
+        // Sub-pipeline blocks: single opaque runtime entry
+        if block.is_sub_pipeline() {
+            let blabel = block_label(block);
+            entries.push(RuntimeReplicaInfo {
+                runtime_id: next_id,
+                source_block_id: block.id,
+                replica_index: 0,
+                phase: RuntimePhase::Execution,
+                run_scope: None,
+                agent: format!("[{}]", block.name),
+                display_label: format!("{blabel} [sub-pipeline]"),
+                session_key: format!("__sub_{}", block.id),
+                filename_stem: format!("sub_b{}_pipeline", block.id),
+            });
+            logical_to_runtime
+                .entry(block.id)
+                .or_default()
+                .push(next_id);
+            next_id += 1;
+            continue;
+        }
+
         let base_session_key = block.effective_session_key();
         let block_name_key = if block.name.trim().is_empty() {
             format!("block{}", block.id)
@@ -279,10 +306,7 @@ async fn evaluate_loop_break(
     rt: &RuntimeReplicaTable,
     output: &crate::output::OutputManager,
     agent_configs: &PipelineAgentConfigs,
-    provider_factory: &impl Fn(
-        ProviderKind,
-        &crate::config::ProviderConfig,
-    ) -> Box<dyn provider::Provider>,
+    provider_factory: &ProviderFactory,
     cancel: &Arc<AtomicBool>,
 ) -> bool {
     let (kind, cfg, _) = match agent_configs.get(break_agent) {
@@ -390,6 +414,8 @@ pub struct PipelineBlock {
     pub position: (u16, u16), // grid coordinates (col, row)
     #[serde(default = "default_one", skip_serializing_if = "is_one")]
     pub replicas: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_pipeline: Option<PipelineDefinition>,
 }
 
 /// Custom deserialize for backward compat: accepts both `agent` (legacy string)
@@ -417,32 +443,44 @@ impl<'de> Deserialize<'de> for PipelineBlock {
             position: (u16, u16),
             #[serde(default = "default_one")]
             replicas: u32,
+            #[serde(default)]
+            sub_pipeline: Option<PipelineDefinition>,
         }
         let raw = Raw::deserialize(deserializer)?;
-        let agents = match (raw.agents, raw.agent) {
-            (Some(v), _) if !v.is_empty() => {
-                if let Some(blank) = v.iter().find(|a| a.trim().is_empty()) {
-                    return Err(serde::de::Error::custom(format!(
-                        "block has a blank agent name '{blank}' in 'agents' list"
-                    )));
+        let agents = if raw.sub_pipeline.is_some() {
+            // Sub-pipeline blocks must not have agents
+            if raw.agents.as_ref().is_some_and(|v| !v.is_empty()) || raw.agent.is_some() {
+                return Err(serde::de::Error::custom(
+                    "sub-pipeline block must not have 'agents' or 'agent' fields",
+                ));
+            }
+            vec![]
+        } else {
+            match (raw.agents, raw.agent) {
+                (Some(v), _) if !v.is_empty() => {
+                    if let Some(blank) = v.iter().find(|a| a.trim().is_empty()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "block has a blank agent name '{blank}' in 'agents' list"
+                        )));
+                    }
+                    v
                 }
-                v
+                (Some(_), _) => {
+                    // agents field explicitly present but empty — reject
+                    return Err(serde::de::Error::custom(
+                        "block has an empty 'agents' list; at least one agent is required",
+                    ));
+                }
+                (_, Some(a)) if !a.trim().is_empty() => vec![a],
+                (_, Some(_)) => {
+                    // agent field explicitly present but empty/whitespace — reject
+                    return Err(serde::de::Error::custom(
+                        "block has a blank 'agent' field; a non-empty agent name is required",
+                    ));
+                }
+                // Neither field present (legacy/minimal TOML) — default to Claude
+                (None, None) => vec!["Claude".to_string()],
             }
-            (Some(_), _) => {
-                // agents field explicitly present but empty — reject
-                return Err(serde::de::Error::custom(
-                    "block has an empty 'agents' list; at least one agent is required",
-                ));
-            }
-            (_, Some(a)) if !a.trim().is_empty() => vec![a],
-            (_, Some(_)) => {
-                // agent field explicitly present but empty/whitespace — reject
-                return Err(serde::de::Error::custom(
-                    "block has a blank 'agent' field; a non-empty agent name is required",
-                ));
-            }
-            // Neither field present (legacy/minimal TOML) — default to Claude
-            (None, None) => vec!["Claude".to_string()],
         };
         // Validate profile names to prevent path traversal
         for p in &raw.profiles {
@@ -461,6 +499,7 @@ impl<'de> Deserialize<'de> for PipelineBlock {
             session_id: raw.session_id,
             position: raw.position,
             replicas: raw.replicas,
+            sub_pipeline: raw.sub_pipeline,
         })
     }
 }
@@ -474,6 +513,19 @@ fn is_one(v: &u32) -> bool {
 }
 
 impl PipelineBlock {
+    pub fn is_sub_pipeline(&self) -> bool {
+        self.sub_pipeline.is_some()
+    }
+
+    /// Logical task count for scheduling: sub-pipelines count as 1 opaque unit.
+    pub fn logical_task_count(&self) -> u32 {
+        if self.is_sub_pipeline() {
+            1
+        } else {
+            self.agents.len() as u32 * self.replicas
+        }
+    }
+
     /// Primary agent (first in the list). Used for backward-compat display contexts.
     pub fn primary_agent(&self) -> &str {
         self.agents.first().map(|s| s.as_str()).unwrap_or("Claude")
@@ -593,22 +645,32 @@ fn default_keep_across_loop_passes() -> bool {
 }
 
 impl PipelineDefinition {
-    /// Collect unique agent names from all blocks (including finalization).
-    pub fn all_agent_names(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        let mut agents = Vec::new();
+    /// Visit all agent references recursively (including sub-pipelines and break agents).
+    pub fn visit_all_agent_refs(&self, visitor: &mut dyn FnMut(&str, BlockId)) {
         for block in self.blocks.iter().chain(self.finalization_blocks.iter()) {
             for agent in &block.agents {
-                if seen.insert(agent.clone()) {
-                    agents.push(agent.clone());
-                }
+                visitor(agent, block.id);
+            }
+            if let Some(ref sub) = block.sub_pipeline {
+                sub.visit_all_agent_refs(visitor);
             }
         }
         for lc in &self.loop_connections {
-            if !lc.break_agent.is_empty() && seen.insert(lc.break_agent.clone()) {
-                agents.push(lc.break_agent.clone());
+            if !lc.break_agent.is_empty() {
+                visitor(&lc.break_agent, lc.from);
             }
         }
+    }
+
+    /// Collect unique agent names from all blocks (including finalization and sub-pipelines).
+    pub fn all_agent_names(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut agents = Vec::new();
+        self.visit_all_agent_refs(&mut |agent, _block_id| {
+            if seen.insert(agent.to_string()) {
+                agents.push(agent.to_string());
+            }
+        });
         agents
     }
 
@@ -988,7 +1050,7 @@ impl RegularGraph {
         let mut reverse: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
         let mut replicas: HashMap<BlockId, u32> = HashMap::new();
         for block in &def.blocks {
-            replicas.insert(block.id, block.agents.len() as u32 * block.replicas);
+            replicas.insert(block.id, block.logical_task_count());
         }
         for conn in &def.connections {
             forward.entry(conn.from).or_default().push(conn.to);
@@ -1208,10 +1270,28 @@ pub fn ensure_pipelines_dir() -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+fn normalize_session_configs_recursive(def: &mut PipelineDefinition) {
+    def.normalize_session_configs();
+    for block in &mut def.blocks {
+        if let Some(ref mut sub) = block.sub_pipeline {
+            normalize_session_configs_recursive(sub);
+        }
+    }
+}
+
+fn migrate_loop_direction_recursive(def: &mut PipelineDefinition) {
+    migrate_loop_direction(def);
+    for block in &mut def.blocks {
+        if let Some(ref mut sub) = block.sub_pipeline {
+            migrate_loop_direction_recursive(sub);
+        }
+    }
+}
+
 pub fn save_pipeline(def: &PipelineDefinition, path: &Path) -> Result<(), AppError> {
     validate_pipeline(def)?;
     let mut normalized = def.clone();
-    normalized.normalize_session_configs();
+    normalize_session_configs_recursive(&mut normalized);
     let content = toml::to_string_pretty(&normalized)
         .map_err(|e| AppError::Config(format!("Failed to serialize pipeline: {e}")))?;
     std::fs::write(path, content)?;
@@ -1222,8 +1302,8 @@ pub fn load_pipeline(path: &Path) -> Result<PipelineDefinition, AppError> {
     let content = std::fs::read_to_string(path)?;
     let mut def: PipelineDefinition = toml::from_str(&content)
         .map_err(|e| AppError::Config(format!("Failed to parse pipeline: {e}")))?;
-    def.normalize_session_configs();
-    migrate_loop_direction(&mut def);
+    normalize_session_configs_recursive(&mut def);
+    migrate_loop_direction_recursive(&mut def);
     validate_pipeline(&def)?;
     Ok(def)
 }
@@ -1263,7 +1343,7 @@ pub(crate) fn validate_replicas(def: &PipelineDefinition) -> Result<(), AppError
                 block.name
             )));
         }
-        let total_tasks = block.agents.len() as u32 * block.replicas;
+        let total_tasks = block.logical_task_count();
         if total_tasks > 32 {
             return Err(AppError::Config(format!(
                 "Block '{}' has agents × replicas = {} (max 32 per block)",
@@ -1604,7 +1684,7 @@ pub(crate) fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError
 
     // Rule 12: Finalization blocks follow same agent/replica rules as execution blocks
     for block in def.all_blocks() {
-        if block.agents.is_empty() {
+        if block.agents.is_empty() && !block.is_sub_pipeline() {
             return Err(AppError::Config(format!(
                 "Block {} has no agents",
                 block.id
@@ -1619,6 +1699,125 @@ pub(crate) fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError
                 )));
             }
         }
+    }
+
+    // Rule 13: Sub-pipeline block validation
+    // 13: reject sub_pipeline on finalization blocks
+    for block in &def.finalization_blocks {
+        if block.is_sub_pipeline() {
+            return Err(AppError::Config(format!(
+                "Finalization block {} cannot be a sub-pipeline",
+                block.id
+            )));
+        }
+    }
+    for block in &def.blocks {
+        if !block.is_sub_pipeline() {
+            continue;
+        }
+        let sub_def = block.sub_pipeline.as_ref().unwrap();
+
+        // 13: Strict field rejection — sub-pipeline blocks must not have agent/prompt/profile/session
+        if !block.agents.is_empty() {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline block '{}' must not have agents",
+                block.name
+            )));
+        }
+        if !block.prompt.is_empty() {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline block '{}' must not have a prompt",
+                block.name
+            )));
+        }
+        if !block.profiles.is_empty() {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline block '{}' must not have profiles",
+                block.name
+            )));
+        }
+        if block.session_id.is_some() {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline block '{}' must not have a session_id",
+                block.name
+            )));
+        }
+
+        // 13e: Parent sub-pipeline block replicas must be 1
+        if block.replicas != 1 {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline block '{}' must have replicas = 1",
+                block.name
+            )));
+        }
+
+        // 13a: No nested sub-pipelines
+        for inner in sub_def
+            .blocks
+            .iter()
+            .chain(sub_def.finalization_blocks.iter())
+        {
+            if inner.is_sub_pipeline() {
+                return Err(AppError::Config(format!(
+                    "Nested sub-pipeline in block '{}' — only one level of nesting is allowed",
+                    block.name
+                )));
+            }
+        }
+
+        // 13b: Must have finalization blocks
+        if sub_def.finalization_blocks.is_empty() {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline '{}' has no finalization blocks — sub-pipelines require exactly one finalization output",
+                block.name
+            )));
+        }
+
+        // 13c: Exactly one terminal finalization leaf
+        let fin_outgoing: HashSet<BlockId> = sub_def
+            .finalization_connections
+            .iter()
+            .map(|c| c.from)
+            .collect();
+        let terminal_leaves: Vec<&PipelineBlock> = sub_def
+            .finalization_blocks
+            .iter()
+            .filter(|b| !fin_outgoing.contains(&b.id))
+            .collect();
+        if terminal_leaves.is_empty() {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline '{}' has no finalization output — sub-pipelines require exactly one finalization output",
+                block.name
+            )));
+        }
+        if terminal_leaves.len() > 1 {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline '{}' has {} finalization outputs — sub-pipelines require exactly one",
+                block.name,
+                terminal_leaves.len()
+            )));
+        }
+
+        let terminal = terminal_leaves[0];
+
+        // 13d: Terminal finalization leaf replicas must be 1
+        if terminal.replicas != 1 {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline '{}' terminal finalization block must have replicas = 1",
+                block.name
+            )));
+        }
+
+        // 13g: Terminal finalization leaf must have exactly one agent
+        if terminal.agents.len() != 1 {
+            return Err(AppError::Config(format!(
+                "Sub-pipeline '{}' terminal finalization block must have exactly one agent",
+                block.name
+            )));
+        }
+
+        // 13f: Recursive validation of sub-pipeline definition
+        validate_pipeline(sub_def)?;
     }
 
     // Replica validation
@@ -1738,6 +1937,27 @@ pub async fn run_pipeline(
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
     cancel: Arc<AtomicBool>,
 ) -> Result<(), AppError> {
+    let run_dir = output.run_dir().display().to_string();
+    let default_max_tokens = config.default_max_tokens;
+    let max_history_messages = config.max_history_messages;
+    let max_history_bytes = config.max_history_bytes;
+    let factory: ProviderFactory = Arc::new(move |kind, cfg| {
+        let mut dirs = vec![run_dir.clone()];
+        let pdir = profiles_dir();
+        if pdir.is_dir() {
+            dirs.push(pdir.display().to_string());
+        }
+        provider::create_provider(
+            kind,
+            cfg,
+            client.clone(),
+            default_max_tokens,
+            max_history_messages,
+            max_history_bytes,
+            cli_timeout_secs,
+            dirs,
+        )
+    });
     run_pipeline_with_provider_factory(
         def,
         config.pipeline_block_concurrency,
@@ -1746,29 +1966,13 @@ pub async fn run_pipeline(
         output,
         progress_tx,
         cancel,
-        |kind, cfg| {
-            let mut dirs = vec![output.run_dir().display().to_string()];
-            let pdir = profiles_dir();
-            if pdir.is_dir() {
-                dirs.push(pdir.display().to_string());
-            }
-            provider::create_provider(
-                kind,
-                cfg,
-                client.clone(),
-                config.default_max_tokens,
-                config.max_history_messages,
-                config.max_history_bytes,
-                cli_timeout_secs,
-                dirs,
-            )
-        },
+        factory,
     )
     .await
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_pipeline_with_provider_factory<F>(
+async fn run_pipeline_with_provider_factory(
     def: &PipelineDefinition,
     max_block_concurrency: u32,
     agent_configs: PipelineAgentConfigs,
@@ -1776,11 +1980,8 @@ async fn run_pipeline_with_provider_factory<F>(
     output: &OutputManager,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
     cancel: Arc<AtomicBool>,
-    provider_factory: F,
-) -> Result<(), AppError>
-where
-    F: Fn(ProviderKind, &crate::config::ProviderConfig) -> Box<dyn provider::Provider>,
-{
+    provider_factory: ProviderFactory,
+) -> Result<(), AppError> {
     let rt = build_runtime_table(def);
     if rt.entries.is_empty() {
         let _ = progress_tx.send(ProgressEvent::AllDone);
@@ -1809,7 +2010,9 @@ where
         max_block_concurrency as usize
     }));
 
-    // Build provider pool keyed by (agent, runtime_session_key)
+    // Build provider pool keyed by (agent, runtime_session_key).
+    // Sub-pipeline entries have synthetic agent names like "[Sub#N]" which
+    // won't match any config — they are harmlessly skipped here.
     let mut provider_pool: ProviderPool = HashMap::new();
     for entry in &rt.entries {
         let pool_key = (entry.agent.clone(), entry.session_key.clone());
@@ -1913,7 +2116,7 @@ where
                             continue;
                         }
                     };
-                    let replica_count = block.agents.len() * block.replicas as usize;
+                    let replica_count = block.logical_task_count() as usize;
 
                     // Determine loop pass for this block
                     let current_loop_pass = if let Some(&key) = block_to_loop.get(&block_id) {
@@ -2072,6 +2275,189 @@ where
                                 }
                             }
                         }
+                        continue;
+                    }
+
+                    // Sub-pipeline dispatch
+                    if block.is_sub_pipeline() {
+                        let sub_def = block.sub_pipeline.as_ref().unwrap().clone();
+                        let rid = rids[0];
+                        let parent_iteration: u32 = iteration;
+                        let parent_loop_pass: u32 = *block_loop_pass.get(&block_id).unwrap_or(&0);
+                        let parent_block_name = block.name.clone();
+                        let parent_label = rt.entries[rid as usize].display_label.clone();
+
+                        let upstream_context = assemble_raw_upstream_context(
+                            block, def, &rt, &replica_outputs,
+                        );
+                        let mut sub_def_ctx = sub_def;
+                        if !upstream_context.is_empty() {
+                            if sub_def_ctx.initial_prompt.is_empty() {
+                                sub_def_ctx.initial_prompt = upstream_context;
+                            } else {
+                                sub_def_ctx.initial_prompt = format!(
+                                    "{}\n\n--- Input from parent pipeline ---\n{}",
+                                    sub_def_ctx.initial_prompt, upstream_context
+                                );
+                            }
+                        }
+
+                        let sub_run_dir = output.run_dir().join(format!("sub_{}", block.id));
+                        let parent_run_dir = output.run_dir().to_path_buf();
+                        let parent_filename = loop_replica_filename(
+                            &rt.entries[rid as usize],
+                            parent_loop_pass,
+                        );
+                        // Wrap the parent factory so CLI providers inside the
+                        // sub-pipeline get --add-dir for the sub-run directory.
+                        let parent_factory = provider_factory.clone();
+                        let sub_dir_str = sub_run_dir.display().to_string();
+                        let sub_factory: ProviderFactory = Arc::new(move |kind, cfg| {
+                            let mut p = parent_factory(kind, cfg);
+                            p.add_allowed_dir(sub_dir_str.clone());
+                            p
+                        });
+                        let agent_configs_clone = agent_configs.clone();
+                        let prompt_context_clone = prompt_context.clone();
+                        let cancel_clone = cancel.clone();
+                        let sem_clone = concurrency_sem.clone();
+                        let max_conc = max_block_concurrency;
+
+                        // Private child progress channel + forwarder
+                        let (child_tx, mut child_rx) = mpsc::unbounded_channel::<ProgressEvent>();
+                        let parent_tx = progress_tx.clone();
+                        let fwd_block_name = parent_block_name.clone();
+                        tokio::spawn(async move {
+                            while let Some(event) = child_rx.recv().await {
+                                match &event {
+                                    ProgressEvent::BlockStarted { block_id: inner_bid, .. } => {
+                                        let _ = parent_tx.send(ProgressEvent::BlockLog {
+                                            block_id: rid,
+                                            agent_name: format!("[{fwd_block_name}]"),
+                                            iteration: parent_iteration,
+                                            loop_pass: parent_loop_pass,
+                                            message: format!("Inner block {inner_bid} started"),
+                                        });
+                                    }
+                                    ProgressEvent::BlockFinished { block_id: inner_bid, .. } => {
+                                        let _ = parent_tx.send(ProgressEvent::BlockLog {
+                                            block_id: rid,
+                                            agent_name: format!("[{fwd_block_name}]"),
+                                            iteration: parent_iteration,
+                                            loop_pass: parent_loop_pass,
+                                            message: format!("Inner block {inner_bid} finished"),
+                                        });
+                                    }
+                                    ProgressEvent::BlockError { block_id: inner_bid, error, .. } => {
+                                        let _ = parent_tx.send(ProgressEvent::BlockLog {
+                                            block_id: rid,
+                                            agent_name: format!("[{fwd_block_name}]"),
+                                            iteration: parent_iteration,
+                                            loop_pass: parent_loop_pass,
+                                            message: format!("Inner block {inner_bid} error: {error}"),
+                                        });
+                                    }
+                                    ProgressEvent::AllDone => { /* Filter — do not forward */ }
+                                    _ => { /* Discard inner events — v1 decision */ }
+                                }
+                            }
+                        });
+
+                        // BlockStarted for the parent sub-pipeline row
+                        let _ = progress_tx.send(ProgressEvent::BlockStarted {
+                            block_id: rid,
+                            agent_name: format!("[{}]", block.name),
+                            label: parent_label.clone(),
+                            iteration,
+                            loop_pass: current_loop_pass,
+                        });
+
+                        let rt_handle = tokio::runtime::Handle::current();
+                        let task_handle = tasks.spawn(async move {
+                            let _permit = sem_clone.acquire().await.expect("semaphore closed");
+
+                            // run_pipeline_with_provider_factory returns a !Send future
+                            // (tokio::select! state machine internals), so we run it on
+                            // a dedicated blocking thread via Handle::block_on.
+                            let result = tokio::task::spawn_blocking(move || {
+                                rt_handle.block_on(async {
+                                    if let Err(e) = std::fs::create_dir_all(&sub_run_dir) {
+                                        return (rid, Err(e.to_string()));
+                                    }
+                                    let sub_output = match OutputManager::from_existing(sub_run_dir.clone()) {
+                                        Ok(o) => o,
+                                        Err(e) => return (rid, Err(e.to_string())),
+                                    };
+
+                                    // Execution phase
+                                    if let Err(e) = run_pipeline_with_provider_factory(
+                                        &sub_def_ctx,
+                                        max_conc,
+                                        agent_configs_clone.clone(),
+                                        &prompt_context_clone,
+                                        &sub_output,
+                                        child_tx.clone(),
+                                        cancel_clone.clone(),
+                                        sub_factory.clone(),
+                                    )
+                                    .await
+                                    {
+                                        return (rid, Err(e.to_string()));
+                                    }
+
+                                    // Finalization phase
+                                    let exec_rt = build_runtime_table(&sub_def_ctx);
+                                    let fin_scope = FinalizationRunScope::SingleRun {
+                                        run_id: 1,
+                                        run_dir: sub_run_dir.clone(),
+                                    };
+                                    if let Err(e) = run_pipeline_finalization(
+                                        &sub_def_ctx,
+                                        fin_scope,
+                                        &exec_rt,
+                                        agent_configs_clone,
+                                        &sub_run_dir,
+                                        child_tx,
+                                        cancel_clone,
+                                        sub_factory,
+                                    )
+                                    .await
+                                    {
+                                        return (rid, Err(e.to_string()));
+                                    }
+
+                                    // Read terminal output and write it as a parent-level file
+                                    // so that downstream blocks, feeds, and post-run discovery
+                                    // can find it on disk.
+                                    match read_sub_pipeline_terminal_output(&sub_def_ctx, &sub_run_dir) {
+                                        Ok(text) => {
+                                            let parent_path = parent_run_dir.join(&parent_filename);
+                                            if let Err(e) = std::fs::write(&parent_path, &text) {
+                                                return (rid, Err(format!(
+                                                    "Failed to write sub-pipeline output: {e}"
+                                                )));
+                                            }
+                                            (rid, Ok(text))
+                                        }
+                                        Err(e) => (rid, Err(e.to_string())),
+                                    }
+                                })
+                            }).await.unwrap_or_else(|e| (rid, Err(format!("sub-pipeline panicked: {e}"))));
+
+                            result
+                        });
+
+                        task_metadata.insert(
+                            task_handle.id(),
+                            PipelineTaskMetadata {
+                                runtime_id: rid,
+                                source_block_id: block_id,
+                                agent_name: format!("[{}]", block.name),
+                                label: parent_label,
+                                iteration,
+                                loop_pass: current_loop_pass,
+                            },
+                        );
                         continue;
                     }
 
@@ -2355,11 +2741,27 @@ where
                     // Handle normal (non-panic) outcome recording
                     if let Ok((runtime_id, ref outcome)) = result {
                         let sid = rt.entries[runtime_id as usize].source_block_id;
+                        let entry_agent = rt.entries[runtime_id as usize].agent.clone();
+                        let entry_label = rt.entries[runtime_id as usize].display_label.clone();
+                        let entry_lp = block_loop_pass.get(&sid).copied().unwrap_or(0);
                         match outcome {
                             Ok(content) => {
                                 replica_outputs.insert(runtime_id, content.clone());
+                                // Emit BlockFinished for sub-pipeline blocks (normal
+                                // tasks emit this inside the spawned task; sub-pipelines
+                                // emit it here because the inner run does not know the
+                                // parent runtime_id).
+                                if block_map.get(&sid).is_some_and(|b| b.is_sub_pipeline()) {
+                                    let _ = progress_tx.send(ProgressEvent::BlockFinished {
+                                        block_id: runtime_id,
+                                        agent_name: entry_agent,
+                                        label: entry_label,
+                                        iteration,
+                                        loop_pass: entry_lp,
+                                    });
+                                }
                             }
-                            Err(_) => {
+                            Err(error) => {
                                 failed_replicas.insert(runtime_id);
                                 // Remove stale output so a previous pass's content
                                 // is not mistaken for current-pass feedback.
@@ -2368,6 +2770,19 @@ where
                                     if rids.iter().all(|r| failed_replicas.contains(r)) {
                                         failed_logical.insert(sid);
                                     }
+                                }
+                                // Emit BlockError for sub-pipeline blocks (same
+                                // rationale as BlockFinished above).
+                                if block_map.get(&sid).is_some_and(|b| b.is_sub_pipeline()) {
+                                    let _ = progress_tx.send(ProgressEvent::BlockError {
+                                        block_id: runtime_id,
+                                        agent_name: entry_agent,
+                                        label: entry_label,
+                                        iteration,
+                                        loop_pass: entry_lp,
+                                        error: error.clone(),
+                                        details: Some(error.clone()),
+                                    });
                                 }
                             }
                         }
@@ -2702,6 +3117,88 @@ fn missing_profiles(profiles: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Read the terminal finalization leaf's output from a sub-pipeline run directory.
+/// Returns the content of the single terminal block's output file.
+fn read_sub_pipeline_terminal_output(
+    def: &PipelineDefinition,
+    output_root: &Path,
+) -> Result<String, AppError> {
+    // Find terminal finalization leaf (validated: exactly one)
+    let outgoing: HashSet<BlockId> = def
+        .finalization_connections
+        .iter()
+        .map(|c| c.from)
+        .collect();
+    let terminal_block = def
+        .finalization_blocks
+        .iter()
+        .find(|b| !outgoing.contains(&b.id))
+        .expect("validated: exactly one finalization leaf");
+
+    // Derive filename from the same code path that writes it
+    let exec_rt = build_runtime_table(def);
+    let fin_scope = FinalizationRunScope::SingleRun {
+        run_id: 1,
+        run_dir: output_root.to_path_buf(),
+    };
+    let fin_entries =
+        build_finalization_runtime_entries(def, &fin_scope, exec_rt.entries.len() as u32);
+    let terminal_entry = fin_entries
+        .iter()
+        .find(|e| e.source_block_id == terminal_block.id)
+        .expect("validated: terminal block has entry");
+
+    let path = output_root
+        .join("finalization")
+        .join(format!("{}.md", terminal_entry.filename_stem));
+
+    std::fs::read_to_string(&path).map_err(AppError::Io)
+}
+
+/// Assemble upstream context without augmentation (no cwd prefix, memory, or diagnostics).
+/// Used for sub-pipeline dispatch to avoid double-augmentation.
+fn assemble_raw_upstream_context(
+    block: &PipelineBlock,
+    def: &PipelineDefinition,
+    runtime_table: &RuntimeReplicaTable,
+    block_outputs: &HashMap<u32, String>,
+) -> String {
+    let upstream_ids = upstream_of(def, block.id);
+    if upstream_ids.is_empty() {
+        return def.initial_prompt.clone();
+    }
+    let mut upstream_content = String::new();
+    for uid in &upstream_ids {
+        if let Some(rids) = runtime_table.logical_to_runtime.get(uid) {
+            for &rid in rids {
+                if let Some(content) = block_outputs.get(&rid) {
+                    if !upstream_content.is_empty() {
+                        upstream_content.push_str("\n\n---\n\n");
+                    }
+                    let upstream_block = def.blocks.iter().find(|b| b.id == *uid);
+                    let needs_label = upstream_block
+                        .map(|b| b.logical_task_count() > 1)
+                        .unwrap_or(false);
+                    if needs_label {
+                        let info = &runtime_table.entries[rid as usize];
+                        upstream_content.push_str(&format!(
+                            "--- Output from {} ---\n{}",
+                            info.display_label, content
+                        ));
+                    } else {
+                        upstream_content.push_str(content);
+                    }
+                }
+            }
+        }
+    }
+    if upstream_content.is_empty() {
+        String::new()
+    } else {
+        format!("--- Upstream outputs ---\n{upstream_content}")
+    }
+}
+
 fn build_pipeline_block_message(
     block: &PipelineBlock,
     use_cli: bool,
@@ -2754,7 +3251,7 @@ fn build_pipeline_block_message(
                                 upstream_content.push_str("\n\n---\n\n");
                             }
                             let needs_label = upstream_block
-                                .map(|b| b.replicas > 1 || b.agents.len() > 1)
+                                .map(|b| b.logical_task_count() > 1)
                                 .unwrap_or(false);
                             if needs_label {
                                 let info = &context.runtime_table.entries[rid as usize];
@@ -2873,7 +3370,7 @@ fn build_loop_rerun_message_v2(
                             }
                             let upstream_block = def.blocks.iter().find(|b| b.id == uid);
                             let needs_label = upstream_block
-                                .map(|b| b.replicas > 1 || b.agents.len() > 1)
+                                .map(|b| b.logical_task_count() > 1)
                                 .unwrap_or(false);
                             if needs_label {
                                 let info = &runtime_table.entries[rid as usize];
@@ -3113,7 +3610,7 @@ pub(crate) fn finalization_task_count(def: &PipelineDefinition) -> usize {
     }
     def.finalization_blocks
         .iter()
-        .map(|b| b.agents.len() * b.replicas.max(1) as usize)
+        .map(|b| b.logical_task_count() as usize)
         .sum()
 }
 
@@ -3342,7 +3839,7 @@ fn write_finalization_toml(
 
 /// Core finalization runner. Executes the finalization DAG after the execution phase completes.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_pipeline_finalization<F>(
+pub(crate) async fn run_pipeline_finalization(
     def: &PipelineDefinition,
     run_scope: FinalizationRunScope,
     exec_runtime_table: &RuntimeReplicaTable,
@@ -3350,11 +3847,8 @@ pub(crate) async fn run_pipeline_finalization<F>(
     output_root: &Path,
     progress_tx: mpsc::UnboundedSender<ProgressEvent>,
     cancel: Arc<AtomicBool>,
-    provider_factory: F,
-) -> Result<(), AppError>
-where
-    F: Fn(ProviderKind, &crate::config::ProviderConfig) -> Box<dyn provider::Provider>,
-{
+    provider_factory: ProviderFactory,
+) -> Result<(), AppError> {
     if def.finalization_blocks.is_empty() {
         return Ok(());
     }
@@ -3455,7 +3949,7 @@ where
                 if per_run_ids.contains(&conn.from) && per_run_ids.contains(&conn.to) {
                     let from_block = fin_block_map.get(&conn.from);
                     let from_replicas = from_block
-                        .map(|b| b.agents.len() * b.replicas.max(1) as usize)
+                        .map(|b| b.logical_task_count() as usize)
                         .unwrap_or(1);
                     *in_degree.entry(conn.to).or_default() += from_replicas;
                 }
@@ -3492,7 +3986,7 @@ where
                     .any(|c| failed_blocks.contains(&(c.from, Some(run_id))));
                 if upstream_failed {
                     failed_blocks.insert((block_id, Some(run_id)));
-                    let replica_count = block.agents.len() * block.replicas.max(1) as usize;
+                    let replica_count = block.logical_task_count() as usize;
                     // Emit BlockSkipped for each replica so the TUI marks rows as skipped
                     let reason = format!("upstream finalization block failed (run {run_id})");
                     for entry in fin_entries
@@ -3705,7 +4199,7 @@ where
                 fin_outputs.insert((block_id, Some(run_id)), block_output_list);
 
                 // Decrement in-degree for downstream per-run blocks
-                let replica_count = block.agents.len() * block.replicas.max(1) as usize;
+                let replica_count = block.logical_task_count() as usize;
                 if let Some(children) = fin_downstream.get(&block_id) {
                     for &child in children {
                         if per_run_ids.contains(&child) {
@@ -3745,7 +4239,7 @@ where
             }
             let from_block = fin_block_map.get(&conn.from);
             let from_replicas = from_block
-                .map(|b| b.agents.len() * b.replicas.max(1) as usize)
+                .map(|b| b.logical_task_count() as usize)
                 .unwrap_or(1);
 
             *in_degree.entry(conn.to).or_default() += from_replicas;
@@ -3778,7 +4272,7 @@ where
                 .any(|c| failed_blocks.contains(&(c.from, None)));
             if upstream_failed {
                 failed_blocks.insert((block_id, None));
-                let replica_count = block.agents.len() * block.replicas.max(1) as usize;
+                let replica_count = block.logical_task_count() as usize;
                 // Emit BlockSkipped for each replica so the TUI marks rows as skipped
                 let reason = "upstream finalization block failed".to_string();
                 for entry in fin_entries
@@ -4000,7 +4494,7 @@ where
             fin_outputs.insert((block_id, None), block_output_list);
 
             // Decrement in-degree for downstream all-runs blocks
-            let replica_count = block.agents.len() * block.replicas.max(1) as usize;
+            let replica_count = block.logical_task_count() as usize;
             if let Some(children) = fin_downstream.get(&block_id) {
                 for &child in children {
                     if all_runs_ids.contains(&child) {
@@ -4066,6 +4560,7 @@ mod tests {
             session_id: None,
             position: (col, row),
             replicas: 1,
+            sub_pipeline: None,
         }
     }
 
@@ -4526,6 +5021,7 @@ to = 1
                 session_id: None,
                 position: (0, 0),
                 replicas: 1,
+                sub_pipeline: None,
             }],
             connections: vec![],
             session_configs: Vec::new(),
@@ -4573,6 +5069,7 @@ to = 1
                 session_id: None,
                 position: (0, 0),
                 replicas: 1,
+                sub_pipeline: None,
             }],
             connections: vec![],
             session_configs: Vec::new(),
@@ -4608,12 +5105,12 @@ to = 1
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 Box::new(PanicProvider::new(
                     ProviderKind::Anthropic,
                     "pipeline panic",
                 ))
-            },
+            }),
         )
         .await
         .expect("run");
@@ -4655,6 +5152,7 @@ to = 1
                 session_id: None,
                 position: (0, 0),
                 replicas: 1,
+                sub_pipeline: None,
             }],
             connections: vec![],
             session_configs: Vec::new(),
@@ -4691,13 +5189,13 @@ to = 1
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 Box::new(MockProvider::err(
                     ProviderKind::Anthropic,
                     "provider failed",
                     received.clone(),
                 ))
-            },
+            }),
         )
         .await
         .expect("run");
@@ -4799,13 +5297,13 @@ to = 1
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| -> Box<dyn Provider> {
+            Arc::new(move |_kind, _cfg| -> Box<dyn Provider> {
                 Box::new(ConcurrencyTracker {
                     kind: ProviderKind::Anthropic,
                     active: active_clone.clone(),
                     peak: peak_clone.clone(),
                 })
-            },
+            }),
         )
         .await
         .expect("run");
@@ -4832,6 +5330,7 @@ to = 1
             session_id: Some("shared".into()),
             position: (0, 0),
             replicas: 1,
+            sub_pipeline: None,
         };
         assert_eq!(b.effective_session_key(), "shared");
     }
@@ -4857,6 +5356,7 @@ to = 1
                     session_id: Some("shared".into()),
                     position: (0, 0),
                     replicas: 1,
+                    sub_pipeline: None,
                 },
                 PipelineBlock {
                     id: 2,
@@ -4867,6 +5367,7 @@ to = 1
                     session_id: Some("shared".into()),
                     position: (1, 0),
                     replicas: 1,
+                    sub_pipeline: None,
                 },
             ],
             vec![conn(1, 2)],
@@ -4892,6 +5393,7 @@ to = 1
                     session_id: Some("shared".into()),
                     position: (0, 0),
                     replicas: 1,
+                    sub_pipeline: None,
                 },
                 PipelineBlock {
                     id: 2,
@@ -4902,6 +5404,7 @@ to = 1
                     session_id: Some("shared".into()),
                     position: (1, 0),
                     replicas: 1,
+                    sub_pipeline: None,
                 },
             ],
             vec![],
@@ -4931,6 +5434,7 @@ to = 1
                     session_id: None,
                     position: (0, 0),
                     replicas: 1,
+                    sub_pipeline: None,
                 },
                 PipelineBlock {
                     id: 2,
@@ -4941,6 +5445,7 @@ to = 1
                     session_id: None,
                     position: (1, 0),
                     replicas: 1,
+                    sub_pipeline: None,
                 },
             ],
             vec![],
@@ -4964,6 +5469,7 @@ to = 1
                     session_id: None,
                     position: (0, 0),
                     replicas: 1,
+                    sub_pipeline: None,
                 },
                 PipelineBlock {
                     id: 2,
@@ -4974,6 +5480,7 @@ to = 1
                     session_id: None,
                     position: (1, 0),
                     replicas: 1,
+                    sub_pipeline: None,
                 },
             ],
             vec![],
@@ -5224,13 +5731,13 @@ keep_across_loop_passes = false
             &output,
             tx,
             cancel,
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 Box::new(ClearCountProvider {
                     kind: ProviderKind::Anthropic,
                     responses: std::sync::Mutex::new(VecDeque::new()),
                     clear_count: cc.clone(),
                 })
-            },
+            }),
         )
         .await
         .unwrap();
@@ -5280,13 +5787,13 @@ keep_across_loop_passes = false
             &output,
             tx,
             cancel,
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 Box::new(ClearCountProvider {
                     kind: ProviderKind::Anthropic,
                     responses: std::sync::Mutex::new(VecDeque::new()),
                     clear_count: cc.clone(),
                 })
-            },
+            }),
         )
         .await
         .unwrap();
@@ -5826,13 +6333,13 @@ keep_across_loop_passes = false
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 Box::new(MockProvider::ok(
                     ProviderKind::Anthropic,
                     "loop output",
                     recv_clone.clone(),
                 ))
-            },
+            }),
         )
         .await
         .expect("run");
@@ -5905,13 +6412,13 @@ keep_across_loop_passes = false
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 Box::new(MockProvider::ok(
                     ProviderKind::Anthropic,
                     "output",
                     recv_clone.clone(),
                 ))
-            },
+            }),
         )
         .await
         .expect("run");
@@ -5997,7 +6504,7 @@ keep_across_loop_passes = false
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n % 2 == 1 {
                     Box::new(PanicProvider::new(ProviderKind::Anthropic, "replica panic"))
@@ -6008,7 +6515,7 @@ keep_across_loop_passes = false
                         recv_clone.clone(),
                     ))
                 }
-            },
+            }),
         )
         .await
         .expect("run should complete despite partial panics");
@@ -6088,7 +6595,7 @@ keep_across_loop_passes = false
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n % 2 == 1 {
                     Box::new(PanicProvider::new(ProviderKind::Anthropic, "to-side panic"))
@@ -6099,7 +6606,7 @@ keep_across_loop_passes = false
                         recv_clone.clone(),
                     ))
                 }
-            },
+            }),
         )
         .await
         .expect("run should complete despite partial to-side panics");
@@ -6279,13 +6786,13 @@ keep_across_loop_passes = false
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 Box::new(MockProvider::ok(
                     ProviderKind::Anthropic,
                     "intermediate output",
                     recv_clone.clone(),
                 ))
-            },
+            }),
         )
         .await
         .expect("run");
@@ -6354,13 +6861,13 @@ keep_across_loop_passes = false
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 Box::new(MockProvider::ok(
                     ProviderKind::Anthropic,
                     "output",
                     recv_clone.clone(),
                 ))
-            },
+            }),
         )
         .await
         .expect("run");
@@ -6448,7 +6955,7 @@ keep_across_loop_passes = false
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n == 0 {
                     // A (first pool entry) panics
@@ -6460,7 +6967,7 @@ keep_across_loop_passes = false
                         recv_clone.clone(),
                     ))
                 }
-            },
+            }),
         )
         .await
         .expect("run should complete despite A panicking");
@@ -6571,7 +7078,7 @@ keep_across_loop_passes = false
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 use crate::execution::test_utils::ok_response;
                 let n = counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 match n {
@@ -6613,7 +7120,7 @@ keep_across_loop_passes = false
                         Arc::new(Mutex::new(Vec::new())),
                     )),
                 }
-            },
+            }),
         )
         .await
         .expect("run should complete");
@@ -6983,6 +7490,7 @@ keep_across_loop_passes = false
             session_id: None,
             position: (col, row),
             replicas: 1,
+            sub_pipeline: None,
         }
     }
 
@@ -7366,7 +7874,7 @@ position = [0, 0]
             &output,
             tx,
             Arc::new(AtomicBool::new(false)),
-            move |_kind, _cfg| {
+            Arc::new(move |_kind, _cfg| {
                 // All providers return "BREAK" — the evaluator will parse it
                 // as a break decision, and the block agents produce it as content.
                 Box::new(MockProvider::ok(
@@ -7374,7 +7882,7 @@ position = [0, 0]
                     "BREAK",
                     recv_clone.clone(),
                 ))
-            },
+            }),
         )
         .await
         .expect("pipeline should complete without error");
@@ -7423,6 +7931,860 @@ position = [0, 0]
         assert!(
             break_eval.is_some(),
             "LoopBreakEval with BREAK decision must be emitted"
+        );
+    }
+
+    // =========================================================================
+    // Sub-pipeline tests
+    // =========================================================================
+
+    fn sub_pipeline_block(
+        id: BlockId,
+        col: u16,
+        row: u16,
+        sub_def: PipelineDefinition,
+    ) -> PipelineBlock {
+        PipelineBlock {
+            id,
+            name: format!("Sub#{id}"),
+            agents: vec![],
+            prompt: String::new(),
+            profiles: vec![],
+            session_id: None,
+            position: (col, row),
+            replicas: 1,
+            sub_pipeline: Some(sub_def),
+        }
+    }
+
+    fn minimal_sub_def() -> PipelineDefinition {
+        PipelineDefinition {
+            initial_prompt: "inner".into(),
+            blocks: vec![block(100, 0, 0)],
+            connections: vec![],
+            session_configs: vec![],
+            loop_connections: vec![],
+            finalization_blocks: vec![PipelineBlock {
+                id: 200,
+                name: "Consolidate".into(),
+                agents: vec!["Claude".into()],
+                prompt: "summarize".into(),
+                profiles: vec![],
+                session_id: None,
+                position: (0, 1),
+                replicas: 1,
+                sub_pipeline: None,
+            }],
+            finalization_connections: vec![],
+            data_feeds: vec![DataFeed {
+                from: WILDCARD_BLOCK_ID,
+                to: 200,
+                collection: FeedCollection::LastPass,
+                granularity: FeedGranularity::PerRun,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_is_sub_pipeline_true_false() {
+        let regular = block(1, 0, 0);
+        assert!(!regular.is_sub_pipeline());
+
+        let sub = sub_pipeline_block(2, 1, 0, minimal_sub_def());
+        assert!(sub.is_sub_pipeline());
+    }
+
+    #[test]
+    fn test_logical_task_count_regular_block() {
+        let mut b = block(1, 0, 0);
+        assert_eq!(b.logical_task_count(), 1);
+
+        b.replicas = 3;
+        assert_eq!(b.logical_task_count(), 3);
+
+        b.agents = vec!["A".into(), "B".into()];
+        b.replicas = 2;
+        assert_eq!(b.logical_task_count(), 4);
+    }
+
+    #[test]
+    fn test_logical_task_count_sub_pipeline_block() {
+        let sub = sub_pipeline_block(1, 0, 0, minimal_sub_def());
+        assert_eq!(sub.logical_task_count(), 1);
+    }
+
+    #[test]
+    fn test_sub_pipeline_block_serde_roundtrip() {
+        let sub_def = minimal_sub_def();
+        let parent = PipelineDefinition {
+            initial_prompt: "top".into(),
+            blocks: vec![block(1, 0, 0), sub_pipeline_block(2, 1, 0, sub_def)],
+            connections: vec![conn(1, 2)],
+            session_configs: vec![],
+            loop_connections: vec![],
+            finalization_blocks: vec![],
+            finalization_connections: vec![],
+            data_feeds: vec![],
+        };
+
+        let toml_str = toml::to_string_pretty(&parent).unwrap();
+        let parsed: PipelineDefinition = toml::from_str(&toml_str).unwrap();
+
+        assert_eq!(parsed.blocks.len(), 2);
+        assert!(parsed.blocks[1].is_sub_pipeline());
+        let inner = parsed.blocks[1].sub_pipeline.as_ref().unwrap();
+        assert_eq!(inner.blocks.len(), 1);
+        assert_eq!(inner.finalization_blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_no_nested_sub_pipelines() {
+        let mut inner_def = minimal_sub_def();
+        // Add a sub-pipeline block INSIDE the sub-pipeline
+        inner_def
+            .blocks
+            .push(sub_pipeline_block(101, 1, 0, minimal_sub_def()));
+
+        let def = PipelineDefinition {
+            initial_prompt: "top".into(),
+            blocks: vec![sub_pipeline_block(1, 0, 0, inner_def)],
+            connections: vec![],
+            session_configs: vec![],
+            loop_connections: vec![],
+            finalization_blocks: vec![],
+            finalization_connections: vec![],
+            data_feeds: vec![],
+        };
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("Nested sub-pipeline"));
+    }
+
+    #[test]
+    fn test_validate_sub_pipeline_must_have_finalization() {
+        let bad_sub = PipelineDefinition {
+            initial_prompt: "inner".into(),
+            blocks: vec![block(100, 0, 0)],
+            connections: vec![],
+            session_configs: vec![],
+            loop_connections: vec![],
+            finalization_blocks: vec![],
+            finalization_connections: vec![],
+            data_feeds: vec![],
+        };
+        let def = def_with(vec![sub_pipeline_block(1, 0, 0, bad_sub)], vec![]);
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("no finalization"));
+    }
+
+    #[test]
+    fn test_validate_sub_pipeline_exactly_one_fin_leaf() {
+        let mut sub_def = minimal_sub_def();
+        // Add a second finalization leaf (not connected)
+        sub_def.finalization_blocks.push(PipelineBlock {
+            id: 201,
+            name: "Second".into(),
+            agents: vec!["Claude".into()],
+            prompt: "extra".into(),
+            profiles: vec![],
+            session_id: None,
+            position: (1, 1),
+            replicas: 1,
+            sub_pipeline: None,
+        });
+        sub_def.data_feeds.push(DataFeed {
+            from: WILDCARD_BLOCK_ID,
+            to: 201,
+            collection: FeedCollection::LastPass,
+            granularity: FeedGranularity::PerRun,
+        });
+        let def = def_with(vec![sub_pipeline_block(1, 0, 0, sub_def)], vec![]);
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("2 finalization outputs"));
+    }
+
+    #[test]
+    fn test_validate_sub_pipeline_terminal_leaf_replicas_1() {
+        let mut sub_def = minimal_sub_def();
+        sub_def.finalization_blocks[0].replicas = 2;
+        let def = def_with(vec![sub_pipeline_block(1, 0, 0, sub_def)], vec![]);
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("replicas = 1"));
+    }
+
+    #[test]
+    fn test_validate_sub_pipeline_terminal_leaf_single_agent() {
+        let mut sub_def = minimal_sub_def();
+        sub_def.finalization_blocks[0].agents = vec!["A".into(), "B".into()];
+        let def = def_with(vec![sub_pipeline_block(1, 0, 0, sub_def)], vec![]);
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("exactly one agent"));
+    }
+
+    #[test]
+    fn test_validate_parent_sub_block_replicas_1() {
+        let mut sub_block = sub_pipeline_block(1, 0, 0, minimal_sub_def());
+        sub_block.replicas = 2;
+        let def = def_with(vec![sub_block], vec![]);
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("replicas = 1"));
+    }
+
+    #[test]
+    fn test_validate_rejects_sub_pipeline_with_agents() {
+        let mut sub_block = sub_pipeline_block(1, 0, 0, minimal_sub_def());
+        sub_block.agents = vec!["Claude".into()];
+        let def = def_with(vec![sub_block], vec![]);
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("must not have agents"));
+    }
+
+    #[test]
+    fn test_validate_rejects_sub_pipeline_on_finalization_block() {
+        let def = PipelineDefinition {
+            initial_prompt: "test".into(),
+            blocks: vec![block(1, 0, 0)],
+            connections: vec![],
+            session_configs: vec![],
+            loop_connections: vec![],
+            finalization_blocks: vec![sub_pipeline_block(2, 0, 1, minimal_sub_def())],
+            finalization_connections: vec![],
+            data_feeds: vec![DataFeed {
+                from: WILDCARD_BLOCK_ID,
+                to: 2,
+                collection: FeedCollection::LastPass,
+                granularity: FeedGranularity::PerRun,
+            }],
+        };
+        let err = validate_pipeline(&def).unwrap_err();
+        assert!(err.to_string().contains("Finalization block"));
+    }
+
+    #[test]
+    fn test_validate_accepts_mixed_blocks() {
+        let def = PipelineDefinition {
+            initial_prompt: "test".into(),
+            blocks: vec![
+                block(1, 0, 0),
+                sub_pipeline_block(2, 1, 0, minimal_sub_def()),
+                block(3, 2, 0),
+            ],
+            connections: vec![conn(1, 2), conn(2, 3)],
+            session_configs: vec![],
+            loop_connections: vec![],
+            finalization_blocks: vec![],
+            finalization_connections: vec![],
+            data_feeds: vec![],
+        };
+        assert!(validate_pipeline(&def).is_ok());
+    }
+
+    #[test]
+    fn test_all_agent_names_includes_sub_pipeline_agents() {
+        let sub_def = PipelineDefinition {
+            initial_prompt: "inner".into(),
+            blocks: vec![PipelineBlock {
+                id: 100,
+                name: "InnerBlock".into(),
+                agents: vec!["Gemini".into()],
+                prompt: "do".into(),
+                profiles: vec![],
+                session_id: None,
+                position: (0, 0),
+                replicas: 1,
+                sub_pipeline: None,
+            }],
+            connections: vec![],
+            session_configs: vec![],
+            loop_connections: vec![],
+            finalization_blocks: vec![PipelineBlock {
+                id: 200,
+                name: "Consolidate".into(),
+                agents: vec!["GPT".into()],
+                prompt: "summarize".into(),
+                profiles: vec![],
+                session_id: None,
+                position: (0, 1),
+                replicas: 1,
+                sub_pipeline: None,
+            }],
+            finalization_connections: vec![],
+            data_feeds: vec![DataFeed {
+                from: WILDCARD_BLOCK_ID,
+                to: 200,
+                collection: FeedCollection::LastPass,
+                granularity: FeedGranularity::PerRun,
+            }],
+        };
+        let def = PipelineDefinition {
+            initial_prompt: "top".into(),
+            blocks: vec![block(1, 0, 0), sub_pipeline_block(2, 1, 0, sub_def)],
+            connections: vec![conn(1, 2)],
+            session_configs: vec![],
+            loop_connections: vec![],
+            finalization_blocks: vec![],
+            finalization_connections: vec![],
+            data_feeds: vec![],
+        };
+        let names = def.all_agent_names();
+        assert!(names.contains(&"Claude".to_string()));
+        assert!(names.contains(&"Gemini".to_string()));
+        assert!(names.contains(&"GPT".to_string()));
+    }
+
+    #[test]
+    fn test_visit_all_agent_refs_includes_break_agents() {
+        let mut def = def_with(vec![block(1, 0, 0), block(2, 1, 0)], vec![conn(1, 2)]);
+        def.loop_connections.push(LoopConnection {
+            from: 2,
+            to: 1,
+            count: 2,
+            prompt: "iterate".into(),
+            break_agent: "Evaluator".into(),
+            break_condition: "stop if done".into(),
+        });
+        let mut agents: Vec<String> = Vec::new();
+        def.visit_all_agent_refs(&mut |name, _| {
+            agents.push(name.to_string());
+        });
+        assert!(agents.contains(&"Evaluator".to_string()));
+    }
+
+    #[test]
+    fn test_build_runtime_table_sub_pipeline_single_entry() {
+        let def = def_with(
+            vec![
+                block(1, 0, 0),
+                sub_pipeline_block(2, 1, 0, minimal_sub_def()),
+            ],
+            vec![conn(1, 2)],
+        );
+        let rt = build_runtime_table(&def);
+        // Block 1 = 1 entry, Block 2 (sub-pipeline) = 1 entry
+        assert_eq!(rt.entries.len(), 2);
+        let sub_rids = rt.logical_to_runtime.get(&2).unwrap();
+        assert_eq!(
+            sub_rids.len(),
+            1,
+            "sub-pipeline should have exactly 1 runtime entry"
+        );
+        assert_eq!(rt.entries[sub_rids[0] as usize].agent, "[Sub#2]");
+    }
+
+    #[test]
+    fn test_assemble_raw_upstream_context_no_augmentation() {
+        let def = def_with(vec![block(1, 0, 0), block(2, 1, 0)], vec![conn(1, 2)]);
+        let rt = build_runtime_table(&def);
+        let mut outputs: HashMap<u32, String> = HashMap::new();
+        let rid_1 = rt.logical_to_runtime.get(&1).unwrap()[0];
+        outputs.insert(rid_1, "hello from block 1".into());
+
+        let ctx = assemble_raw_upstream_context(&def.blocks[1], &def, &rt, &outputs);
+        assert!(ctx.contains("hello from block 1"));
+        // No cwd prefix, no memory, no diagnostics
+        assert!(!ctx.contains("Working directory"));
+    }
+
+    #[test]
+    fn test_read_sub_pipeline_terminal_output_correct_path() {
+        let sub_def = minimal_sub_def();
+        let dir = tempfile::tempdir().unwrap();
+        let fin_dir = dir.path().join("finalization");
+        std::fs::create_dir_all(&fin_dir).unwrap();
+
+        // Figure out the expected filename
+        let exec_rt = build_runtime_table(&sub_def);
+        let fin_entries = build_finalization_runtime_entries(
+            &sub_def,
+            &FinalizationRunScope::SingleRun {
+                run_id: 1,
+                run_dir: dir.path().to_path_buf(),
+            },
+            exec_rt.entries.len() as u32,
+        );
+        let terminal_entry = fin_entries
+            .iter()
+            .find(|e| e.source_block_id == 200)
+            .unwrap();
+        let path = fin_dir.join(format!("{}.md", terminal_entry.filename_stem));
+        std::fs::write(&path, "final output").unwrap();
+
+        let result = read_sub_pipeline_terminal_output(&sub_def, dir.path());
+        assert_eq!(result.unwrap(), "final output");
+    }
+
+    #[tokio::test]
+    async fn test_sub_pipeline_e2e_with_mock_provider() {
+        let sub_def = minimal_sub_def();
+        let def = def_with(vec![sub_pipeline_block(1, 0, 0, sub_def)], vec![]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("sub-e2e")).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let factory: ProviderFactory = Arc::new(move |_kind, _cfg| {
+            Box::new(MockProvider::ok(
+                ProviderKind::Anthropic,
+                "mock output",
+                received_clone.clone(),
+            ))
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let ctx = crate::execution::PromptRuntimeContext::new("test prompt", false);
+
+        run_pipeline_with_provider_factory(&def, 4, configs, &ctx, &output, tx, cancel, factory)
+            .await
+            .unwrap();
+
+        let events = collect_progress_events(rx);
+        assert!(
+            events.iter().any(|e| matches!(e, ProgressEvent::AllDone)),
+            "AllDone event must be emitted"
+        );
+        // The mock should have been called at least once (for the inner execution block + finalization)
+        let calls = received.lock().unwrap();
+        assert!(
+            !calls.is_empty(),
+            "inner sub-pipeline blocks should invoke the provider"
+        );
+
+        // HIGH fix: BlockFinished must be emitted for the sub-pipeline parent row
+        assert!(
+            events.iter().any(|e| matches!(e, ProgressEvent::BlockFinished { block_id, .. } if *block_id == 0)),
+            "BlockFinished must be emitted for sub-pipeline (runtime_id 0): {:?}",
+            events.iter().filter(|e| matches!(e, ProgressEvent::BlockFinished { .. } | ProgressEvent::BlockError { .. })).collect::<Vec<_>>()
+        );
+
+        // HIGH fix: parent-level output file must be written for downstream/feed consumers
+        let run_dir = output.run_dir();
+        let expected_parent_file = run_dir.join("sub_b1_pipeline.md");
+        assert!(
+            expected_parent_file.exists(),
+            "Parent-level output file {expected_parent_file:?} must be written",
+        );
+        let content = std::fs::read_to_string(&expected_parent_file).unwrap();
+        assert!(!content.is_empty(), "Parent-level output file must not be empty");
+    }
+
+    #[test]
+    fn test_deser_rejects_agents_on_sub_pipeline_block() {
+        let toml_str = r#"
+            id = 1
+            name = "bad"
+            agents = ["Claude"]
+            prompt = "x"
+            profiles = []
+            position = [0, 0]
+            replicas = 1
+
+            [sub_pipeline]
+            initial_prompt = "inner"
+            connections = []
+            session_configs = []
+            loop_connections = []
+            finalization_connections = []
+            data_feeds = []
+
+            [[sub_pipeline.blocks]]
+            id = 100
+            name = "B"
+            agents = ["Claude"]
+            prompt = "p"
+            profiles = []
+            position = [0, 0]
+
+            [[sub_pipeline.finalization_blocks]]
+            id = 200
+            name = "Fin"
+            agents = ["Claude"]
+            prompt = "fin"
+            profiles = []
+            position = [0, 1]
+        "#;
+        let result: Result<PipelineBlock, _> = toml::from_str(toml_str);
+        assert!(result.is_err(), "should reject agents on sub-pipeline block");
+        assert!(
+            result.unwrap_err().to_string().contains("must not have"),
+            "error should mention agents restriction"
+        );
+    }
+
+    #[test]
+    fn test_deser_allows_empty_agents_on_sub_pipeline_block() {
+        let toml_str = r#"
+            id = 1
+            name = "ok"
+            agents = []
+            prompt = ""
+            profiles = []
+            position = [0, 0]
+            replicas = 1
+
+            [sub_pipeline]
+            initial_prompt = "inner"
+            connections = []
+            session_configs = []
+            loop_connections = []
+            finalization_connections = []
+            data_feeds = []
+
+            [[sub_pipeline.blocks]]
+            id = 100
+            name = "B"
+            agents = ["Claude"]
+            prompt = "p"
+            profiles = []
+            position = [0, 0]
+
+            [[sub_pipeline.finalization_blocks]]
+            id = 200
+            name = "Fin"
+            agents = ["Claude"]
+            prompt = "fin"
+            profiles = []
+            position = [0, 1]
+        "#;
+        let result: Result<PipelineBlock, _> = toml::from_str(toml_str);
+        assert!(result.is_ok(), "empty agents on sub-pipeline should be allowed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_add_allowed_dir_on_provider_trait() {
+        // Verify the default trait implementation is a no-op (doesn't panic)
+        use crate::provider::Provider;
+        let mut mock = MockProvider::ok(ProviderKind::Anthropic, "test", Arc::new(Mutex::new(Vec::new())));
+        mock.add_allowed_dir("/tmp/test".into());
+        // Should not panic — default no-op
+    }
+
+    #[test]
+    fn test_sub_pipeline_filename_stem_passes_output_contract() {
+        let def = def_with(
+            vec![sub_pipeline_block(1, 0, 0, minimal_sub_def())],
+            vec![],
+        );
+        let rt = build_runtime_table(&def);
+        let sub_rid = rt.logical_to_runtime.get(&1).unwrap()[0];
+        let stem = &rt.entries[sub_rid as usize].filename_stem;
+        let filename = format!("{stem}.md");
+        assert!(
+            crate::post_run::is_pipeline_output_filename(&filename),
+            "Sub-pipeline filename '{filename}' must pass is_pipeline_output_filename",
+        );
+        // Loop variant too
+        let loop_filename = format!("{stem}_loop3.md");
+        assert!(
+            crate::post_run::is_pipeline_output_filename(&loop_filename),
+            "Sub-pipeline loop filename '{loop_filename}' must pass is_pipeline_output_filename",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sub_pipeline_in_loop_produces_loop_filenames() {
+        // Build a parent pipeline: sub-pipeline block (1) -> regular block (2)
+        // with a loop from block 2 back to block 1 (count=1 -> 2 total passes).
+        let sub_def = minimal_sub_def();
+
+        let def = PipelineDefinition {
+            initial_prompt: "test".into(),
+            blocks: vec![
+                sub_pipeline_block(1, 0, 0, sub_def),
+                block(2, 1, 0),
+            ],
+            connections: vec![conn(1, 2)],
+            session_configs: Vec::new(),
+            loop_connections: vec![lconn(2, 1, 1)],
+            finalization_blocks: Vec::new(),
+            finalization_connections: Vec::new(),
+            data_feeds: Vec::new(),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("sub-loop")).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let factory: ProviderFactory = Arc::new(move |_kind, _cfg| {
+            Box::new(MockProvider::ok(
+                ProviderKind::Anthropic,
+                "mock output",
+                received_clone.clone(),
+            ))
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let ctx = crate::execution::PromptRuntimeContext::new("test prompt", false);
+
+        run_pipeline_with_provider_factory(&def, 4, configs, &ctx, &output, tx, cancel, factory)
+            .await
+            .unwrap();
+
+        let events = collect_progress_events(rx);
+        assert!(
+            events.iter().any(|e| matches!(e, ProgressEvent::AllDone)),
+            "AllDone event must be emitted"
+        );
+
+        let run_dir = output.run_dir();
+        let pass0_file = run_dir.join("sub_b1_pipeline.md");
+        let pass1_file = run_dir.join("sub_b1_pipeline_loop1.md");
+
+        assert!(
+            pass0_file.exists(),
+            "Pass 0 output file {pass0_file:?} must exist in {run_dir:?}",
+        );
+        assert!(
+            pass1_file.exists(),
+            "Pass 1 (loop) output file {pass1_file:?} must exist in {run_dir:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sub_pipeline_provider_error_propagates_block_error() {
+        let sub_def = minimal_sub_def();
+        let def = def_with(vec![sub_pipeline_block(1, 0, 0, sub_def)], vec![]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("sub-err")).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let factory: ProviderFactory = Arc::new(move |_kind, _cfg| {
+            Box::new(MockProvider::err(
+                ProviderKind::Anthropic,
+                "inner provider failed",
+                received_clone.clone(),
+            ))
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let ctx = crate::execution::PromptRuntimeContext::new("test prompt", false);
+
+        run_pipeline_with_provider_factory(&def, 4, configs, &ctx, &output, tx, cancel, factory)
+            .await
+            .unwrap();
+
+        let events = collect_progress_events(rx);
+
+        // Sub-pipeline block (logical id 1) gets runtime_id 0
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProgressEvent::BlockError { block_id, .. } if *block_id == 0
+            )),
+            "BlockError must be emitted for the sub-pipeline block (runtime_id 0): {events:?}"
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(e, ProgressEvent::AllDone)),
+            "AllDone event must be emitted"
+        );
+
+        // The inner pipeline writes _errors.log inside the sub-run directory
+        let sub_errors_log = output.run_dir().join("sub_1").join("_errors.log");
+        assert!(
+            sub_errors_log.exists(),
+            "_errors.log must exist in sub-pipeline run dir {0:?}",
+            sub_errors_log
+        );
+        let log_content = std::fs::read_to_string(&sub_errors_log).unwrap();
+        assert!(
+            log_content.contains("inner provider failed"),
+            "_errors.log must contain the error text, got: {log_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sub_pipeline_cancel_stops_execution() {
+        let sub_def = minimal_sub_def();
+        let def = def_with(
+            vec![sub_pipeline_block(1, 0, 0, sub_def), block(2, 1, 0)],
+            vec![conn(1, 2)],
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("sub-cancel")).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let factory: ProviderFactory = Arc::new(move |_kind, _cfg| {
+            Box::new(MockProvider::ok(
+                ProviderKind::Anthropic,
+                "should not run",
+                received_clone.clone(),
+            ))
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Pre-cancelled before execution starts
+        let cancel = Arc::new(AtomicBool::new(true));
+
+        let configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let ctx = crate::execution::PromptRuntimeContext::new("test prompt", false);
+
+        run_pipeline_with_provider_factory(&def, 4, configs, &ctx, &output, tx, cancel, factory)
+            .await
+            .unwrap();
+
+        let events = collect_progress_events(rx);
+
+        assert!(
+            events.iter().any(|e| matches!(e, ProgressEvent::AllDone)),
+            "AllDone event must be emitted even when cancelled"
+        );
+
+        let calls = received.lock().unwrap();
+        assert!(
+            calls.is_empty(),
+            "Provider must never be called when cancelled, but got {0} calls",
+            calls.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sub_pipeline_error_skips_downstream() {
+        let sub_def = minimal_sub_def();
+        let def = def_with(
+            vec![sub_pipeline_block(1, 0, 0, sub_def), block(2, 1, 0)],
+            vec![conn(1, 2)],
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("sub-skip")).unwrap();
+
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        let factory: ProviderFactory = Arc::new(move |_kind, _cfg| {
+            Box::new(MockProvider::err(
+                ProviderKind::Anthropic,
+                "sub-pipeline broke",
+                received_clone.clone(),
+            ))
+        });
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    cli_print_mode: true,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let ctx = crate::execution::PromptRuntimeContext::new("test prompt", false);
+
+        run_pipeline_with_provider_factory(&def, 4, configs, &ctx, &output, tx, cancel, factory)
+            .await
+            .unwrap();
+
+        let events = collect_progress_events(rx);
+
+        // Sub-pipeline block (logical id 1) gets runtime_id 0
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProgressEvent::BlockError { block_id, .. } if *block_id == 0
+            )),
+            "BlockError must be emitted for the sub-pipeline block (runtime_id 0): {events:?}"
+        );
+
+        // Block 2 (logical id 2) gets runtime_id 1 and should be skipped
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProgressEvent::BlockSkipped { block_id, .. } if *block_id == 1
+            )),
+            "BlockSkipped must be emitted for the downstream block (runtime_id 1): {events:?}"
+        );
+
+        assert!(
+            events.iter().any(|e| matches!(e, ProgressEvent::AllDone)),
+            "AllDone event must be emitted"
         );
     }
 }
