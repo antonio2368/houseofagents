@@ -571,6 +571,8 @@ impl Provider for CliProvider {
                         let mut args = Vec::new();
                         if self.cli_print_mode {
                             args.push("-p".to_string());
+                            args.push("--system-prompt".to_string());
+                            args.push("Never use TodoWrite.".to_string());
                         }
                         args.push("--output-format".to_string());
                         args.push("text".to_string());
