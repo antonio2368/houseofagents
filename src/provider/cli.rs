@@ -35,7 +35,6 @@ pub struct CliProvider {
     reasoning_effort: Option<String>,
     thinking_effort: Option<String>,
     extra_cli_args: String,
-    cli_print_mode: bool,
     add_dirs: Vec<String>,
     session_id: Option<String>,
     session_started: bool,
@@ -55,7 +54,6 @@ impl CliProvider {
         reasoning_effort: Option<String>,
         thinking_effort: Option<String>,
         extra_cli_args: String,
-        cli_print_mode: bool,
         add_dirs: Vec<String>,
         timeout_seconds: u64,
         max_history_messages: usize,
@@ -67,7 +65,6 @@ impl CliProvider {
             reasoning_effort,
             thinking_effort,
             extra_cli_args,
-            cli_print_mode,
             add_dirs,
             session_id: match kind {
                 ProviderKind::Anthropic => Some(Uuid::new_v4().to_string()),
@@ -541,16 +538,40 @@ impl Provider for CliProvider {
             let message = &message;
             let output_path = self.output_path.take();
 
-            if output_path.is_some() && self.kind == ProviderKind::Anthropic {
-                if let Ok(extra_args) = self.parse_extra_cli_args() {
-                    if extra_args
-                        .iter()
-                        .any(|a| a == "-p" || a == "--system-prompt")
-                    {
-                        return Err(AppError::Provider {
-                            provider: self.provider_name().into(),
-                            message: "extra_cli_args contains -p or --system-prompt which conflicts with output_path file-write mode".into(),
-                        });
+            if let Ok(extra_args) = self.parse_extra_cli_args() {
+                match self.kind {
+                    ProviderKind::Anthropic => {
+                        if extra_args
+                            .iter()
+                            .any(|a| a == "-p" || a.starts_with("--system-prompt"))
+                        {
+                            return Err(AppError::Provider {
+                                provider: self.provider_name().into(),
+                                message: "extra_cli_args contains -p or --system-prompt which conflicts with internal CLI flags".into(),
+                            });
+                        }
+                    }
+                    ProviderKind::OpenAI => {
+                        if extra_args
+                            .iter()
+                            .any(|a| a == "-o" || a.starts_with("--output-last-message"))
+                        {
+                            return Err(AppError::Provider {
+                                provider: self.provider_name().into(),
+                                message: "extra_cli_args contains -o or --output-last-message which conflicts with internal Codex output capture".into(),
+                            });
+                        }
+                    }
+                    ProviderKind::Gemini => {
+                        if extra_args
+                            .iter()
+                            .any(|a| a.starts_with("--prompt") || a.starts_with("--output-format"))
+                        {
+                            return Err(AppError::Provider {
+                                provider: self.provider_name().into(),
+                                message: "extra_cli_args contains --prompt or --output-format which conflicts with internal Gemini CLI flags".into(),
+                            });
+                        }
                     }
                 }
             }
@@ -581,14 +602,22 @@ impl Provider for CliProvider {
                 self.build_prompt_from_history()
             };
 
-            if self.kind == ProviderKind::Anthropic
+            if (self.kind == ProviderKind::Anthropic || self.kind == ProviderKind::OpenAI)
                 && output_path.is_none()
-                && self.cli_print_mode
                 && !self.session_started
             {
                 prompt = format!(
                 "IMPORTANT: Do NOT write any files. Return everything in your output.\n\n{prompt}"
             );
+            }
+
+            if self.kind == ProviderKind::Gemini || self.kind == ProviderKind::OpenAI {
+                if let Some(ref path) = output_path {
+                    prompt = format!(
+                        "IMPORTANT: Write your complete final response ONLY to the file: {}. Do not create any other files.\n\n{prompt}",
+                        path.display()
+                    );
+                }
             }
 
             let bin = self.bin_name();
@@ -604,7 +633,7 @@ impl Provider for CliProvider {
                                 "Write your complete final response ONLY to the file: {}. Do not create any other files.",
                                 path.display()
                             ));
-                        } else if self.cli_print_mode {
+                        } else {
                             args.push("-p".to_string());
                             args.push("--system-prompt".to_string());
                             args.push("Never use TodoWrite.".to_string());
@@ -630,6 +659,14 @@ impl Provider for CliProvider {
                         args
                     }
                     ProviderKind::OpenAI => {
+                        if let Some(ref path) = output_path {
+                            if let Some(parent) = path.parent() {
+                                let parent_str = parent.display().to_string();
+                                if !self.add_dirs.iter().any(|d| d == &parent_str) {
+                                    self.add_dirs.push(parent_str);
+                                }
+                            }
+                        }
                         let (args, out_path) = match self.build_codex_args() {
                             Ok(v) => v,
                             Err(e) => {
@@ -664,20 +701,18 @@ impl Provider for CliProvider {
                 self.push_command_debug(&mut debug_logs, bin, &args);
                 self.emit_live_log(format!("start {} (timeout {}s)", bin, self.timeout_seconds));
 
-                if self.kind == ProviderKind::Anthropic {
-                    if let Some(ref path) = output_path {
-                        match fs::remove_file(path).await {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                let msg = format!(
-                                    "failed to remove stale output file {}: {e} — aborting to prevent reading old content",
-                                    path.display()
-                                );
-                                debug_logs.push(msg.clone());
-                                self.reset_after_send_error();
-                                return Err(Self::provider_error_with_debug(bin, msg, &debug_logs));
-                            }
+                if let Some(ref path) = output_path {
+                    match fs::remove_file(path).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            let msg = format!(
+                                "failed to remove stale output file {}: {e} — aborting to prevent reading old content",
+                                path.display()
+                            );
+                            debug_logs.push(msg.clone());
+                            self.reset_after_send_error();
+                            return Err(Self::provider_error_with_debug(bin, msg, &debug_logs));
                         }
                     }
                 }
@@ -915,29 +950,52 @@ impl Provider for CliProvider {
 
                 let mut output_file_was_written = false;
                 let content = if self.kind == ProviderKind::OpenAI {
-                    if let Some(path) = codex_output_path.as_ref() {
+                    // Always read and clean up the -o temp file
+                    let codex_temp_content = if let Some(path) = codex_output_path.as_ref() {
+                        let text = fs::read_to_string(path).await.ok();
+                        let _ = fs::remove_file(path).await;
+                        if let Some(ref t) = text {
+                            debug_logs
+                                .push(format!("codex temp output chars: {}", t.chars().count()));
+                        }
+                        text
+                    } else {
+                        None
+                    };
+
+                    if let Some(ref path) = output_path {
+                        // Try prompt-written output file first
                         match fs::read_to_string(path).await {
-                            Ok(text) => {
-                                let _ = fs::remove_file(path).await;
-                                debug_logs
-                                    .push(format!("codex output chars: {}", text.chars().count()));
+                            Ok(text) if !text.trim().is_empty() => {
+                                debug_logs.push(format!(
+                                    "output file read ({} chars): {}",
+                                    text.chars().count(),
+                                    path.display()
+                                ));
+                                output_file_was_written = true;
                                 text
                             }
-                            Err(e) => {
-                                let _ = fs::remove_file(path).await;
-                                self.reset_after_send_error();
-                                let msg = format!(
-                                    "failed to read codex output file {}: {e}",
+                            Ok(_) => {
+                                debug_logs.push(format!(
+                                    "output file empty, falling back to temp/stdout: {}",
                                     path.display()
-                                );
-                                debug_logs.push(msg.clone());
-                                return Err(Self::provider_error_with_debug(bin, msg, &debug_logs));
+                                ));
+                                let _ = fs::remove_file(path).await;
+                                codex_temp_content.unwrap_or(stdout_text)
+                            }
+                            Err(_) => {
+                                debug_logs.push(format!(
+                                    "output file not found, falling back to temp/stdout: {}",
+                                    path.display()
+                                ));
+                                codex_temp_content.unwrap_or(stdout_text)
                             }
                         }
                     } else {
-                        stdout_text
+                        codex_temp_content.unwrap_or(stdout_text)
                     }
-                } else if self.kind == ProviderKind::Anthropic {
+                } else {
+                    // Anthropic, Gemini, and future providers: try output_path, fall back to stdout
                     if let Some(ref path) = output_path {
                         match fs::read_to_string(path).await {
                             Ok(text) if !text.trim().is_empty() => {
@@ -968,16 +1026,10 @@ impl Provider for CliProvider {
                     } else {
                         stdout_text
                     }
-                } else {
-                    stdout_text
                 };
                 // Guard: if output_path was set and both file and stdout are empty,
                 // treat as an error rather than silently producing an empty artifact.
-                if self.kind == ProviderKind::Anthropic
-                    && output_path.is_some()
-                    && !output_file_was_written
-                    && content.trim().is_empty()
-                {
+                if output_path.is_some() && !output_file_was_written && content.trim().is_empty() {
                     debug_logs.push(
                         "output file not written and stdout empty — no response captured".into(),
                     );
@@ -1027,7 +1079,6 @@ mod tests {
             None,
             None,
             extra.to_string(),
-            true,
             Vec::new(),
             30,
             50,
@@ -1078,7 +1129,6 @@ mod tests {
             Some("high".to_string()),
             None,
             "--sandbox full".to_string(),
-            false,
             Vec::new(),
             30,
             50,
@@ -1154,7 +1204,6 @@ not json
             None,
             None,
             String::new(),
-            false,
             Vec::new(),
             30,
             50,
@@ -1232,7 +1281,6 @@ not json
             None,
             None,
             String::new(),
-            false,
             Vec::new(),
             30,
             50,
@@ -1242,7 +1290,7 @@ not json
     }
 
     #[tokio::test]
-    async fn anthropic_output_path_rejects_print_flag_in_extra_args() {
+    async fn anthropic_rejects_print_flag_in_extra_args() {
         use crate::provider::Provider;
         let mut provider = CliProvider::new(
             ProviderKind::Anthropic,
@@ -1250,23 +1298,21 @@ not json
             None,
             None,
             "-p".to_string(),
-            true,
             Vec::new(),
             30,
             50,
             0,
         );
-        provider.set_output_path(Some(PathBuf::from("/tmp/test_output.md")));
         let result = provider.send("test").await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("conflicts with output_path"));
+            .contains("conflicts with internal CLI flags"));
     }
 
     #[tokio::test]
-    async fn anthropic_output_path_rejects_system_prompt_in_extra_args() {
+    async fn anthropic_rejects_system_prompt_in_extra_args() {
         use crate::provider::Provider;
         let mut provider = CliProvider::new(
             ProviderKind::Anthropic,
@@ -1274,7 +1320,50 @@ not json
             None,
             None,
             "--system-prompt 'custom'".to_string(),
-            true,
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let result = provider.send("test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with internal CLI flags"));
+    }
+
+    #[tokio::test]
+    async fn codex_rejects_output_flag_in_extra_args() {
+        use crate::provider::Provider;
+        let mut provider = CliProvider::new(
+            ProviderKind::OpenAI,
+            String::new(),
+            None,
+            None,
+            "-o /tmp/custom.txt".to_string(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let result = provider.send("test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with internal Codex output capture"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_rejects_print_flag_even_with_output_path() {
+        use crate::provider::Provider;
+        let mut provider = CliProvider::new(
+            ProviderKind::Anthropic,
+            String::new(),
+            None,
+            None,
+            "-p".to_string(),
             Vec::new(),
             30,
             50,
@@ -1286,6 +1375,158 @@ not json
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("conflicts with output_path"));
+            .contains("conflicts with internal CLI flags"));
+    }
+
+    #[tokio::test]
+    async fn gemini_rejects_prompt_flag_in_extra_args() {
+        use crate::provider::Provider;
+        let mut provider = CliProvider::new(
+            ProviderKind::Gemini,
+            String::new(),
+            None,
+            None,
+            "--prompt something".to_string(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let result = provider.send("test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with internal Gemini CLI flags"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_rejects_system_prompt_equals_form() {
+        use crate::provider::Provider;
+        let mut provider = CliProvider::new(
+            ProviderKind::Anthropic,
+            String::new(),
+            None,
+            None,
+            "--system-prompt=custom".to_string(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let result = provider.send("test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with internal CLI flags"));
+    }
+
+    #[tokio::test]
+    async fn codex_rejects_output_last_message_flag() {
+        use crate::provider::Provider;
+        let mut provider = CliProvider::new(
+            ProviderKind::OpenAI,
+            String::new(),
+            None,
+            None,
+            "--output-last-message /tmp/out.txt".to_string(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let result = provider.send("test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with internal Codex output capture"));
+    }
+
+    #[tokio::test]
+    async fn codex_rejects_output_last_message_equals_form() {
+        use crate::provider::Provider;
+        let mut provider = CliProvider::new(
+            ProviderKind::OpenAI,
+            String::new(),
+            None,
+            None,
+            "--output-last-message=/tmp/out.txt".to_string(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let result = provider.send("test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with internal Codex output capture"));
+    }
+
+    #[tokio::test]
+    async fn gemini_rejects_prompt_equals_form() {
+        use crate::provider::Provider;
+        let mut provider = CliProvider::new(
+            ProviderKind::Gemini,
+            String::new(),
+            None,
+            None,
+            "--prompt=something".to_string(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let result = provider.send("test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with internal Gemini CLI flags"));
+    }
+
+    #[tokio::test]
+    async fn gemini_rejects_output_format_equals_form() {
+        use crate::provider::Provider;
+        let mut provider = CliProvider::new(
+            ProviderKind::Gemini,
+            String::new(),
+            None,
+            None,
+            "--output-format=json".to_string(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let result = provider.send("test").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("conflicts with internal Gemini CLI flags"));
+    }
+
+    #[test]
+    fn codex_args_always_uses_temp_output_path() {
+        let provider = CliProvider::new(
+            ProviderKind::OpenAI,
+            "model".to_string(),
+            None,
+            None,
+            String::new(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        let (args, path) = provider.build_codex_args().unwrap();
+        // Should use a temp path, not any specific output_path
+        assert!(path.to_string_lossy().contains("houseofagents-codex-last-"));
+        assert!(args.contains(&"-o".to_string()));
+        assert!(args.contains(&path.display().to_string()));
     }
 }
