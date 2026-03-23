@@ -240,12 +240,13 @@ pub async fn run_swarm(
 }
 
 fn build_swarm_message(outputs: &HashMap<String, String>) -> String {
+    use std::fmt::Write;
     let mut msg = String::from("Here are the outputs from all agents in the previous round:\n\n");
     let mut keys: Vec<&String> = outputs.keys().collect();
     keys.sort();
     for name in keys {
         if let Some(output) = outputs.get(name) {
-            msg.push_str(&format!("=== {name}'s output ===\n{output}\n\n"));
+            write!(msg, "=== {name}'s output ===\n{output}\n\n").unwrap();
         }
     }
     msg.push_str("Review all perspectives and provide your updated analysis.");

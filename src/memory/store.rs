@@ -578,32 +578,33 @@ impl MemoryStore {
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("List query failed: {e}"))?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
         let rows = stmt
-            .query_map(params_refs.as_slice(), |row| {
-                let kind_str: String = row.get(2)?;
-                let kind = kind_str
-                    .parse::<MemoryKind>()
-                    .unwrap_or(MemoryKind::Observation);
-                Ok(Memory {
-                    id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    kind,
-                    content: row.get(3)?,
-                    reasoning: row.get(4)?,
-                    source_run: row.get(5)?,
-                    source_agent: row.get(6)?,
-                    evidence_count: row.get(7)?,
-                    tags: row.get(8)?,
-                    created_at: row.get(9)?,
-                    expires_at: row.get(10)?,
-                    updated_at: row.get(11)?,
-                    recall_count: row.get(12)?,
-                    last_recalled_at: row.get(13)?,
-                    archived: row.get::<_, i64>(14)? != 0,
-                })
-            })
+            .query_map(
+                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+                |row| {
+                    let kind_str: String = row.get(2)?;
+                    let kind = kind_str
+                        .parse::<MemoryKind>()
+                        .unwrap_or(MemoryKind::Observation);
+                    Ok(Memory {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        kind,
+                        content: row.get(3)?,
+                        reasoning: row.get(4)?,
+                        source_run: row.get(5)?,
+                        source_agent: row.get(6)?,
+                        evidence_count: row.get(7)?,
+                        tags: row.get(8)?,
+                        created_at: row.get(9)?,
+                        expires_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                        recall_count: row.get(12)?,
+                        last_recalled_at: row.get(13)?,
+                        archived: row.get::<_, i64>(14)? != 0,
+                    })
+                },
+            )
             .map_err(|e| format!("List query failed: {e}"))?;
 
         let memories: Vec<Memory> = rows.flatten().collect();
@@ -635,14 +636,8 @@ impl MemoryStore {
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|e| format!("delete_batch prepare failed: {e}"))?;
-            let params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk
-                .iter()
-                .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-                .collect();
-            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
             total += stmt
-                .execute(params_refs.as_slice())
+                .execute(rusqlite::params_from_iter(chunk.iter()))
                 .map_err(|e| format!("delete_batch failed: {e}"))?;
         }
         Ok(total)
@@ -676,15 +671,9 @@ impl MemoryStore {
             let mut stmt = conn
                 .prepare(&sql)
                 .map_err(|e| format!("mark_recalled prepare failed: {e}"))?;
-            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> =
-                Vec::with_capacity(chunk.len() + 1);
-            params.push(Box::new(now.clone()));
-            for id in chunk {
-                params.push(Box::new(*id));
-            }
-            let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            stmt.execute(params_refs.as_slice())
+            let params = std::iter::once(&now as &dyn rusqlite::types::ToSql)
+                .chain(chunk.iter().map(|id| id as &dyn rusqlite::types::ToSql));
+            stmt.execute(rusqlite::params_from_iter(params))
                 .map_err(|e| format!("mark_recalled failed: {e}"))?;
         }
         Ok(())
@@ -722,10 +711,11 @@ impl MemoryStore {
         let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| format!("Count query failed: {e}"))?;
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
         let count: u64 = stmt
-            .query_row(params_refs.as_slice(), |row| row.get(0))
+            .query_row(
+                rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+                |row| row.get(0),
+            )
             .map_err(|e| format!("Count query failed: {e}"))?;
         Ok(count)
     }

@@ -39,6 +39,7 @@ struct PipelineTaskMetadata {
 
 struct PipelineMessageContext<'a> {
     def: &'a PipelineDefinition,
+    block_map: &'a HashMap<BlockId, &'a PipelineBlock>,
     block_outputs: &'a HashMap<u32, String>,
     output: &'a OutputManager,
     prompt_context: &'a PromptRuntimeContext,
@@ -1620,9 +1621,11 @@ pub(crate) fn validate_pipeline(def: &PipelineDefinition) -> Result<(), AppError
         }
 
         // Scatter source must have logical_task_count() == 1
+        let scatter_block_map: HashMap<BlockId, &PipelineBlock> =
+            def.blocks.iter().map(|b| (b.id, b)).collect();
         for conn in &def.connections {
             if conn.scatter {
-                if let Some(block) = def.blocks.iter().find(|b| b.id == conn.from) {
+                if let Some(block) = scatter_block_map.get(&conn.from) {
                     if block.logical_task_count() != 1 {
                         return Err(AppError::Config(format!(
                             "Scatter source block {} has logical_task_count {} (must be 1)",
@@ -2260,9 +2263,11 @@ async fn run_pipeline_with_provider_factory(
     }));
 
     // Build provider pool keyed by (agent, runtime_session_key).
+    // Shared sessions intentionally serialize through a single pooled provider
+    // to maintain conversation state within each (agent, session_key) pair.
     // Sub-pipeline entries have synthetic agent names like "[Sub#N]" which
     // won't match any config — they are harmlessly skipped here.
-    let mut provider_pool: ProviderPool = HashMap::new();
+    let mut provider_pool: ProviderPool = HashMap::with_capacity(rt.entries.len());
     for entry in &rt.entries {
         let pool_key = (entry.agent.clone(), entry.session_key.clone());
         if let std::collections::hash_map::Entry::Vacant(vacant) = provider_pool.entry(pool_key) {
@@ -2278,7 +2283,7 @@ async fn run_pipeline_with_provider_factory(
     let block_map: HashMap<BlockId, &PipelineBlock> =
         def.blocks.iter().map(|b| (b.id, b)).collect();
     let mut in_degree: HashMap<BlockId, usize> = def.blocks.iter().map(|b| (b.id, 0)).collect();
-    let mut downstream: HashMap<BlockId, Vec<BlockId>> = HashMap::new();
+    let mut downstream: HashMap<BlockId, Vec<BlockId>> = HashMap::with_capacity(def.blocks.len());
     for conn in &def.connections {
         let from_replicas = graph.replicas.get(&conn.from).copied().unwrap_or(1) as usize;
         *in_degree.entry(conn.to).or_default() += from_replicas;
@@ -2298,7 +2303,7 @@ async fn run_pipeline_with_provider_factory(
         let mut current_in_degree = in_degree.clone();
         let mut failed_replicas: HashSet<u32> = HashSet::new();
         let mut failed_logical: HashSet<BlockId> = HashSet::new();
-        let mut replica_outputs: HashMap<u32, String> = HashMap::new();
+        let mut replica_outputs: HashMap<u32, String> = HashMap::with_capacity(rt.entries.len());
         let mut completed = 0usize;
 
         // Loop runtime state (clone from prepared sub_dags)
@@ -2535,7 +2540,7 @@ async fn run_pipeline_with_provider_factory(
                         let parent_loop_pass: u32 = *block_loop_pass.get(&block_id).unwrap_or(&0);
                         let parent_block_name = block.name.clone();
                         let upstream_context = assemble_raw_upstream_context(
-                            block, def, &rt, &replica_outputs,
+                            block, def, &rt, &replica_outputs, &block_map,
                         );
 
                         for &rid in rids {
@@ -2604,31 +2609,30 @@ async fn run_pipeline_with_provider_factory(
                             }
 
                             // Clone sub_def and inject upstream + scatter into initial_prompt
-                            let sub_def = block.sub_pipeline.as_ref().unwrap().clone();
-                            let mut sub_def_ctx = sub_def;
+                            let mut sub_def_ctx = block.sub_pipeline.as_ref().unwrap().clone();
                             let mut final_prompt = sub_def_ctx.initial_prompt.clone();
                             if !upstream_context.is_empty() {
                                 if final_prompt.is_empty() {
                                     final_prompt = upstream_context.clone();
                                 } else {
-                                    final_prompt = format!(
-                                        "{final_prompt}\n\n--- Input from parent pipeline ---\n{upstream_context}",
-                                    );
+                                    final_prompt
+                                        .push_str("\n\n--- Input from parent pipeline ---\n");
+                                    final_prompt.push_str(&upstream_context);
                                 }
                             }
                             if let Some(ref item) = scatter_item {
-                                let scatter_header = format!(
+                                use std::fmt::Write;
+                                if !final_prompt.is_empty() {
+                                    final_prompt.push_str("\n\n");
+                                }
+                                write!(
+                                    final_prompt,
                                     "--- Scatter item {}/{} ---\n{}",
                                     item.index + 1,
                                     scatter_total,
                                     item.content,
-                                );
-                                if final_prompt.is_empty() {
-                                    final_prompt = scatter_header;
-                                } else {
-                                    final_prompt =
-                                        format!("{final_prompt}\n\n{scatter_header}");
-                                }
+                                )
+                                .unwrap();
                             }
                             sub_def_ctx.initial_prompt = final_prompt;
 
@@ -3058,12 +3062,13 @@ async fn run_pipeline_with_provider_factory(
                                         &ls.prompt, &replica_outputs, &rt, output,
                                         prompt_context, &block_to_loop, &block_loop_pass,
                                         scatter_injection.as_deref(),
+                                        &block_map,
                                     )
                                 } else {
                                     build_pipeline_block_message(
                                         block, use_cli,
                                         &PipelineMessageContext {
-                                            def,
+                                            def, block_map: &block_map,
                                             block_outputs: &replica_outputs,
                                             output, prompt_context, runtime_table: &rt,
                                             block_to_loop: &block_to_loop,
@@ -3079,7 +3084,7 @@ async fn run_pipeline_with_provider_factory(
                             build_pipeline_block_message(
                                 block, use_cli,
                                 &PipelineMessageContext {
-                                    def,
+                                    def, block_map: &block_map,
                                     block_outputs: &replica_outputs,
                                     output, prompt_context, runtime_table: &rt,
                                     block_to_loop: &block_to_loop,
@@ -3784,6 +3789,7 @@ fn assemble_raw_upstream_context(
     def: &PipelineDefinition,
     runtime_table: &RuntimeReplicaTable,
     block_outputs: &HashMap<u32, String>,
+    block_map: &HashMap<BlockId, &PipelineBlock>,
 ) -> String {
     let upstream_ids = upstream_of_non_scatter(def, block.id);
     if upstream_ids.is_empty() {
@@ -3797,7 +3803,7 @@ fn assemble_raw_upstream_context(
                     if !upstream_content.is_empty() {
                         upstream_content.push_str("\n\n---\n\n");
                     }
-                    let upstream_block = def.blocks.iter().find(|b| b.id == *uid);
+                    let upstream_block = block_map.get(uid).copied();
                     let needs_label = upstream_block
                         .map(|b| b.logical_task_count() > 1)
                         .unwrap_or(false);
@@ -3819,6 +3825,29 @@ fn assemble_raw_upstream_context(
     } else {
         format!("--- Upstream outputs ---\n{upstream_content}")
     }
+}
+
+/// Apply profile prefix, scatter injection, and augmentation to a base message.
+/// Shared by `build_pipeline_block_message` and `build_loop_rerun_message_v2`.
+fn apply_profiles_scatter_augment(
+    base: String,
+    profiles: &[String],
+    use_cli: bool,
+    scatter_injection: Option<&str>,
+    prompt_context: &PromptRuntimeContext,
+) -> String {
+    let profile_prefix = resolve_profile_instructions(profiles, use_cli);
+    let with_profiles = if profile_prefix.is_empty() {
+        base
+    } else {
+        format!("{profile_prefix}{base}")
+    };
+    let full = if let Some(scatter_text) = scatter_injection {
+        format!("{with_profiles}\n\n{scatter_text}")
+    } else {
+        with_profiles
+    };
+    prompt_context.augment_prompt_for_agent(&full, use_cli)
 }
 
 fn build_pipeline_block_message(
@@ -3869,7 +3898,7 @@ fn build_pipeline_block_message(
         } else {
             let mut upstream_content = String::new();
             for uid in &upstream_ids {
-                let upstream_block = context.def.blocks.iter().find(|b| b.id == *uid);
+                let upstream_block = context.block_map.get(uid).copied();
                 if let Some(rids) = context.runtime_table.logical_to_runtime.get(uid) {
                     for &rid in rids {
                         if let Some(content) = context.block_outputs.get(&rid) {
@@ -3903,20 +3932,13 @@ fn build_pipeline_block_message(
         base_message
     };
 
-    let profile_prefix = resolve_profile_instructions(&block.profiles, use_cli);
-    let with_profiles = if profile_prefix.is_empty() {
-        base_message
-    } else {
-        format!("{profile_prefix}{base_message}")
-    };
-    let full_message = if let Some(ref scatter_text) = context.scatter_injection {
-        format!("{with_profiles}\n\n{scatter_text}")
-    } else {
-        with_profiles
-    };
-    context
-        .prompt_context
-        .augment_prompt_for_agent(&full_message, use_cli)
+    apply_profiles_scatter_augment(
+        base_message,
+        &block.profiles,
+        use_cli,
+        context.scatter_injection.as_deref(),
+        context.prompt_context,
+    )
 }
 
 /// Loop-aware filename resolver for CLI upstream references.
@@ -4050,6 +4072,7 @@ fn build_loop_rerun_message_v2(
     block_to_loop: &HashMap<BlockId, (BlockId, BlockId)>,
     block_loop_pass: &HashMap<BlockId, u32>,
     scatter_injection: Option<&str>,
+    block_map: &HashMap<BlockId, &PipelineBlock>,
 ) -> String {
     let mut message = String::new();
 
@@ -4105,7 +4128,7 @@ fn build_loop_rerun_message_v2(
                             if !upstream_content.is_empty() {
                                 upstream_content.push_str("\n\n---\n\n");
                             }
-                            let upstream_block = def.blocks.iter().find(|b| b.id == uid);
+                            let upstream_block = block_map.get(&uid).copied();
                             let needs_label = upstream_block
                                 .map(|b| b.logical_task_count() > 1)
                                 .unwrap_or(false);
@@ -4191,18 +4214,13 @@ fn build_loop_rerun_message_v2(
         message.push_str(&scatter_source_instruction(delim));
     }
 
-    let profile_prefix = resolve_profile_instructions(&block.profiles, use_cli);
-    let with_profiles = if profile_prefix.is_empty() {
-        message
-    } else {
-        format!("{profile_prefix}{message}")
-    };
-    let full_message = if let Some(scatter_text) = scatter_injection {
-        format!("{with_profiles}\n\n{scatter_text}")
-    } else {
-        with_profiles
-    };
-    prompt_context.augment_prompt_for_agent(&full_message, use_cli)
+    apply_profiles_scatter_augment(
+        message,
+        &block.profiles,
+        use_cli,
+        scatter_injection,
+        prompt_context,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4485,19 +4503,62 @@ fn collect_feed_data(
         // Step 7: Sort for determinism
         matched_files.sort_by(|a, b| post_run::natural_cmp(&a.0, &b.0));
 
-        // Step 8: Read contents and assemble
+        // Step 8: Read contents and assemble (bounded reads to enforce budget)
         for (name, path) in &matched_files {
-            if assembled.len() >= budget {
+            let remaining = budget.saturating_sub(assembled.len());
+            if remaining == 0 {
                 assembled.push_str("\n[... feed data truncated at 512 KB budget ...]\n");
                 break;
             }
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let run_label = if run_dirs.len() > 1 {
-                    format!("(run {dir_run_id}) ")
-                } else {
-                    String::new()
+            let header = if run_dirs.len() > 1 {
+                format!("### (run {dir_run_id}) {name}\n")
+            } else {
+                format!("### {name}\n")
+            };
+            if header.len() >= remaining {
+                assembled.push_str("\n[... feed data truncated at 512 KB budget ...]\n");
+                break;
+            }
+            let content_budget = remaining - header.len();
+            if let Ok(file) = std::fs::File::open(path) {
+                use std::io::Read;
+                // Read into bytes to avoid read_to_string failing on a
+                // multi-byte UTF-8 character split at the take boundary.
+                let mut buf = Vec::with_capacity((content_budget + 1).min(64 * 1024));
+                let _ = file.take((content_budget + 1) as u64).read_to_end(&mut buf);
+                if buf.is_empty() {
+                    continue;
+                }
+                // If we read more than the budget, the file was larger
+                let overflowed = buf.len() > content_budget;
+                if overflowed {
+                    buf.truncate(content_budget);
+                }
+                // Find the last valid UTF-8 boundary within the bytes read
+                let valid_end = match std::str::from_utf8(&buf) {
+                    Ok(_) => buf.len(),
+                    Err(e) => e.valid_up_to(),
                 };
-                assembled.push_str(&format!("### {run_label}{name}\n{content}\n\n"));
+                if valid_end == 0 {
+                    // Budget too small to hold even the first UTF-8 scalar
+                    // (e.g. 1-3 bytes left and the file starts with a 4-byte
+                    // emoji). Skip silently — emitting a header + truncation
+                    // marker here would overshoot the budget by more than the
+                    // bytes we're saving. The next loop iteration will hit
+                    // remaining == 0 and emit the global budget marker.
+                    continue;
+                }
+                let content = &buf[..valid_end];
+                let truncated = valid_end < buf.len() || overflowed;
+                // Push header only after confirming we have content
+                assembled.push_str(&header);
+                // SAFETY: content is guaranteed valid UTF-8 by from_utf8 / valid_up_to
+                assembled.push_str(std::str::from_utf8(content).unwrap());
+                if truncated {
+                    assembled.push_str("\n[... truncated ...]\n\n");
+                } else {
+                    assembled.push_str("\n\n");
+                }
             }
         }
     }
@@ -5785,8 +5846,10 @@ to = 1
         let rt = build_runtime_table(&def);
         let btl = HashMap::new();
         let blp = HashMap::new();
+        let bm: HashMap<BlockId, &PipelineBlock> = def.blocks.iter().map(|b| (b.id, b)).collect();
         let message_context = PipelineMessageContext {
             def: &def,
+            block_map: &bm,
             block_outputs: &block_outputs,
             output: &output,
             prompt_context: &context,
@@ -8574,6 +8637,197 @@ position = [0, 0]
         );
     }
 
+    #[test]
+    fn collect_feed_data_respects_budget_with_multibyte_chars() {
+        // Regression: File::take on a multi-byte boundary must not lose the file.
+        // Creates a file with CJK + emoji content exceeding the 512 KB budget,
+        // verifies the result is valid UTF-8 and stays within budget.
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let mut def = def_with(vec![block(1, 0, 0)], vec![]);
+        def.finalization_blocks = vec![fin_block(10, 0, 0)];
+        let rt = build_runtime_table(&def);
+        let stem = &rt.entries[0].filename_stem;
+
+        // Build content: ~600 KB of 4-byte emoji (well past 512 KB budget)
+        let emoji_content = "\u{1F600}".repeat(150_000); // 150k × 4 bytes = 600 KB
+        std::fs::write(run_dir.join(format!("{stem}.md")), &emoji_content).unwrap();
+
+        let scope = FinalizationRunScope::SingleRun {
+            run_id: 1,
+            run_dir: run_dir.clone(),
+        };
+        let feed = DataFeed {
+            from: 1,
+            to: 10,
+            collection: FeedCollection::LastPass,
+            granularity: FeedGranularity::PerRun,
+        };
+        let result = collect_feed_data(&feed, &def, &rt, &scope, Some(1)).unwrap();
+
+        // Must be valid UTF-8
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
+        // Must stay within budget (plus reasonable overhead for headers/truncation markers)
+        assert!(
+            result.len() <= super::MAX_FEED_ASSEMBLY_BYTES + 200,
+            "result {} bytes exceeds budget",
+            result.len()
+        );
+        // Must contain some of the emoji content (not silently dropped)
+        assert!(
+            result.contains('\u{1F600}'),
+            "emoji content must not be silently dropped"
+        );
+        // Must contain truncation marker
+        assert!(
+            result.contains("[... truncated ...]"),
+            "should indicate truncation for oversized file"
+        );
+    }
+
+    #[test]
+    fn collect_feed_data_exact_fit_file_has_no_truncation_marker() {
+        // When a file's size exactly equals the content budget, no bytes are
+        // lost — the truncation marker must NOT appear (false-positive guard).
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        let mut def = def_with(vec![block(1, 0, 0)], vec![]);
+        def.finalization_blocks = vec![fin_block(10, 0, 0)];
+        let rt = build_runtime_table(&def);
+        let stem = &rt.entries[0].filename_stem;
+        let filename = format!("{stem}.md");
+
+        // Compute the exact content budget:
+        // budget = 512 KB, header = "### {filename}\n", content_budget = budget - header.len()
+        let header = format!("### {filename}\n");
+        let content_budget = super::MAX_FEED_ASSEMBLY_BYTES - header.len();
+
+        // Write a file whose size exactly matches content_budget (all ASCII)
+        let content = "A".repeat(content_budget);
+        std::fs::write(run_dir.join(&filename), &content).unwrap();
+
+        let scope = FinalizationRunScope::SingleRun {
+            run_id: 1,
+            run_dir: run_dir.clone(),
+        };
+        let feed = DataFeed {
+            from: 1,
+            to: 10,
+            collection: FeedCollection::LastPass,
+            granularity: FeedGranularity::PerRun,
+        };
+        let result = collect_feed_data(&feed, &def, &rt, &scope, Some(1)).unwrap();
+
+        // Must NOT contain the truncation marker — the file fit exactly
+        assert!(
+            !result.contains("[... truncated ...]"),
+            "exact-fit file should not be marked as truncated"
+        );
+        // Must contain the full content
+        assert!(
+            result.contains(&content),
+            "exact-fit file content must be fully present"
+        );
+    }
+
+    #[test]
+    fn collect_feed_data_zero_valid_prefix_skips_gracefully() {
+        // When the budget is nearly exhausted and the next file starts with a
+        // multi-byte character that doesn't fit in the remaining bytes, the
+        // file is silently skipped (valid_end == 0 path). Verify no panic
+        // and valid UTF-8 output.
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run1");
+        std::fs::create_dir_all(&run_dir).unwrap();
+
+        // Two-agent block so we get two output files from a single feed
+        let two_agent_block = PipelineBlock {
+            id: 1,
+            name: "Block#1".into(),
+            agents: vec!["A".into(), "Z".into()],
+            prompt: "block 1".into(),
+            profiles: vec![],
+            session_id: None,
+            position: (0, 0),
+            replicas: 1,
+            sub_pipeline: None,
+        };
+        let mut def = def_with(vec![two_agent_block], vec![]);
+        def.finalization_blocks = vec![fin_block(10, 0, 0)];
+        let rt = build_runtime_table(&def);
+
+        // Identify the two stems (sorted by natural_cmp, "A" < "Z")
+        let stems: Vec<&str> = rt
+            .entries
+            .iter()
+            .filter(|e| e.source_block_id == 1)
+            .map(|e| e.filename_stem.as_str())
+            .collect();
+        assert_eq!(
+            stems.len(),
+            2,
+            "must have two runtime entries for two agents"
+        );
+
+        // Find which stem sorts first (agent "A") and which second (agent "Z")
+        let mut file_names: Vec<String> = stems.iter().map(|s| format!("{s}.md")).collect();
+        file_names.sort();
+
+        // First file: fill budget leaving only 2 bytes of content space for the second file.
+        // The header for the second file is "### {second_filename}\n".
+        let second_header = format!("### {}\n", file_names[1]);
+        // After assembling the first file, remaining = budget - assembled.len().
+        // We want: remaining - second_header.len() = 2 (content_budget for second file).
+        // So: remaining = second_header.len() + 2.
+        // First file assembly = header1 + content1 + "\n\n" (non-truncated suffix).
+        let first_header = format!("### {}\n", file_names[0]);
+        let budget = super::MAX_FEED_ASSEMBLY_BYTES;
+        let target_remaining = second_header.len() + 2;
+        // assembled.len() after first file = budget - target_remaining
+        // = first_header.len() + content1.len() + 2 ("\n\n")
+        let first_content_len = budget - target_remaining - first_header.len() - 2;
+        let first_content = "x".repeat(first_content_len);
+        std::fs::write(run_dir.join(&file_names[0]), &first_content).unwrap();
+
+        // Second file: starts with a 4-byte emoji. content_budget=2 can't hold it.
+        std::fs::write(run_dir.join(&file_names[1]), "\u{1F600}hello").unwrap();
+
+        let scope = FinalizationRunScope::SingleRun {
+            run_id: 1,
+            run_dir: run_dir.clone(),
+        };
+        let feed = DataFeed {
+            from: 1,
+            to: 10,
+            collection: FeedCollection::LastPass,
+            granularity: FeedGranularity::PerRun,
+        };
+        let result = collect_feed_data(&feed, &def, &rt, &scope, Some(1)).unwrap();
+
+        // Must be valid UTF-8
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "must be valid UTF-8"
+        );
+        // The first file's content must be present
+        assert!(
+            result.contains(&first_content[..100]),
+            "first file content must be present"
+        );
+        // The second file (emoji) must NOT have a header — it was silently skipped
+        assert!(
+            !result.contains(&file_names[1]),
+            "zero-valid-prefix file should be silently skipped (no header emitted)"
+        );
+    }
+
     #[tokio::test]
     async fn test_early_break_completes_and_emits_all_done() {
         // A(1)→B(2)→C(3) with loop_back(B, A, count=5) and break_agent="Claude".
@@ -9027,7 +9281,8 @@ position = [0, 0]
         let rid_1 = rt.logical_to_runtime.get(&1).unwrap()[0];
         outputs.insert(rid_1, "hello from block 1".into());
 
-        let ctx = assemble_raw_upstream_context(&def.blocks[1], &def, &rt, &outputs);
+        let bm: HashMap<BlockId, &PipelineBlock> = def.blocks.iter().map(|b| (b.id, b)).collect();
+        let ctx = assemble_raw_upstream_context(&def.blocks[1], &def, &rt, &outputs, &bm);
         assert!(ctx.contains("hello from block 1"));
         // No cwd prefix, no memory, no diagnostics
         assert!(!ctx.contains("Working directory"));
@@ -10207,8 +10462,10 @@ position = [0, 0]
         let rt = build_runtime_table(&def);
         let btl = HashMap::new();
         let blp = HashMap::new();
+        let bm: HashMap<BlockId, &PipelineBlock> = def.blocks.iter().map(|b| (b.id, b)).collect();
         let msg_ctx = PipelineMessageContext {
             def: &def,
+            block_map: &bm,
             block_outputs: &block_outputs,
             output: &output,
             prompt_context: &ctx,
@@ -10259,8 +10516,10 @@ position = [0, 0]
         let rt = build_runtime_table(&def);
         let btl = HashMap::new();
         let blp = HashMap::new();
+        let bm: HashMap<BlockId, &PipelineBlock> = def.blocks.iter().map(|b| (b.id, b)).collect();
         let msg_ctx = PipelineMessageContext {
             def: &def,
+            block_map: &bm,
             block_outputs: &block_outputs,
             output: &output,
             prompt_context: &ctx,
@@ -10443,6 +10702,7 @@ position = [0, 0]
         let blp = HashMap::from([(1, 1u32), (2, 1u32), (3, 1u32)]);
         let loop_sub_dag: HashSet<BlockId> = [1, 2, 3].into_iter().collect();
 
+        let bm: HashMap<BlockId, &PipelineBlock> = def.blocks.iter().map(|b| (b.id, b)).collect();
         let msg = build_loop_rerun_message_v2(
             &def.blocks[0], // block 1
             false,
@@ -10459,6 +10719,7 @@ position = [0, 0]
             &btl,
             &blp,
             None,
+            &bm,
         );
 
         assert!(

@@ -298,11 +298,16 @@ impl OutputManager {
 
         // Sort newest-first by mtime, breaking ties by the timestamp embedded
         // in the directory name (reverse order so later dates come first).
-        entries.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| path_sort_key(&b.1).cmp(&path_sort_key(&a.1)))
-        });
-        Ok(entries.into_iter().map(|(_, p)| p).collect())
+        // Pre-compute sort keys to avoid allocating per comparison.
+        let mut decorated: Vec<(_, String, _)> = entries
+            .into_iter()
+            .map(|(mtime, path)| {
+                let key = path_sort_key(&path);
+                (mtime, key, path)
+            })
+            .collect();
+        decorated.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        Ok(decorated.into_iter().map(|(_, _, p)| p).collect())
     }
 
     pub fn new_batch_parent(base_dir: &Path, session_name: Option<&str>) -> Result<Self, AppError> {

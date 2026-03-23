@@ -572,6 +572,14 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // ── Connection rendering (two-phase: route then paint) ──
+    let conn_block_map: HashMap<BlockId, &crate::execution::pipeline::PipelineBlock> = app
+        .pipeline
+        .pipeline_def
+        .blocks
+        .iter()
+        .map(|b| (b.id, b))
+        .collect();
+    let occupied_pixels = pixel_occupancy(&app.pipeline.pipeline_def.blocks);
     let grid_occ = grid_occupancy(&app.pipeline.pipeline_def.blocks);
     let lanes = assign_lanes(
         &app.pipeline.pipeline_def.connections,
@@ -600,19 +608,9 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
     let mut rendered_connections: Vec<RenderedConnection> = Vec::new();
 
     for (ci, conn) in app.pipeline.pipeline_def.connections.iter().enumerate() {
-        let fb = app
-            .pipeline
-            .pipeline_def
-            .blocks
-            .iter()
-            .find(|b| b.id == conn.from);
-        let tb = app
-            .pipeline
-            .pipeline_def
-            .blocks
-            .iter()
-            .find(|b| b.id == conn.to);
-        let (Some(fb), Some(tb)) = (fb, tb) else {
+        let fb = conn_block_map.get(&conn.from);
+        let tb = conn_block_map.get(&conn.to);
+        let (Some(&fb), Some(&tb)) = (fb, tb) else {
             continue;
         };
 
@@ -636,7 +634,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
             exit_y_off,
             entry_y_off,
         );
-        let mut conn_map: ConnectionRaster = HashMap::new();
+        let mut conn_map: ConnectionRaster = HashMap::with_capacity(32);
         for seg in &segs {
             rasterize_seg(seg, color, &mut conn_map);
         }
@@ -680,7 +678,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
     // Paint each connection independently; do not merge glyphs across connections.
     for (_, conn_map, scatter_label) in &rendered_connections {
         for (&(wx, wy), cell) in conn_map {
-            if pixel_hits_block(wx, wy, &app.pipeline.pipeline_def.blocks) {
+            if occupied_pixels.contains(&(wx, wy)) {
                 continue;
             }
             let ch = if cell.is_arrow {
@@ -794,7 +792,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
                     exit_y_off,
                     entry_y_off,
                 );
-                let mut conn_map: ConnectionRaster = HashMap::new();
+                let mut conn_map: ConnectionRaster = HashMap::with_capacity(32);
                 for seg in &segs {
                     rasterize_seg(seg, color, &mut conn_map);
                 }
@@ -841,7 +839,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
 
                 // Paint the wire
                 for (&(wx, wy), cell) in &conn_map {
-                    if pixel_hits_block(wx, wy, &app.pipeline.pipeline_def.blocks) {
+                    if occupied_pixels.contains(&(wx, wy)) {
                         continue;
                     }
                     let ch = if cell.is_arrow {
@@ -1023,6 +1021,8 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
         let feed_style = Style::default().fg(Color::Yellow);
         let exec_blocks = &app.pipeline.pipeline_def.blocks;
         let fin_blocks = &app.pipeline.pipeline_def.finalization_blocks;
+        let fin_block_map: HashMap<BlockId, &crate::execution::pipeline::PipelineBlock> =
+            fin_blocks.iter().map(|b| (b.id, b)).collect();
         for feed in &app.pipeline.pipeline_def.data_feeds {
             // Determine source blocks
             let sources: Vec<&crate::execution::pipeline::PipelineBlock> =
@@ -1031,7 +1031,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     exec_blocks.iter().filter(|b| b.id == feed.from).collect()
                 };
-            let target = fin_blocks.iter().find(|b| b.id == feed.to);
+            let target = fin_block_map.get(&feed.to).copied();
             let Some(target) = target else { continue };
 
             for src in &sources {
@@ -1099,6 +1099,9 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
             // Build position map with offset applied for finalization blocks
             let fin_blocks_offset: Vec<crate::execution::pipeline::PipelineBlock> =
                 app.pipeline.pipeline_def.finalization_blocks.to_vec();
+            let fin_block_map_offset: HashMap<BlockId, &crate::execution::pipeline::PipelineBlock> =
+                fin_blocks_offset.iter().map(|b| (b.id, b)).collect();
+            let fin_occupied = pixel_occupancy(&fin_blocks_offset);
             let fin_grid_occ = grid_occupancy(&fin_blocks_offset);
             let fin_lanes = assign_lanes(
                 &app.pipeline.pipeline_def.finalization_connections,
@@ -1120,9 +1123,9 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .enumerate()
             {
-                let fb = fin_blocks_offset.iter().find(|b| b.id == conn.from);
-                let tb = fin_blocks_offset.iter().find(|b| b.id == conn.to);
-                let (Some(fb), Some(tb)) = (fb, tb) else {
+                let fb = fin_block_map_offset.get(&conn.from);
+                let tb = fin_block_map_offset.get(&conn.to);
+                let (Some(&fb), Some(&tb)) = (fb, tb) else {
                     continue;
                 };
 
@@ -1146,7 +1149,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
                     exit_y_off,
                     entry_y_off,
                 );
-                let mut conn_map: ConnectionRaster = HashMap::new();
+                let mut conn_map: ConnectionRaster = HashMap::with_capacity(32);
                 for seg in &segs {
                     rasterize_seg(seg, color, &mut conn_map);
                 }
@@ -1170,7 +1173,7 @@ fn draw_canvas(f: &mut Frame, app: &App, area: Rect) {
                 }
                 // Paint finalization connection wires (offset by fin_y_off)
                 for (&(wx, wy), cell) in &conn_map {
-                    if pixel_hits_block(wx, wy, &fin_blocks_offset) {
+                    if fin_occupied.contains(&(wx, wy)) {
                         continue;
                     }
                     let ch = if cell.is_arrow {
@@ -1243,16 +1246,18 @@ fn grid_occupancy(blocks: &[crate::execution::pipeline::PipelineBlock]) -> HashS
     blocks.iter().map(|b| b.position).collect()
 }
 
-fn pixel_hits_block(
-    wx: i16,
-    wy: i16,
-    blocks: &[crate::execution::pipeline::PipelineBlock],
-) -> bool {
-    blocks.iter().any(|b| {
+fn pixel_occupancy(blocks: &[crate::execution::pipeline::PipelineBlock]) -> HashSet<(i16, i16)> {
+    let mut set = HashSet::with_capacity(blocks.len() * BLOCK_W as usize * BLOCK_H as usize);
+    for b in blocks {
         let bx = b.position.0 as i16 * CELL_W as i16;
         let by = b.position.1 as i16 * CELL_H as i16;
-        wx >= bx && wx < bx + BLOCK_W as i16 && wy >= by && wy < by + BLOCK_H as i16
-    })
+        for dx in 0..BLOCK_W as i16 {
+            for dy in 0..BLOCK_H as i16 {
+                set.insert((bx + dx, by + dy));
+            }
+        }
+    }
+    set
 }
 
 fn assign_lanes(
@@ -1708,6 +1713,9 @@ pub(crate) fn render_dag_readonly(
     }
 
     // Wire routing and painting
+    let dag_block_map: HashMap<BlockId, &crate::execution::pipeline::PipelineBlock> =
+        blocks.iter().map(|b| (b.id, b)).collect();
+    let dag_occupied = pixel_occupancy(blocks);
     let grid_occ = grid_occupancy(blocks);
     let lanes = assign_lanes(connections, blocks);
     let ports = assign_ports(connections, blocks);
@@ -1715,9 +1723,9 @@ pub(crate) fn render_dag_readonly(
     let mut rendered_connections: Vec<RenderedConnection> = Vec::new();
 
     for (ci, conn) in connections.iter().enumerate() {
-        let fb = blocks.iter().find(|b| b.id == conn.from);
-        let tb = blocks.iter().find(|b| b.id == conn.to);
-        let (Some(fb), Some(tb)) = (fb, tb) else {
+        let fb = dag_block_map.get(&conn.from);
+        let tb = dag_block_map.get(&conn.to);
+        let (Some(&fb), Some(&tb)) = (fb, tb) else {
             continue;
         };
 
@@ -1731,7 +1739,7 @@ pub(crate) fn render_dag_readonly(
             exit_y_off,
             entry_y_off,
         );
-        let mut conn_map: ConnectionRaster = HashMap::new();
+        let mut conn_map: ConnectionRaster = HashMap::with_capacity(32);
         for seg in &segs {
             rasterize_seg(seg, color, &mut conn_map);
         }
@@ -1770,7 +1778,7 @@ pub(crate) fn render_dag_readonly(
 
     for (_, conn_map, scatter_label) in &rendered_connections {
         for (&(wx, wy), cell) in conn_map {
-            if pixel_hits_block(wx, wy, blocks) {
+            if dag_occupied.contains(&(wx, wy)) {
                 continue;
             }
             let ch = if cell.is_arrow {
@@ -1817,9 +1825,9 @@ pub(crate) fn render_dag_readonly(
             let loop_ports = assign_ports(&loop_conns_as_regular, blocks);
 
             for (ci, lc) in loop_connections.iter().enumerate() {
-                let fb = blocks.iter().find(|b| b.id == lc.from);
-                let tb = blocks.iter().find(|b| b.id == lc.to);
-                let (Some(fb), Some(tb)) = (fb, tb) else {
+                let fb = dag_block_map.get(&lc.from);
+                let tb = dag_block_map.get(&lc.to);
+                let (Some(&fb), Some(&tb)) = (fb, tb) else {
                     continue;
                 };
 
@@ -1834,7 +1842,7 @@ pub(crate) fn render_dag_readonly(
                     exit_y_off,
                     entry_y_off,
                 );
-                let mut conn_map: ConnectionRaster = HashMap::new();
+                let mut conn_map: ConnectionRaster = HashMap::with_capacity(32);
                 for seg in &segs {
                     rasterize_seg(seg, color, &mut conn_map);
                 }
@@ -1878,7 +1886,7 @@ pub(crate) fn render_dag_readonly(
                 let label = format!("\u{00d7}{}", lc.count);
 
                 for (&(wx, wy), cell) in &conn_map {
-                    if pixel_hits_block(wx, wy, blocks) {
+                    if dag_occupied.contains(&(wx, wy)) {
                         continue;
                     }
                     let ch = if cell.is_arrow {
@@ -3252,6 +3260,7 @@ mod routing_tests {
     }
 
     fn no_seg_hits_block(segs: &[WireSeg], blocks: &[PipelineBlock]) {
+        let occupied = pixel_occupancy(blocks);
         for seg in segs {
             if seg.y1 == seg.y2 {
                 let y = seg.y1;
@@ -3262,7 +3271,7 @@ mod routing_tests {
                 };
                 for x in lo..=hi {
                     assert!(
-                        !pixel_hits_block(x, y, blocks),
+                        !occupied.contains(&(x, y)),
                         "wire pixel ({x}, {y}) hits a block"
                     );
                 }
@@ -3275,7 +3284,7 @@ mod routing_tests {
                 };
                 for y in lo..=hi {
                     assert!(
-                        !pixel_hits_block(x, y, blocks),
+                        !occupied.contains(&(x, y)),
                         "wire pixel ({x}, {y}) hits a block"
                     );
                 }

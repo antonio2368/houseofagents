@@ -4440,7 +4440,10 @@ fn sub_pipeline_replicas_not_capped_by_stale_agent_selection() {
     assert!(app.pipeline.pipeline_show_edit);
     // Tab to Replicas, type 32
     handle_key(&mut app, key(KeyCode::Tab));
-    assert_eq!(app.pipeline.pipeline_edit_field, PipelineEditField::Replicas);
+    assert_eq!(
+        app.pipeline.pipeline_edit_field,
+        PipelineEditField::Replicas
+    );
     handle_key(&mut app, key(KeyCode::Backspace));
     handle_key(&mut app, key(KeyCode::Char('3')));
     handle_key(&mut app, key(KeyCode::Char('2')));
@@ -4475,4 +4478,3 @@ async fn discover_final_outputs_async_sub_pipeline_multi_replica() {
     assert!(names.contains(&"sub_b2_pipeline_r2.md"));
     assert_eq!(files.len(), 2);
 }
-

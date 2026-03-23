@@ -1,23 +1,28 @@
 use super::store::MemoryStore;
 use super::types::{Memory, RecalledSet};
+use std::collections::HashSet;
+use std::sync::LazyLock;
 
-const STOP_WORDS: &[&str] = &[
-    "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
-    "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
-    "this", "that", "these", "those", "it", "its", "i", "me", "my", "we", "our", "you", "your",
-    "he", "she", "they", "them", "his", "her", "and", "or", "but", "not", "no", "so", "if", "then",
-    "than", "too", "very", "just", "about", "up", "out", "on", "off", "in", "of", "to", "for",
-    "with", "at", "by", "from", "as", "into", "all", "each", "any", "some", "such", "what",
-    "which", "who", "when", "where", "how", "why", "more", "most", "other", "over",
-];
+static STOP: LazyLock<HashSet<&str>> = LazyLock::new(|| {
+    [
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "this", "that", "these", "those", "it", "its", "i", "me", "my", "we", "our", "you", "your",
+        "he", "she", "they", "them", "his", "her", "and", "or", "but", "not", "no", "so", "if",
+        "then", "than", "too", "very", "just", "about", "up", "out", "on", "off", "in", "of", "to",
+        "for", "with", "at", "by", "from", "as", "into", "all", "each", "any", "some", "such",
+        "what", "which", "who", "when", "where", "how", "why", "more", "most", "other", "over",
+    ]
+    .into_iter()
+    .collect()
+});
 
 pub fn extract_keywords(prompt: &str) -> Vec<String> {
-    let stop: std::collections::HashSet<&str> = STOP_WORDS.iter().copied().collect();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut words: Vec<String> = prompt
         .to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.len() > 2 && !stop.contains(w))
+        .filter(|w| w.len() > 2 && !STOP.contains(w))
         .filter(|w| seen.insert(w.to_string()))
         .map(|w| w.to_string())
         .collect();
@@ -64,14 +69,16 @@ pub fn count_entries_in_context(context: &str) -> usize {
 }
 
 /// Escape characters that could break out of XML wrapper tags.
-fn escape_xml(s: &str) -> String {
+fn escape_xml(s: &str) -> std::borrow::Cow<'_, str> {
     // Fast path: skip allocation if no special chars
     if !s.contains('&') && !s.contains('<') && !s.contains('>') {
-        return s.to_string();
+        return std::borrow::Cow::Borrowed(s);
     }
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    std::borrow::Cow::Owned(
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;"),
+    )
 }
 
 fn format_memory_entry(out: &mut String, mem: &Memory) {
