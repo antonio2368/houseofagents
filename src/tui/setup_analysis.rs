@@ -561,12 +561,30 @@ fn build_pipeline_prompt(app: &App, prompt: &mut String) {
             }
         }
         if !in_loop {
-            let capacity = to_block.map(|b| b.logical_task_count()).unwrap_or(1);
-            prompt.push_str(&format!(
-                "\nWARNING: Block {} \"{}\" receives scatter input but is not in a loop. \
-                 Only {} items will be processed per run.\n",
-                conn.to, to_label, capacity
-            ));
+            let is_sub = to_block.is_some_and(|b| b.is_sub_pipeline());
+            if is_sub {
+                prompt.push_str(&format!(
+                    "\nINFO: Sub-pipeline block {} \"{}\" receives scatter input. \
+                     All items will be auto-consumed by replicas (no loop needed).\n",
+                    conn.to, to_label
+                ));
+            } else {
+                let capacity = to_block.map(|b| b.logical_task_count()).unwrap_or(1);
+                prompt.push_str(&format!(
+                    "\nWARNING: Block {} \"{}\" receives scatter input but is not in a loop. \
+                     Only {} items will be processed per run.\n",
+                    conn.to, to_label, capacity
+                ));
+            }
+        } else if in_loop && is_restart_block {
+            let is_sub = to_block.is_some_and(|b| b.is_sub_pipeline());
+            if is_sub {
+                prompt.push_str(&format!(
+                    "\nINFO: Sub-pipeline block {} \"{}\" receives scatter input with a loop connection. \
+                     The loop is redundant \u{2014} sub-pipelines auto-consume all items in a single pass.\n",
+                    conn.to, to_label
+                ));
+            }
         } else if in_loop && !is_restart_block {
             prompt.push_str(&format!(
                 "\nWARNING: Block {} \"{}\" receives scatter input and is inside a loop sub-DAG \

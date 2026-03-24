@@ -59,6 +59,7 @@ pub(crate) enum RuntimePhase {
     Finalization,
 }
 
+#[derive(Clone)]
 pub(crate) struct RuntimeReplicaInfo {
     pub runtime_id: u32,
     pub source_block_id: BlockId,
@@ -673,6 +674,42 @@ impl ScatterQueue {
     #[allow(dead_code)]
     pub fn remaining(&self) -> usize {
         self.items.len()
+    }
+}
+
+/// Thread-safe wrapper around `ScatterQueue` allowing concurrent `pop()` from
+/// multiple spawned sub-pipeline replica tasks. Uses `std::sync::Mutex` because
+/// lock hold time is trivially short (single `pop_front()` or `.len()` check)
+/// and no `.await` is held across the lock.
+#[derive(Clone)]
+pub(crate) struct SharedScatterQueue {
+    inner: Arc<std::sync::Mutex<ScatterQueue>>,
+}
+
+impl SharedScatterQueue {
+    pub fn new(queue: ScatterQueue) -> Self {
+        Self {
+            inner: Arc::new(std::sync::Mutex::new(queue)),
+        }
+    }
+    pub fn pop(&self) -> Option<ScatterItem> {
+        self.inner.lock().expect("scatter queue poisoned").pop()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("scatter queue poisoned")
+            .is_empty()
+    }
+    pub fn total(&self) -> usize {
+        self.inner.lock().expect("scatter queue poisoned").total()
+    }
+    #[allow(dead_code)]
+    pub fn remaining(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("scatter queue poisoned")
+            .remaining()
     }
 }
 
@@ -2351,7 +2388,7 @@ async fn run_pipeline_with_provider_factory(
             };
         // Track current loop pass per block for progress events
         let mut block_loop_pass: HashMap<BlockId, u32> = HashMap::new();
-        let mut scatter_queues: HashMap<(BlockId, BlockId), ScatterQueue> = HashMap::new();
+        let mut scatter_queues: HashMap<(BlockId, BlockId), SharedScatterQueue> = HashMap::new();
         let mut scatter_done_replicas: HashMap<BlockId, HashSet<u32>> = HashMap::new();
 
         // Seed ready queue with root blocks (logical IDs)
@@ -2557,33 +2594,77 @@ async fn run_pipeline_with_provider_factory(
                             block, def, &rt, &replica_outputs, &block_map,
                         );
 
+                        // Shared scatter queue handle for auto-consume
+                        let shared_scatter_queue: Option<SharedScatterQueue> = def
+                            .connections
+                            .iter()
+                            .find(|c| c.scatter && c.to == block_id)
+                            .and_then(|sc| scatter_queues.get(&(sc.from, block_id)))
+                            .cloned();
+
+                        // Warn about redundant loop + sub-pipeline scatter
+                        if shared_scatter_queue.is_some() {
+                            let has_loop =
+                                def.loop_connections.iter().any(|lc| lc.to == block_id);
+                            if has_loop {
+                                let _ = progress_tx.send(ProgressEvent::BlockLog {
+                                    block_id: rids[0],
+                                    agent_name: format!("[{}]", block.name),
+                                    iteration,
+                                    loop_pass: current_loop_pass,
+                                    message: "[scatter] INFO: Sub-pipeline auto-consumes all \
+                                              scatter items; loop connection is redundant and \
+                                              will terminate after first pass."
+                                        .to_string(),
+                                });
+                            }
+                        }
+
+                        // Precompute outgoing scatter delimiter (same for all replicas)
+                        let outgoing_delim: Option<String> =
+                            outgoing_scatter_delimiter(def, block_id).map(|s| s.to_string());
+
+                        // Base sub-pipeline definition (before scatter injection)
+                        let base_sub_def = block.sub_pipeline.as_ref().unwrap().clone();
+
+                        // Sub-name key (same for all replicas)
+                        let sub_name_key = if block.name.trim().is_empty() {
+                            format!("b{}", block.id)
+                        } else {
+                            format!(
+                                "{}_b{}",
+                                OutputManager::sanitize_session_name(&block.name),
+                                block.id
+                            )
+                        };
+
+                        let block_replicas = block.replicas;
+
                         for &rid in rids {
                             let info = &rt.entries[rid as usize];
                             let parent_label = info.display_label.clone();
                             let replica_index = info.replica_index;
 
-                            // --- Scatter: pop item from queue ---
+                            // --- Scatter: pop first item from queue ---
                             let incoming_scatter: Option<&PipelineConnection> = def
                                 .connections
                                 .iter()
                                 .find(|c| c.scatter && c.to == block_id);
 
-                            let scatter_item: Option<ScatterItem> =
-                                if let Some(sc) = incoming_scatter {
-                                    scatter_queues
-                                        .get_mut(&(sc.from, block_id))
-                                        .and_then(|q| q.pop())
+                            let first_scatter_item: Option<ScatterItem> =
+                                if incoming_scatter.is_some() {
+                                    shared_scatter_queue.as_ref().and_then(|q| q.pop())
                                 } else {
                                     None
                                 };
 
-                            let scatter_total = incoming_scatter
-                                .and_then(|sc| scatter_queues.get(&(sc.from, block_id)))
+                            let scatter_total = shared_scatter_queue
+                                .as_ref()
                                 .map(|q| q.total())
                                 .unwrap_or(0);
 
-                            // Queue exhausted → no-op task
-                            if incoming_scatter.is_some() && scatter_item.is_none() {
+                            // Queue exhausted → no-op task (UNCHANGED)
+                            if incoming_scatter.is_some() && first_scatter_item.is_none() {
                                 let _ = progress_tx.send(ProgressEvent::BlockFinished {
                                     block_id: rid,
                                     agent_name: info.agent.clone(),
@@ -2607,8 +2688,8 @@ async fn run_pipeline_with_provider_factory(
                                 continue;
                             }
 
-                            // Scatter log
-                            if let Some(ref item) = scatter_item {
+                            // Scatter log for the FIRST item
+                            if let Some(ref item) = first_scatter_item {
                                 let _ = progress_tx.send(ProgressEvent::BlockLog {
                                     block_id: rid,
                                     agent_name: info.agent.clone(),
@@ -2622,82 +2703,22 @@ async fn run_pipeline_with_provider_factory(
                                 });
                             }
 
-                            // Clone sub_def and inject upstream + scatter into initial_prompt
-                            let mut sub_def_ctx = block.sub_pipeline.as_ref().unwrap().clone();
-                            let mut final_prompt = sub_def_ctx.initial_prompt.clone();
-                            if !upstream_context.is_empty() {
-                                if final_prompt.is_empty() {
-                                    final_prompt = upstream_context.clone();
-                                } else {
-                                    final_prompt
-                                        .push_str("\n\n--- Input from parent pipeline ---\n");
-                                    final_prompt.push_str(&upstream_context);
-                                }
-                            }
-                            if let Some(ref item) = scatter_item {
-                                use std::fmt::Write;
-                                if !final_prompt.is_empty() {
-                                    final_prompt.push_str("\n\n");
-                                }
-                                write!(
-                                    final_prompt,
-                                    "--- Scatter item {}/{} ---\n{}",
-                                    item.index + 1,
-                                    scatter_total,
-                                    item.content,
-                                )
-                                .unwrap();
-                            }
-                            sub_def_ctx.initial_prompt = final_prompt;
+                            // Clone info for use inside the task loop
+                            let info_clone = info.clone();
 
-                            // If this sub-pipeline has an outgoing scatter connection,
-                            // inject the delimiter instruction into the finalization leaf's
-                            // prompt — that block's output is what gets scattered downstream.
-                            if let Some(delim) = outgoing_scatter_delimiter(def, block_id) {
-                                let leaf = sub_def_ctx
-                                    .finalization_leaf_mut()
-                                    .expect("validated: exactly one finalization leaf");
-                                if leaf.prompt.is_empty() {
-                                    leaf.prompt = scatter_source_instruction(delim);
-                                } else {
-                                    leaf.prompt.push_str("\n\n");
-                                    leaf.prompt.push_str(&scatter_source_instruction(delim));
-                                }
-                            }
+                            // Clone shared values for the task
+                            let shared_sq_clone = shared_scatter_queue.clone();
+                            let outgoing_delim_clone = outgoing_delim.clone();
+                            let base_sub_def_clone = base_sub_def.clone();
+                            let sub_name_key_clone = sub_name_key.clone();
+                            let upstream_context_clone = upstream_context.clone();
+                            let parent_block_name_clone = parent_block_name.clone();
 
-                            // Per-replica sub-run directory
-                            let sub_name_key = if block.name.trim().is_empty() {
-                                format!("b{}", block.id)
-                            } else {
-                                format!(
-                                    "{}_b{}",
-                                    OutputManager::sanitize_session_name(&block.name),
-                                    block.id
-                                )
-                            };
-                            let sub_run_dir = if block.replicas > 1 {
-                                output.run_dir().join(format!(
-                                    "sub_{}_r{}",
-                                    sub_name_key,
-                                    replica_index + 1
-                                ))
-                            } else {
-                                output.run_dir().join(format!("sub_{sub_name_key}"))
-                            };
+                            // Parent progress channel for outer scatter logs (NOT child_tx)
+                            let parent_progress_tx = progress_tx.clone();
+
                             let parent_run_dir = output.run_dir().to_path_buf();
-                            let parent_filename = loop_replica_filename(
-                                &rt.entries[rid as usize],
-                                parent_loop_pass,
-                            );
-                            // Wrap the parent factory so CLI providers inside the
-                            // sub-pipeline get --add-dir for the sub-run directory.
                             let parent_factory = provider_factory.clone();
-                            let sub_dir_str = sub_run_dir.display().to_string();
-                            let sub_factory: ProviderFactory = Arc::new(move |kind, cfg| {
-                                let mut p = parent_factory(kind, cfg);
-                                p.add_allowed_dir(sub_dir_str.clone());
-                                p
-                            });
                             let agent_configs_clone = agent_configs.clone();
                             let prompt_context_clone = prompt_context.clone();
                             let cancel_clone = cancel.clone();
@@ -2825,82 +2846,269 @@ async fn run_pipeline_with_provider_factory(
 
                                 let result = tokio::task::spawn_blocking(move || {
                                     rt_handle.block_on(async {
-                                        if let Err(e) = std::fs::create_dir_all(&sub_run_dir) {
-                                            return (rid, Err(e.to_string()));
-                                        }
-                                        let sub_output =
-                                            match OutputManager::from_existing(sub_run_dir.clone())
+                                        let mut all_outputs: Vec<String> = Vec::new();
+                                        let mut current_item = first_scatter_item;
+
+                                        loop {
+                                            // Check cancellation at start of each iteration
+                                            if cancel_clone
+                                                .load(std::sync::atomic::Ordering::Relaxed)
                                             {
+                                                break;
+                                            }
+
+                                            // 1. Build sub_def_ctx: clone base, inject upstream + scatter
+                                            let mut sub_def_ctx = base_sub_def_clone.clone();
+                                            let mut final_prompt =
+                                                sub_def_ctx.initial_prompt.clone();
+                                            if !upstream_context_clone.is_empty() {
+                                                if final_prompt.is_empty() {
+                                                    final_prompt = upstream_context_clone.clone();
+                                                } else {
+                                                    final_prompt.push_str(
+                                                        "\n\n--- Input from parent pipeline ---\n",
+                                                    );
+                                                    final_prompt
+                                                        .push_str(&upstream_context_clone);
+                                                }
+                                            }
+                                            if let Some(ref item) = current_item {
+                                                use std::fmt::Write;
+                                                if !final_prompt.is_empty() {
+                                                    final_prompt.push_str("\n\n");
+                                                }
+                                                write!(
+                                                    final_prompt,
+                                                    "--- Scatter item {}/{} ---\n{}",
+                                                    item.index + 1,
+                                                    scatter_total,
+                                                    item.content,
+                                                )
+                                                .unwrap();
+                                            }
+                                            sub_def_ctx.initial_prompt = final_prompt;
+
+                                            // 2. Inject outgoing scatter delimiter if needed
+                                            if let Some(ref delim) = outgoing_delim_clone {
+                                                let leaf = sub_def_ctx
+                                                    .finalization_leaf_mut()
+                                                    .expect(
+                                                        "validated: exactly one finalization leaf",
+                                                    );
+                                                if leaf.prompt.is_empty() {
+                                                    leaf.prompt = scatter_source_instruction(delim);
+                                                } else {
+                                                    leaf.prompt.push_str("\n\n");
+                                                    leaf.prompt.push_str(
+                                                        &scatter_source_instruction(delim),
+                                                    );
+                                                }
+                                            }
+
+                                            // 3. Build unique sub_run_dir per scatter item
+                                            let sub_run_dir = if let Some(ref item) = current_item
+                                            {
+                                                let base = if block_replicas > 1 {
+                                                    format!(
+                                                        "sub_{}_r{}_i{}",
+                                                        sub_name_key_clone,
+                                                        replica_index + 1,
+                                                        item.index
+                                                    )
+                                                } else {
+                                                    format!(
+                                                        "sub_{}_i{}",
+                                                        sub_name_key_clone, item.index
+                                                    )
+                                                };
+                                                if parent_loop_pass > 0 {
+                                                    parent_run_dir
+                                                        .join(format!("{base}_loop{parent_loop_pass}"))
+                                                } else {
+                                                    parent_run_dir.join(base)
+                                                }
+                                            } else {
+                                                // No scatter — same naming as today
+                                                if block_replicas > 1 {
+                                                    parent_run_dir.join(format!(
+                                                        "sub_{}_r{}",
+                                                        sub_name_key_clone,
+                                                        replica_index + 1
+                                                    ))
+                                                } else {
+                                                    parent_run_dir
+                                                        .join(format!("sub_{sub_name_key_clone}"))
+                                                }
+                                            };
+
+                                            // 4. Build unique parent_filename per scatter item
+                                            let parent_filename =
+                                                if let Some(ref item) = current_item {
+                                                    scatter_replica_filename(
+                                                        &info_clone,
+                                                        item.index,
+                                                        parent_loop_pass,
+                                                    )
+                                                } else {
+                                                    loop_replica_filename(
+                                                        &info_clone,
+                                                        parent_loop_pass,
+                                                    )
+                                                };
+
+                                            // 5. Build scoped sub_factory for this sub_run_dir
+                                            let sub_dir_str =
+                                                sub_run_dir.display().to_string();
+                                            let pf = parent_factory.clone();
+                                            let item_factory: ProviderFactory =
+                                                Arc::new(move |kind, cfg| {
+                                                    let mut p = pf(kind, cfg);
+                                                    p.add_allowed_dir(sub_dir_str.clone());
+                                                    p
+                                                });
+
+                                            // 6. Log scatter progress for SUBSEQUENT items
+                                            //    (First item logged before task started.)
+                                            //    Sent on parent_progress_tx directly — NOT
+                                            //    child_tx, to avoid double-scoping by forwarder.
+                                            if let Some(ref item) = current_item {
+                                                if !all_outputs.is_empty() {
+                                                    let _ = parent_progress_tx.send(
+                                                        ProgressEvent::BlockLog {
+                                                            block_id: rid,
+                                                            agent_name: format!(
+                                                                "[{parent_block_name_clone}]"
+                                                            ),
+                                                            iteration: parent_iteration,
+                                                            loop_pass: parent_loop_pass,
+                                                            message: format!(
+                                                                "[scatter] Processing item {}/{}",
+                                                                item.index + 1,
+                                                                scatter_total,
+                                                            ),
+                                                        },
+                                                    );
+                                                }
+                                            }
+
+                                            // 7. Create dir, OutputManager, run execution + finalization
+                                            if let Err(e) =
+                                                std::fs::create_dir_all(&sub_run_dir)
+                                            {
+                                                return (rid, Err(e.to_string()));
+                                            }
+                                            let sub_output = match OutputManager::from_existing(
+                                                sub_run_dir.clone(),
+                                            ) {
                                                 Ok(o) => o,
                                                 Err(e) => return (rid, Err(e.to_string())),
                                             };
 
-                                        // Execution phase
-                                        if let Err(e) = run_pipeline_with_provider_factory(
-                                            &sub_def_ctx,
-                                            max_conc,
-                                            agent_configs_clone.clone(),
-                                            &prompt_context_clone,
-                                            &sub_output,
-                                            child_tx.clone(),
-                                            cancel_clone.clone(),
-                                            sub_factory.clone(),
-                                        )
-                                        .await
-                                        {
-                                            return (rid, Err(e.to_string()));
+                                            // Execution phase
+                                            if let Err(e) = run_pipeline_with_provider_factory(
+                                                &sub_def_ctx,
+                                                max_conc,
+                                                agent_configs_clone.clone(),
+                                                &prompt_context_clone,
+                                                &sub_output,
+                                                child_tx.clone(),
+                                                cancel_clone.clone(),
+                                                item_factory.clone(),
+                                            )
+                                            .await
+                                            {
+                                                return (rid, Err(e.to_string()));
+                                            }
+
+                                            // Cancelled — skip finalization
+                                            if cancel_clone
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                            {
+                                                break;
+                                            }
+
+                                            // Finalization phase
+                                            let exec_rt = build_runtime_table(&sub_def_ctx);
+                                            let fin_scope = FinalizationRunScope::SingleRun {
+                                                run_id: 1,
+                                                run_dir: sub_run_dir.clone(),
+                                            };
+                                            if let Err(e) = run_pipeline_finalization(
+                                                &sub_def_ctx,
+                                                fin_scope,
+                                                &exec_rt,
+                                                agent_configs_clone.clone(),
+                                                &sub_run_dir,
+                                                child_tx.clone(),
+                                                cancel_clone.clone(),
+                                                item_factory,
+                                            )
+                                            .await
+                                            {
+                                                return (rid, Err(e.to_string()));
+                                            }
+
+                                            // 8. Read terminal output, write per-item parent file, collect
+                                            match read_sub_pipeline_terminal_output(
+                                                &sub_def_ctx,
+                                                &sub_run_dir,
+                                            ) {
+                                                Ok(text) => {
+                                                    let parent_path =
+                                                        parent_run_dir.join(&parent_filename);
+                                                    if let Err(e) =
+                                                        std::fs::write(&parent_path, &text)
+                                                    {
+                                                        return (
+                                                            rid,
+                                                            Err(format!(
+                                                                "Failed to write sub-pipeline output: {e}"
+                                                            )),
+                                                        );
+                                                    }
+                                                    all_outputs.push(text);
+                                                }
+                                                Err(e) => return (rid, Err(e.to_string())),
+                                            }
+
+                                            // 9. Try to pop next item; if None, break
+                                            match shared_sq_clone
+                                                .as_ref()
+                                                .and_then(|q| q.pop())
+                                            {
+                                                Some(next) => {
+                                                    current_item = Some(next);
+                                                }
+                                                None => break,
+                                            }
                                         }
 
-                                        // Cancelled — skip finalization and output read;
-                                        // the run is incomplete and no output files exist.
+                                        // If cancelled, return error to match regular block
+                                        // semantics and prevent partial output from propagating
+                                        // downstream as a success.
                                         if cancel_clone
                                             .load(std::sync::atomic::Ordering::Relaxed)
                                         {
-                                            return (rid, Ok(String::new()));
+                                            return (rid, Err("Cancelled".to_string()));
                                         }
 
-                                        // Finalization phase
-                                        let exec_rt = build_runtime_table(&sub_def_ctx);
-                                        let fin_scope = FinalizationRunScope::SingleRun {
-                                            run_id: 1,
-                                            run_dir: sub_run_dir.clone(),
-                                        };
-                                        if let Err(e) = run_pipeline_finalization(
-                                            &sub_def_ctx,
-                                            fin_scope,
-                                            &exec_rt,
-                                            agent_configs_clone,
-                                            &sub_run_dir,
-                                            child_tx,
-                                            cancel_clone,
-                                            sub_factory,
-                                        )
-                                        .await
-                                        {
-                                            return (rid, Err(e.to_string()));
-                                        }
-
-                                        match read_sub_pipeline_terminal_output(
-                                            &sub_def_ctx,
-                                            &sub_run_dir,
-                                        ) {
-                                            Ok(text) => {
-                                                let parent_path =
-                                                    parent_run_dir.join(&parent_filename);
-                                                if let Err(e) =
-                                                    std::fs::write(&parent_path, &text)
-                                                {
-                                                    return (
-                                                        rid,
-                                                        Err(format!(
-                                                        "Failed to write sub-pipeline output: {e}"
-                                                    )),
-                                                    );
-                                                }
-                                                (rid, Ok(text))
+                                        // Return aggregated output.
+                                        // Delimiter strategy depends on outgoing scatter.
+                                        let output_text = if all_outputs.len() > 1 {
+                                            if let Some(ref delim) = outgoing_delim_clone {
+                                                // Scatter source: join with delimiter for
+                                                // downstream ScatterQueue::from_output() re-split
+                                                all_outputs.join(&format!("\n{delim}\n"))
+                                            } else {
+                                                // Not a scatter source: readable separator
+                                                // (avoids leaking transport delimiters into
+                                                // downstream prompts)
+                                                all_outputs.join("\n\n---\n\n")
                                             }
-                                            Err(e) => (rid, Err(e.to_string())),
-                                        }
+                                        } else {
+                                            all_outputs.into_iter().next().unwrap_or_default()
+                                        };
+                                        (rid, Ok(output_text))
                                     })
                                 })
                                 .await
@@ -2926,6 +3134,40 @@ async fn run_pipeline_with_provider_factory(
                         continue;
                     }
 
+                    // Emit overflow warning for regular scatter targets.
+                    // Suppress when the block is the restart target of a loop connection,
+                    // since remaining items WILL be processed on subsequent loop passes.
+                    {
+                        let incoming_scatter_conn: Option<&PipelineConnection> = def
+                            .connections
+                            .iter()
+                            .find(|c| c.scatter && c.to == block_id);
+                        let has_loop_drain =
+                            def.loop_connections.iter().any(|lc| lc.to == block_id);
+                        if let Some(sc) = incoming_scatter_conn {
+                            let total = scatter_queues
+                                .get(&(sc.from, block_id))
+                                .map(|q| q.total())
+                                .unwrap_or(0);
+                            if total > rids.len() && !has_loop_drain {
+                                let _ = progress_tx.send(ProgressEvent::BlockLog {
+                                    block_id: rids[0],
+                                    agent_name: block.primary_agent().to_string(),
+                                    iteration,
+                                    loop_pass: current_loop_pass,
+                                    message: format!(
+                                        "[scatter] WARNING: {} items but only {} tasks; \
+                                         {} items will not be processed. Use a loop \
+                                         connection or increase replicas.",
+                                        total,
+                                        rids.len(),
+                                        total - rids.len(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+
                     // Spawn one task per replica (agents × replicas)
                     for &rid in rids {
                         let info = &rt.entries[rid as usize];
@@ -2945,7 +3187,7 @@ async fn run_pipeline_with_provider_factory(
                         let scatter_item: Option<ScatterItem> =
                             if let Some(sc) = incoming_scatter {
                                 scatter_queues
-                                    .get_mut(&(sc.from, block_id))
+                                    .get(&(sc.from, block_id))
                                     .and_then(|q| q.pop())
                             } else {
                                 None
@@ -3483,7 +3725,9 @@ async fn run_pipeline_with_provider_factory(
                                         if conn.scatter && conn.from == sid {
                                             if let Some(rids) = rt.logical_to_runtime.get(&sid) {
                                                 if let Some(text) = replica_outputs.get(&rids[0]) {
-                                                    let queue = ScatterQueue::from_output(text, conn.effective_delimiter());
+                                                    let queue = SharedScatterQueue::new(
+                                                        ScatterQueue::from_output(text, conn.effective_delimiter()),
+                                                    );
                                                     let _ = progress_tx.send(ProgressEvent::BlockLog {
                                                         block_id: runtime_id,
                                                         agent_name: entry_agent.clone(),
@@ -3529,7 +3773,12 @@ async fn run_pipeline_with_provider_factory(
                                 }
                                 // Emit BlockError for sub-pipeline blocks (same
                                 // rationale as BlockFinished above).
-                                if block_map.get(&sid).is_some_and(|b| b.is_sub_pipeline()) {
+                                // Skip for "Cancelled" — let the post-run sweep
+                                // handle it as AgentStatus::Cancelled (yellow) to
+                                // match regular block cancellation rendering.
+                                if block_map.get(&sid).is_some_and(|b| b.is_sub_pipeline())
+                                    && error != "Cancelled"
+                                {
                                     let _ = progress_tx.send(ProgressEvent::BlockError {
                                         block_id: runtime_id,
                                         agent_name: entry_agent,
@@ -10028,6 +10277,113 @@ position = [0, 0]
         assert_eq!(q.pop().unwrap().index, 1);
         assert_eq!(q.pop().unwrap().index, 2);
         assert!(q.pop().is_none());
+    }
+
+    // ── SharedScatterQueue Tests ──
+
+    #[test]
+    fn shared_scatter_queue_basic_pop() {
+        let q = SharedScatterQueue::new(ScatterQueue::from_output(
+            "a\n===SCATTER_ITEM===\nb\n===SCATTER_ITEM===\nc",
+            "===SCATTER_ITEM===",
+        ));
+        assert_eq!(q.total(), 3);
+        assert!(!q.is_empty());
+        assert_eq!(q.remaining(), 3);
+
+        let first = q.pop().unwrap();
+        assert_eq!(first.index, 0);
+        assert_eq!(first.content, "a");
+        assert_eq!(q.remaining(), 2);
+
+        let second = q.pop().unwrap();
+        assert_eq!(second.index, 1);
+        assert_eq!(second.content, "b");
+
+        let third = q.pop().unwrap();
+        assert_eq!(third.index, 2);
+        assert_eq!(third.content, "c");
+
+        assert!(q.pop().is_none());
+        assert!(q.is_empty());
+        assert_eq!(q.total(), 3); // total doesn't change
+    }
+
+    #[test]
+    fn shared_scatter_queue_concurrent_pop() {
+        // Verify all items are consumed exactly once across multiple threads
+        let q = SharedScatterQueue::new(ScatterQueue::from_output(
+            "i0\n===SCATTER_ITEM===\ni1\n===SCATTER_ITEM===\ni2\n===SCATTER_ITEM===\ni3\n===SCATTER_ITEM===\ni4\n===SCATTER_ITEM===\ni5",
+            "===SCATTER_ITEM===",
+        ));
+        assert_eq!(q.total(), 6);
+
+        let collected = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        for _ in 0..4 {
+            let q_clone = q.clone();
+            let collected_clone = collected.clone();
+            handles.push(std::thread::spawn(move || {
+                while let Some(item) = q_clone.pop() {
+                    collected_clone.lock().unwrap().push(item.index);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut items = collected.lock().unwrap().clone();
+        items.sort();
+        assert_eq!(
+            items,
+            vec![0, 1, 2, 3, 4, 5],
+            "all 6 items consumed exactly once"
+        );
+        assert!(q.is_empty());
+        assert_eq!(q.total(), 6);
+    }
+
+    #[test]
+    fn shared_scatter_queue_clone_shares_state() {
+        let q1 = SharedScatterQueue::new(ScatterQueue::from_output(
+            "x\n===SCATTER_ITEM===\ny",
+            "===SCATTER_ITEM===",
+        ));
+        let q2 = q1.clone();
+
+        let item = q1.pop().unwrap();
+        assert_eq!(item.content, "x");
+        assert_eq!(q2.remaining(), 1); // shared state
+        let item = q2.pop().unwrap();
+        assert_eq!(item.content, "y");
+        assert!(q1.pop().is_none()); // both see empty
+    }
+
+    // ── Scatter Sub-pipeline Directory and Filename Tests ──
+
+    #[test]
+    fn scatter_sub_pipeline_directory_naming_pass_0() {
+        // With replicas > 1, scatter item: sub_{name}_r{R}_i{I}
+        assert_eq!(
+            format!("sub_{}_r{}_i{}", "Debug_b3", 1, 5),
+            "sub_Debug_b3_r1_i5"
+        );
+        // Single replica with scatter item: sub_{name}_i{I}
+        assert_eq!(format!("sub_{}_i{}", "Debug_b3", 5), "sub_Debug_b3_i5");
+    }
+
+    #[test]
+    fn scatter_sub_pipeline_directory_naming_loop_pass() {
+        // With replicas > 1, scatter item, loop pass > 0: sub_{name}_r{R}_i{I}_loop{P}
+        let base = format!("sub_{}_r{}_i{}", "Debug_b3", 1, 5);
+        let loop_pass = 2u32;
+        assert_eq!(
+            format!("{base}_loop{loop_pass}"),
+            "sub_Debug_b3_r1_i5_loop2"
+        );
     }
 
     // ── Scatter Serialization Tests ──

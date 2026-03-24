@@ -375,7 +375,7 @@ Inside the **edit popup**: `Tab` cycles between Name, Agents (multiselect list �
 
 **Sub-pipeline blocks**: Press `p` to create a sub-pipeline block. Press `Enter` to drill into it and edit its inner DAG. Press `e` to edit its name and replica count. Press `Esc` to pop back to the parent. Sub-pipelines execute as opaque units. The parent block can have replicas > 1, in which case each replica runs an independent copy of the inner DAG with its own sub-run directory. The inner DAG's terminal finalization block output becomes the sub-pipeline's output to the parent pipeline. Limitations: one level of nesting only (sub-pipelines cannot contain sub-pipelines), the inner pipeline must have exactly one finalization leaf with a single agent and `replicas = 1`. Save (Ctrl+S) and Run (F5) are disabled while inside a sub-pipeline. Tab cycles between the initial prompt and the builder canvas.
 
-**Scatter connections**: A scatter connection splits an upstream block's output into discrete work items using a configurable delimiter (default `===SCATTER_ITEM===`) and distributes them across replicas of the downstream block. Source blocks automatically receive a prompt instruction telling them to format their output with the scatter delimiter — no manual prompt editing needed. To toggle scatter: press `x` to enter connection-action mode, navigate to the connection, and press `s`. Each replica pops one item at a time from an in-memory queue. Combine with a loop connection for full queue drain — replicas keep processing items until the queue is empty, at which point the loop terminates automatically (loop count acts as a safety cap). The scatter target must be the loop's restart block (the block the loop feeds back into). Sub-pipeline blocks can be scatter targets (each replica receives one work item) or scatter sources (the finalization leaf receives the delimiter instruction). Scatter wires render as dashed lines (`╌╎`) in cyan. Constraints: source must have exactly 1 logical task (1 agent × 1 replica, or a single-replica sub-pipeline), max 1 scatter input per block, all scatter edges from the same source must use the same delimiter.
+**Scatter connections**: A scatter connection splits an upstream block's output into discrete work items using a configurable delimiter (default `===SCATTER_ITEM===`) and distributes them across replicas of the downstream block. Source blocks automatically receive a prompt instruction telling them to format their output with the scatter delimiter — no manual prompt editing needed. To toggle scatter: press `x` to enter connection-action mode, navigate to the connection, and press `s`. Sub-pipeline scatter targets auto-consume: each replica loops internally until the shared queue is drained, so all items are processed even when items outnumber replicas. Faster replicas naturally consume more items. Because sub-pipeline targets drain the queue in a single pass, loop connections are redundant for sub-pipeline scatter targets (the loop will terminate after the first pass since the queue is already empty). For regular (non-sub-pipeline) scatter targets, each replica pops one item at a time from the queue. Combine with a loop connection for full queue drain — replicas keep processing items until the queue is empty, at which point the loop terminates automatically (loop count acts as a safety cap). The scatter target must be the loop's restart block (the block the loop feeds back into). Sub-pipeline blocks can be scatter targets (each replica auto-consumes multiple work items) or scatter sources (the finalization leaf receives the delimiter instruction). Scatter wires render as dashed lines (`╌╎`) in cyan. Constraints: source must have exactly 1 logical task (1 agent × 1 replica, or a single-replica sub-pipeline), max 1 scatter input per block, all scatter edges from the same source must use the same delimiter.
 
 ### Order Screen (relay with 2+ agents)
 
@@ -459,13 +459,13 @@ output_dir/
       _sessions.toml                      # CLI provider session ID mapping
 ```
 
-Sub-pipeline blocks create a `sub_{block_id}/` subdirectory containing the inner pipeline's outputs and finalization:
+Sub-pipeline blocks create a `sub_{name}_b{id}/` subdirectory containing the inner pipeline's outputs and finalization:
 
 ```
 my_session/
   Analyzer_b1_Claude.md
-  sub_b2_pipeline.md                  # Parent-level output (consumed by downstream blocks/feeds)
-  sub_2/                              # Sub-pipeline block (id 2) inner artifacts
+  sub_Debugger_b2_pipeline.md         # Parent-level output (consumed by downstream blocks/feeds)
+  sub_Debugger_b2/                    # Sub-pipeline block inner artifacts
     InnerBlock_b100_Gemini.md         # Inner execution block
     finalization/
       Consolidate_b200_Claude.md      # Terminal output → parent pipeline
@@ -476,16 +476,35 @@ With `replicas > 1`, each replica creates its own sub-directory and parent-level
 ```
 my_session/
   Analyzer_b1_Claude.md
-  sub_b2_pipeline_r1.md               # Replica 1 parent-level output
-  sub_b2_pipeline_r2.md               # Replica 2 parent-level output
-  sub_2_r1/                            # Replica 1 inner artifacts
+  sub_Debugger_b2_pipeline_r1.md      # Replica 1 parent-level output
+  sub_Debugger_b2_pipeline_r2.md      # Replica 2 parent-level output
+  sub_Debugger_b2_r1/                 # Replica 1 inner artifacts
     InnerBlock_b100_Gemini.md
     finalization/
       Consolidate_b200_Claude.md
-  sub_2_r2/                            # Replica 2 inner artifacts
+  sub_Debugger_b2_r2/                 # Replica 2 inner artifacts
     InnerBlock_b100_Gemini.md
     finalization/
       Consolidate_b200_Claude.md
+```
+
+With scatter connections to a sub-pipeline, each replica auto-consumes items from the shared queue. Each processed scatter item gets its own sub-directory and parent-level output file:
+
+```
+my_session/
+  Source_b1_Claude.md
+  sub_Debugger_b2_pipeline_r1_item0.md   # Replica 1, scatter item 0
+  sub_Debugger_b2_pipeline_r1_item3.md   # Replica 1, scatter item 3 (auto-consumed)
+  sub_Debugger_b2_pipeline_r2_item1.md   # Replica 2, scatter item 1
+  sub_Debugger_b2_pipeline_r2_item2.md   # Replica 2, scatter item 2
+  sub_Debugger_b2_r1_i0/                 # Item 0 inner artifacts
+    ...
+  sub_Debugger_b2_r1_i3/                 # Item 3 inner artifacts (auto-consumed)
+    ...
+  sub_Debugger_b2_r2_i1/
+    ...
+  sub_Debugger_b2_r2_i2/
+    ...
 ```
 
 Loop-back connections create iterative refinement cycles. `from` is the downstream feedback source and `to` is the upstream restart target. All blocks on regular-graph paths between the two endpoints form the loop sub-DAG and re-run on each pass. In saved pipeline TOML files they appear as:
