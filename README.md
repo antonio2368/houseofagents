@@ -121,7 +121,8 @@ Headless mode (noninteractive):
       --consolidation-prompt <S>  Extra consolidation instructions
       --output-format <FMT>       Output format: text, json [default: text]
       --quiet                     Suppress stderr progress output
-      --no-memory                 Disable cross-run memory
+      --memory                    Enable cross-run memory
+      --output-dir <DIR>          Override output directory
 ```
 
 ## Noninteractive (Headless) Mode

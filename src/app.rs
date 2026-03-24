@@ -2055,7 +2055,7 @@ mod tests {
     #[test]
     fn effective_memory_values_use_global_defaults() {
         let app = app_with_known_cli();
-        assert!(app.effective_memory_enabled());
+        assert!(!app.effective_memory_enabled());
         assert_eq!(app.effective_memory_max_recall(), 20);
         assert_eq!(app.effective_memory_max_recall_bytes(), 16384);
         assert_eq!(app.effective_memory_observation_ttl_days(), 120);

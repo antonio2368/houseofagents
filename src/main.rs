@@ -108,9 +108,13 @@ struct Cli {
     #[arg(long)]
     quiet: bool,
 
-    /// Disable cross-run memory
+    /// Enable cross-run memory
     #[arg(long)]
-    no_memory: bool,
+    memory: bool,
+
+    /// Override output directory
+    #[arg(long)]
+    output_dir: Option<String>,
 }
 
 impl Cli {
@@ -262,8 +266,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    if cli.no_memory {
-        config.memory.enabled = false;
+    if cli.memory {
+        config.memory.enabled = true;
+    }
+
+    if let Some(ref dir) = cli.output_dir {
+        config.output_dir = dir.clone();
     }
 
     if cli.is_headless() {

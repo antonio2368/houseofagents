@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub db_path: String,
@@ -31,7 +31,7 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             db_path: String::new(),
             project_id: String::new(),
             max_recall: default_max_recall(),
@@ -174,10 +174,6 @@ fn default_http_timeout_seconds() -> u64 {
 
 fn default_model_fetch_timeout_seconds() -> u64 {
     30
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_cli_timeout_seconds() -> u64 {
