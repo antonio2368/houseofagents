@@ -324,6 +324,148 @@ pub(crate) fn discover_finalization_outputs(
     files
 }
 
+/// Discover sub-pipeline parent output files for `--print-result` fallback.
+/// Matches `sub_{name}_pipeline*.md` files and deduplicates loop variants.
+pub(crate) fn discover_sub_pipeline_outputs(
+    run_dir: &std::path::Path,
+) -> Vec<(String, std::path::PathBuf)> {
+    let mut files: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(run_dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?.to_string();
+            if !name.ends_with(".md") {
+                return None;
+            }
+            let stem = name.trim_end_matches(".md");
+            // Strip optional _loop{N} to get the base stem for pattern matching
+            let base_stem = if let Some(lp) = stem.rfind("_loop") {
+                if stem[lp + 5..].parse::<u32>().is_ok() {
+                    &stem[..lp]
+                } else {
+                    stem
+                }
+            } else {
+                stem
+            };
+            // Strip optional _r{N} to get the core pattern
+            let core = if let Some(rp) = base_stem.rfind("_r") {
+                if base_stem[rp + 2..].parse::<u32>().is_ok() {
+                    &base_stem[..rp]
+                } else {
+                    base_stem
+                }
+            } else {
+                base_stem
+            };
+            if core.starts_with("sub_") && core.ends_with("_pipeline") {
+                Some((name, path))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Deduplicate loop variants — keep only the highest loop pass per stem
+    files = keep_highest_loop_pass(files);
+    files.sort_by(|a, b| natural_cmp(&a.0, &b.0));
+    files
+}
+
+/// Discover printable result files for `--print-result`.
+///
+/// Priority chain:
+/// 1. Finalization outputs (`run_dir/finalization/`)
+/// 2. Consolidation (batch: `cross_run_consolidation.md` > per-run `consolidation.md`;
+///    single: `consolidated_*.md`)
+/// 3. Sub-pipeline parent outputs (`sub_*_pipeline*.md`) — single-run pipeline only
+/// 4. Empty vec (silent no-op)
+pub(crate) fn discover_printable_results(
+    run_dir: &std::path::Path,
+    is_batch: bool,
+    pipeline_has_finalization: bool,
+    mode: ExecutionMode,
+) -> Vec<(String, std::path::PathBuf)> {
+    // Priority 1: finalization
+    if pipeline_has_finalization {
+        let fin = discover_finalization_outputs(run_dir);
+        if !fin.is_empty() {
+            return fin
+                .into_iter()
+                .map(|(name, path)| {
+                    let display = name.strip_suffix(".md").unwrap_or(&name).to_string();
+                    (display, path)
+                })
+                .collect();
+        }
+    }
+
+    // Priority 2: consolidation
+    if is_batch {
+        let cross_path = run_dir.join("cross_run_consolidation.md");
+        if cross_path.is_file() {
+            return vec![("cross_run_consolidation".to_string(), cross_path)];
+        }
+        // Fall back to per-run consolidation
+        let mut per_run: Vec<(String, std::path::PathBuf)> = Vec::new();
+        for dir in batch_run_directories(run_dir) {
+            let c = dir.join("consolidation.md");
+            if c.is_file() {
+                let id = dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_prefix("run_"))
+                    .unwrap_or("?");
+                per_run.push((format!("consolidation_run_{id}"), c));
+            }
+        }
+        if !per_run.is_empty() {
+            return per_run;
+        }
+    } else if let Ok(entries) = std::fs::read_dir(run_dir) {
+        let mut consol: Vec<(String, std::path::PathBuf)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_file() {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?.to_string();
+                if name.starts_with("consolidated_") && name.ends_with(".md") {
+                    let display = name.strip_suffix(".md").unwrap_or(&name).to_string();
+                    Some((display, path))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        consol.sort_by(|a, b| natural_cmp(&a.0, &b.0));
+        if !consol.is_empty() {
+            return consol;
+        }
+    }
+
+    // Priority 3: sub-pipeline terminal outputs (single-run pipeline only)
+    if mode == ExecutionMode::Pipeline && !is_batch {
+        let sub_outputs = discover_sub_pipeline_outputs(run_dir);
+        if !sub_outputs.is_empty() {
+            return sub_outputs
+                .into_iter()
+                .map(|(name, path)| {
+                    let display = name.strip_suffix(".md").unwrap_or(&name).to_string();
+                    (display, path)
+                })
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
 pub(crate) async fn discover_final_outputs_async(
     run_dir: &std::path::Path,
     mode: ExecutionMode,
@@ -388,6 +530,12 @@ pub(crate) async fn discover_final_outputs_async(
 pub(crate) const POST_RUN_SYNTHESIS_MAX_INPUT_BYTES: u64 = 200 * 1024;
 pub(crate) const CROSS_RUN_MAX_INPUT_BYTES: u64 = POST_RUN_SYNTHESIS_MAX_INPUT_BYTES;
 pub(crate) const EXTRACTION_MAX_INPUT_BYTES: u64 = 100 * 1024;
+
+/// Maximum bytes to read from a single result file for `--print-result`.
+pub(crate) const PRINT_RESULT_MAX_FILE_BYTES: u64 = 512 * 1024;
+
+/// Maximum total bytes across all result files for `--print-result`.
+pub(crate) const PRINT_RESULT_MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024;
 
 pub(crate) struct PostRunPromptBudget {
     used_bytes: u64,
@@ -1100,5 +1248,209 @@ mod tests {
         let errors = collect_application_errors(&[], dir.path());
         assert!(errors.contains(&"root error".to_string()));
         assert!(errors.contains(&"sub error".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // discover_printable_results tests (Group A)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn discover_printable_results_finalization_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let fin_dir = dir.path().join("finalization");
+        std::fs::create_dir_all(&fin_dir).unwrap();
+        std::fs::write(fin_dir.join("Summary_b3_claude.md"), "final result").unwrap();
+        std::fs::write(fin_dir.join("prompt.md"), "skip me").unwrap();
+        // Also create consolidation file that should NOT be picked
+        std::fs::write(
+            dir.path().join("consolidated_claude.md"),
+            "should not appear",
+        )
+        .unwrap();
+
+        let files = discover_printable_results(dir.path(), false, true, ExecutionMode::Pipeline);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "Summary_b3_claude"); // .md stripped
+        assert!(!files.iter().any(|(n, _)| n.contains("prompt")));
+    }
+
+    #[test]
+    fn discover_printable_results_single_consolidation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("consolidated_claude.md"), "consolidated").unwrap();
+        std::fs::write(dir.path().join("agent_iter1.md"), "not this").unwrap();
+
+        let files = discover_printable_results(dir.path(), false, false, ExecutionMode::Swarm);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "consolidated_claude");
+    }
+
+    #[test]
+    fn discover_printable_results_batch_cross_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cross_run_consolidation.md"), "cross").unwrap();
+        let run1 = dir.path().join("run_1");
+        std::fs::create_dir_all(&run1).unwrap();
+        std::fs::write(run1.join("consolidation.md"), "per-run").unwrap();
+
+        let files = discover_printable_results(dir.path(), true, false, ExecutionMode::Swarm);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "cross_run_consolidation");
+    }
+
+    #[test]
+    fn discover_printable_results_batch_fallback_per_run() {
+        let dir = tempfile::tempdir().unwrap();
+        // No cross_run_consolidation.md
+        let run1 = dir.path().join("run_1");
+        let run2 = dir.path().join("run_2");
+        std::fs::create_dir_all(&run1).unwrap();
+        std::fs::create_dir_all(&run2).unwrap();
+        std::fs::write(run1.join("consolidation.md"), "run 1 result").unwrap();
+        std::fs::write(run2.join("consolidation.md"), "run 2 result").unwrap();
+
+        let files = discover_printable_results(dir.path(), true, false, ExecutionMode::Swarm);
+        assert_eq!(files.len(), 2);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"consolidation_run_1"));
+        assert!(names.contains(&"consolidation_run_2"));
+    }
+
+    #[test]
+    fn discover_printable_results_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = discover_printable_results(dir.path(), false, false, ExecutionMode::Swarm);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn discover_printable_results_finalization_over_consolidation() {
+        let dir = tempfile::tempdir().unwrap();
+        let fin_dir = dir.path().join("finalization");
+        std::fs::create_dir_all(&fin_dir).unwrap();
+        std::fs::write(fin_dir.join("result.md"), "finalization").unwrap();
+        std::fs::write(dir.path().join("consolidated_claude.md"), "consolidation").unwrap();
+
+        let files = discover_printable_results(dir.path(), false, true, ExecutionMode::Pipeline);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "result");
+    }
+
+    #[test]
+    fn discover_printable_results_batch_finalization() {
+        let dir = tempfile::tempdir().unwrap();
+        let fin_dir = dir.path().join("finalization");
+        std::fs::create_dir_all(&fin_dir).unwrap();
+        std::fs::write(fin_dir.join("Summary_b3_claude.md"), "a").unwrap();
+        std::fs::write(fin_dir.join("Summary_b3_claude_run1.md"), "b").unwrap();
+
+        let files = discover_printable_results(dir.path(), true, true, ExecutionMode::Pipeline);
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn discover_printable_results_empty_finalization_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fin_dir = dir.path().join("finalization");
+        std::fs::create_dir_all(&fin_dir).unwrap();
+        std::fs::write(fin_dir.join("empty.md"), "").unwrap();
+
+        let files = discover_printable_results(dir.path(), false, true, ExecutionMode::Pipeline);
+        // Empty files ARE discovered (content handling is separate)
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "empty");
+    }
+
+    #[test]
+    fn discover_printable_results_sub_pipeline_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sub_Worker_b5_pipeline.md"), "sub out").unwrap();
+        // Regular block outputs should NOT be included
+        std::fs::write(dir.path().join("Researcher_b1_claude.md"), "not this").unwrap();
+
+        let files = discover_printable_results(dir.path(), false, false, ExecutionMode::Pipeline);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "sub_Worker_b5_pipeline");
+    }
+
+    #[test]
+    fn discover_printable_results_sub_pipeline_not_for_swarm() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sub_Worker_b5_pipeline.md"), "sub out").unwrap();
+
+        let files = discover_printable_results(dir.path(), false, false, ExecutionMode::Swarm);
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn discover_sub_pipeline_outputs_multi_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sub_Worker_b5_pipeline_r1.md"), "r1").unwrap();
+        std::fs::write(dir.path().join("sub_Worker_b5_pipeline_r2.md"), "r2").unwrap();
+        // Regular blocks excluded
+        std::fs::write(dir.path().join("Researcher_b1_claude.md"), "not this").unwrap();
+
+        let files = discover_sub_pipeline_outputs(dir.path());
+        assert_eq!(files.len(), 2);
+        let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"sub_Worker_b5_pipeline_r1.md"));
+        assert!(names.contains(&"sub_Worker_b5_pipeline_r2.md"));
+    }
+
+    #[test]
+    fn discover_sub_pipeline_outputs_excludes_regular_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Researcher_b1_claude.md"), "a").unwrap();
+        std::fs::write(dir.path().join("block1_gpt.md"), "b").unwrap();
+
+        let files = discover_sub_pipeline_outputs(dir.path());
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn discover_sub_pipeline_outputs_loop_dedup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sub_Worker_b5_pipeline_loop0.md"), "pass0").unwrap();
+        std::fs::write(dir.path().join("sub_Worker_b5_pipeline_loop1.md"), "pass1").unwrap();
+        std::fs::write(dir.path().join("sub_Worker_b5_pipeline_loop2.md"), "pass2").unwrap();
+
+        let files = discover_sub_pipeline_outputs(dir.path());
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "sub_Worker_b5_pipeline_loop2.md");
+    }
+
+    #[test]
+    fn discover_printable_results_relay_consolidation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("consolidated_claude.md"),
+            "relay consolidated",
+        )
+        .unwrap();
+
+        let files = discover_printable_results(dir.path(), false, false, ExecutionMode::Relay);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "consolidated_claude");
+    }
+
+    #[test]
+    fn discover_printable_results_relay_empty_without_consolidation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only regular iteration files, no consolidation
+        std::fs::write(dir.path().join("claude_iter1.md"), "output").unwrap();
+
+        let files = discover_printable_results(dir.path(), false, false, ExecutionMode::Relay);
+        // No consolidation or finalization → empty (sub-pipeline fallback only for Pipeline mode)
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn discover_printable_results_sub_pipeline_not_for_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("sub_Worker_b5_pipeline.md"), "sub out").unwrap();
+
+        // is_batch = true: sub-pipeline fallback should not activate
+        let files = discover_printable_results(dir.path(), true, false, ExecutionMode::Pipeline);
+        assert!(files.is_empty());
     }
 }

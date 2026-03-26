@@ -115,6 +115,10 @@ struct Cli {
     /// Override output directory
     #[arg(long)]
     output_dir: Option<String>,
+
+    /// Print finalization, consolidation, or sub-pipeline output to stdout after completion
+    #[arg(long)]
+    print_result: bool,
 }
 
 impl Cli {
@@ -136,6 +140,7 @@ impl Cli {
             || self.quiet
             || !matches!(self.output_format, CliOutputFormat::Text)
             || self.mode.is_some()
+            || self.print_result
     }
 }
 
@@ -222,6 +227,7 @@ fn cli_to_headless_args(cli: &Cli) -> Result<headless::HeadlessArgs, String> {
         consolidation_prompt: cli.consolidation_prompt.clone(),
         output_format,
         quiet: cli.quiet,
+        print_result: cli.print_result,
     })
 }
 
@@ -304,4 +310,36 @@ async fn main() -> anyhow::Result<()> {
     tui::run(&mut app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn print_result_sets_headless_only_flag() {
+        let cli = Cli::parse_from(["houseofagents", "--print-result"]);
+        assert!(cli.has_headless_only_flags());
+        assert!(!cli.is_headless());
+    }
+
+    #[test]
+    fn print_result_with_pipeline_is_headless() {
+        let cli = Cli::parse_from([
+            "houseofagents",
+            "--pipeline",
+            "/tmp/test.toml",
+            "--print-result",
+        ]);
+        assert!(cli.is_headless());
+        assert!(cli.print_result);
+    }
+
+    #[test]
+    fn print_result_default_is_false() {
+        let cli = Cli::parse_from(["houseofagents"]);
+        assert!(!cli.print_result);
+        assert!(!cli.has_headless_only_flags());
+    }
 }

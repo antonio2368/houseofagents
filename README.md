@@ -123,6 +123,7 @@ Headless mode (noninteractive):
       --quiet                     Suppress stderr progress output
       --memory                    Enable cross-run memory
       --output-dir <DIR>          Override output directory
+      --print-result              Print finalization/consolidation/sub-pipeline output to stdout
 ```
 
 ## Noninteractive (Headless) Mode
@@ -160,11 +161,14 @@ houseofagents --pipeline my_pipeline.toml --runs 3
 
 # Pipeline with consolidation
 houseofagents --pipeline my_pipeline.toml --consolidate Claude
+
+# Print finalization output directly to stdout
+houseofagents --pipeline my_pipeline.toml --print-result
 ```
 
 ### Output Behavior
 
-- **stdout**: In text mode, prints the run directory path on success. In JSON mode, prints a structured result object.
+- **stdout**: In text mode, prints the run directory path on success. In JSON mode, prints a structured result object. With `--print-result`, finalization or consolidation content is appended after the directory path (text) or included as a `"results"` array in the JSON object. Results are printed on both success and error paths (partial failures still produce usable artifacts) but NOT on cancellation. On error paths, the directory path is printed to stderr and result content appears directly on stdout without a preceding path line. For single-run pipelines without finalization or consolidation, sub-pipeline terminal outputs are used as a fallback. When results exceed the internal size budget (512 KB per file, 2 MB aggregate), a `"results_truncated": true` key is added to the JSON object and inline `[...truncated...]` markers appear in the content.
 - **stderr**: Progress events (agent starts, iteration completions, errors). Suppressed with `--quiet`. In JSON output format, progress events are NDJSON on stderr.
   - `sub_block_started` — An inner block within a sub-pipeline has started. Fields: `parent_block_id`, `inner_block_id`, `inner_label`, `parent_label`, `iteration`, `loop_pass`, `inner_loop_pass`.
   - `sub_block_finished` — An inner block within a sub-pipeline has finished. Same fields as `sub_block_started`.

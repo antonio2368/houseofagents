@@ -42,6 +42,7 @@ pub(crate) struct HeadlessArgs {
     pub consolidation_prompt: String,
     pub output_format: OutputFormat,
     pub quiet: bool,
+    pub print_result: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +1257,56 @@ pub(crate) async fn run(args: HeadlessArgs, config: AppConfig) -> i32 {
 
                 let extra = (post_run_partial.consolidation, post_run_partial.diagnostics);
 
+                // Collect result paths/content for --print-result.
+                // Placed AFTER the cancel re-check so Ctrl+C during post-run exits immediately.
+                // Collected for both ok and error paths — partial failure still has usable artifacts.
+                let (
+                    print_result_paths,
+                    print_result_json,
+                    print_result_truncated,
+                    result_read_errors,
+                ) = if args.print_result {
+                    if let Some(ref dir) = summary.run_dir {
+                        let run_dir = std::path::Path::new(dir);
+                        let paths = post_run::discover_printable_results(
+                            run_dir,
+                            summary.runs > 1,
+                            summary.pipeline_has_finalization,
+                            summary.mode,
+                        );
+                        if matches!(args.output_format, OutputFormat::Json) {
+                            let (json_content, errors, truncated) =
+                                collect_result_content_for_json(&paths).await;
+                            (paths, json_content, truncated, errors)
+                        } else {
+                            (paths, Vec::new(), false, Vec::new())
+                        }
+                    } else {
+                        (Vec::new(), Vec::new(), false, Vec::new())
+                    }
+                } else {
+                    (Vec::new(), Vec::new(), false, Vec::new())
+                };
+
+                // Emit format-aware warnings for unreadable result files.
+                // In practice only populated for JSON mode (text mode handles errors
+                // inline in write_text_results), but we handle both for robustness.
+                if !result_read_errors.is_empty() && !args.quiet {
+                    for (name, err) in &result_read_errors {
+                        let msg = format!("Failed to read result '{name}': {err}");
+                        if matches!(args.output_format, OutputFormat::Json) {
+                            let obj = serde_json::json!({
+                                "event": "warning",
+                                "component": "print_result",
+                                "message": msg,
+                            });
+                            eprintln!("{}", serde_json::to_string(&obj).unwrap_or_default());
+                        } else {
+                            eprintln!("Warning: {msg}");
+                        }
+                    }
+                }
+
                 if summary.failed || post_run_err_msg.is_some() {
                     // Combine execution + post-run errors for the final payload.
                     let error_msg = match (&summary.error, &post_run_err_msg) {
@@ -1272,6 +1323,9 @@ pub(crate) async fn run(args: HeadlessArgs, config: AppConfig) -> i32 {
                         Some(FinalResultExtra {
                             consolidation: extra.0.as_deref(),
                             diagnostics: extra.1.as_deref(),
+                            print_result_paths,
+                            print_result_json,
+                            print_result_truncated,
                         }),
                     );
                     EXIT_EXECUTION
@@ -1284,6 +1338,9 @@ pub(crate) async fn run(args: HeadlessArgs, config: AppConfig) -> i32 {
                         Some(FinalResultExtra {
                             consolidation: extra.0.as_deref(),
                             diagnostics: extra.1.as_deref(),
+                            print_result_paths,
+                            print_result_json,
+                            print_result_truncated,
                         }),
                     );
                     EXIT_OK
@@ -1332,6 +1389,9 @@ struct PostRunResult {
 struct FinalResultExtra<'a> {
     consolidation: Option<&'a str>,
     diagnostics: Option<&'a str>,
+    print_result_paths: Vec<(String, std::path::PathBuf)>,
+    print_result_json: Vec<(String, String)>,
+    print_result_truncated: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2837,6 +2897,228 @@ fn emit_run_dir_early(args: &HeadlessArgs, run_dir: &str) {
     }
 }
 
+/// Read up to `max_bytes` of a UTF-8 file asynchronously.
+/// Returns `(content, was_truncated)`.
+///
+/// Always uses `take()` to bound the read, avoiding any transient memory spike
+/// from a TOCTOU race where the file grows between stat and read.
+async fn read_file_bounded(
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> Result<(String, bool), std::io::Error> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await?;
+    // Pre-allocate based on the open fd's metadata (fstat), matching
+    // write_text_results. Falls back to 64 KB if fstat fails.
+    let prealloc = file
+        .metadata()
+        .await
+        .map(|m| m.len().min(max_bytes) as usize + 1)
+        .unwrap_or(64 * 1024);
+    let mut reader = file.take(max_bytes + 1);
+    let mut buf = Vec::with_capacity(prealloc);
+    reader.read_to_end(&mut buf).await?;
+    let was_truncated = buf.len() as u64 > max_bytes;
+    if was_truncated {
+        buf.truncate(max_bytes as usize);
+    }
+    let valid_end = match std::str::from_utf8(&buf) {
+        Ok(_) => buf.len(),
+        Err(e) => e.valid_up_to(),
+    };
+    // If the file had data but contains zero valid UTF-8 bytes, surface an
+    // error so callers can warn the user rather than silently returning empty.
+    if valid_end == 0 && !buf.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file contains no valid UTF-8 data",
+        ));
+    }
+    buf.truncate(valid_end);
+    let content = String::from_utf8(buf).unwrap();
+    Ok((content, was_truncated))
+}
+
+/// Collect result file content for JSON mode with per-file and aggregate caps.
+/// Returns `(results, read_errors, truncated)`.
+async fn collect_result_content_for_json(
+    files: &[(String, std::path::PathBuf)],
+) -> (Vec<(String, String)>, Vec<(String, String)>, bool) {
+    let per_file_max = post_run::PRINT_RESULT_MAX_FILE_BYTES;
+    let total_max = post_run::PRINT_RESULT_MAX_TOTAL_BYTES;
+    let mut results = Vec::with_capacity(files.len());
+    let mut errors = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let mut truncated = false;
+
+    for (display_name, path) in files {
+        let remaining = total_max.saturating_sub(total_bytes);
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let file_cap = per_file_max.min(remaining);
+        match read_file_bounded(path, file_cap).await {
+            Ok((content, file_truncated)) => {
+                // Note: total_bytes tracks original content only. The
+                // `\n[...truncated...]` suffix (~18 bytes) is not counted
+                // against the budget — negligible vs. the 2 MB cap.
+                total_bytes += content.len() as u64;
+                if file_truncated {
+                    truncated = true;
+                }
+                let content = if file_truncated {
+                    format!("{content}\n[...truncated...]")
+                } else {
+                    content
+                };
+                results.push((display_name.clone(), content));
+            }
+            Err(e) => {
+                errors.push((display_name.clone(), format!("{}: {e}", path.display())));
+            }
+        }
+    }
+    (results, errors, truncated)
+}
+
+/// Stream `--print-result` text output to a writer. Returns `(total_bytes, had_errors)`.
+fn write_text_results(
+    writer: &mut impl std::io::Write,
+    files: &[(String, std::path::PathBuf)],
+    quiet: bool,
+    err_writer: &mut impl std::io::Write,
+) -> (u64, bool) {
+    use std::io::Read;
+    let per_file_max = post_run::PRINT_RESULT_MAX_FILE_BYTES;
+    let total_max = post_run::PRINT_RESULT_MAX_TOTAL_BYTES;
+    let mut total_bytes: u64 = 0;
+    let mut had_errors = false;
+    let mut files_written = 0usize;
+
+    for (name, path) in files.iter() {
+        let remaining = total_max.saturating_sub(total_bytes);
+        if remaining == 0 {
+            let _ = writeln!(writer, "\n[...additional results truncated...]");
+            break;
+        }
+        let file_cap = per_file_max.min(remaining);
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                had_errors = true;
+                if !quiet {
+                    let _ = writeln!(err_writer, "Warning: failed to read result '{name}': {e}");
+                }
+                continue;
+            }
+        };
+        // Pre-allocate based on the open fd's metadata (fstat) to avoid a
+        // redundant syscall and any TOCTOU divergence from the path-based stat.
+        let prealloc = file
+            .metadata()
+            .map(|m| (m.len().min(file_cap) as usize + 1))
+            .unwrap_or(64 * 1024)
+            .min(file_cap as usize + 1);
+        let mut buf = Vec::with_capacity(prealloc);
+        match file.take(file_cap + 1).read_to_end(&mut buf) {
+            Ok(_) => {}
+            Err(e) => {
+                if buf.is_empty() {
+                    had_errors = true;
+                    if !quiet {
+                        let _ =
+                            writeln!(err_writer, "Warning: failed to read result '{name}': {e}");
+                    }
+                    continue;
+                }
+                // Partial read — use whatever bytes we got
+            }
+        }
+        if buf.is_empty() {
+            continue;
+        }
+        let overflowed = buf.len() as u64 > file_cap;
+        if overflowed {
+            buf.truncate(file_cap as usize);
+        }
+        let valid_end = match std::str::from_utf8(&buf) {
+            Ok(_) => buf.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_end == 0 {
+            // File had data but no valid UTF-8 — warn instead of silently skipping.
+            had_errors = true;
+            if !quiet {
+                let _ = writeln!(
+                    err_writer,
+                    "Warning: result '{name}' contains no valid UTF-8 data"
+                );
+            }
+            continue;
+        }
+        let content = std::str::from_utf8(&buf[..valid_end]).unwrap();
+        // Emit header AFTER confirming content exists
+        if files_written > 0 {
+            let _ = writeln!(writer);
+        }
+        let _ = writeln!(writer, "=== {name} ===");
+        let _ = write!(writer, "{content}");
+        if !content.ends_with('\n') {
+            let _ = writeln!(writer);
+        }
+        total_bytes += valid_end as u64;
+        if overflowed {
+            let _ = writeln!(writer, "[...truncated...]");
+        }
+        files_written += 1;
+    }
+    (total_bytes, had_errors)
+}
+
+/// Build the final JSON result object. Extracted for testability.
+fn build_final_result_json(
+    args: &HeadlessArgs,
+    status: &str,
+    run_dir: Option<&str>,
+    error: Option<&str>,
+    extra: Option<&FinalResultExtra<'_>>,
+) -> serde_json::Value {
+    let mode = if args.pipeline_path.is_some() {
+        "pipeline"
+    } else {
+        args.mode.as_str()
+    };
+    let consolidation = extra.and_then(|e| e.consolidation);
+    let diagnostics = extra.and_then(|e| e.diagnostics);
+    let mut obj = serde_json::json!({
+        "event": "result",
+        "status": status,
+        "mode": mode,
+        "run_dir": run_dir,
+        "runs": args.runs,
+        "consolidation": consolidation,
+        "diagnostics": diagnostics,
+        "error": error,
+    });
+    if args.print_result && status != "cancelled" {
+        let arr: Vec<serde_json::Value> = extra
+            .map(|e| {
+                e.print_result_json
+                    .iter()
+                    .map(|(n, c)| serde_json::json!({"name": n, "content": c}))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let map = obj.as_object_mut().unwrap();
+        map.insert("results".to_string(), serde_json::json!(arr));
+        if extra.is_some_and(|e| e.print_result_truncated) {
+            map.insert("results_truncated".to_string(), serde_json::json!(true));
+        }
+    }
+    obj
+}
+
 fn emit_final_result(
     args: &HeadlessArgs,
     status: &str,
@@ -2859,25 +3141,34 @@ fn emit_final_result(
                     eprintln!("Failed: {err}\nOutput at: {dir}");
                 }
             }
+            // --print-result: stream result files to stdout
+            if args.print_result && status != "cancelled" {
+                if let Some(ref e) = extra {
+                    if !e.print_result_paths.is_empty() {
+                        // Only emit a separator newline when the directory path was
+                        // written to stdout (status "ok"). On error the path goes to
+                        // stderr, so a leading blank line on stdout would be stray.
+                        if status == "ok" {
+                            println!();
+                        }
+                        let stdout = std::io::stdout();
+                        let mut out = stdout.lock();
+                        let stderr = std::io::stderr();
+                        let mut err_out = stderr.lock();
+                        // Return value (bytes_written, had_errors) intentionally
+                        // unused at this callsite; kept for testability.
+                        let _ = write_text_results(
+                            &mut out,
+                            &e.print_result_paths,
+                            args.quiet,
+                            &mut err_out,
+                        );
+                    }
+                }
+            }
         }
         OutputFormat::Json => {
-            let mode = if args.pipeline_path.is_some() {
-                "pipeline"
-            } else {
-                args.mode.as_str()
-            };
-            let consolidation = extra.as_ref().and_then(|e| e.consolidation);
-            let diagnostics = extra.as_ref().and_then(|e| e.diagnostics);
-            let obj = serde_json::json!({
-                "event": "result",
-                "status": status,
-                "mode": mode,
-                "run_dir": run_dir,
-                "runs": args.runs,
-                "consolidation": consolidation,
-                "diagnostics": diagnostics,
-                "error": error,
-            });
+            let obj = build_final_result_json(args, status, run_dir, error, extra.as_ref());
             println!("{}", serde_json::to_string_pretty(&obj).unwrap_or_default());
         }
     }
@@ -3012,4 +3303,491 @@ async fn run_memory_extraction(
     }
 
     Ok(memories.len())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::ExecutionMode;
+
+    // Helper to create minimal HeadlessArgs for testing
+    fn test_args(print_result: bool, output_format: OutputFormat) -> HeadlessArgs {
+        HeadlessArgs {
+            prompt: None,
+            mode: ExecutionMode::Pipeline,
+            agents: vec![],
+            relay_order: vec![],
+            iterations: None,
+            runs: 1,
+            concurrency: 0,
+            session_name: None,
+            forward_prompt: false,
+            keep_session: true,
+            pipeline_path: Some(PathBuf::from("/tmp/test.toml")),
+            consolidate_agent: None,
+            consolidation_prompt: String::new(),
+            output_format,
+            quiet: false,
+            print_result,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Group B: Bounded read + content collection
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_file_bounded_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.md");
+        std::fs::write(&path, "hello world").unwrap();
+
+        let (content, truncated) = read_file_bounded(&path, 1024).await.unwrap();
+        assert_eq!(content, "hello world");
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn read_file_bounded_large_file_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.md");
+        let data = "x".repeat(2000);
+        std::fs::write(&path, &data).unwrap();
+
+        let (content, truncated) = read_file_bounded(&path, 100).await.unwrap();
+        assert!(content.len() <= 100);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn read_file_bounded_multibyte_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("utf8.md");
+        // Each emoji is 4 bytes. Write 10 emojis = 40 bytes
+        let data = "🎉".repeat(10);
+        std::fs::write(&path, &data).unwrap();
+
+        // Cut at 6 bytes — mid-emoji. Should back up to valid boundary.
+        let (content, truncated) = read_file_bounded(&path, 6).await.unwrap();
+        assert!(truncated);
+        // Should contain only 1 emoji (4 bytes), since 6 bytes truncates mid-second emoji
+        assert_eq!(content, "🎉");
+        assert!(content.len() <= 6);
+    }
+
+    #[tokio::test]
+    async fn collect_result_content_for_json_no_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.md");
+        let p2 = dir.path().join("b.md");
+        std::fs::write(&p1, "content a").unwrap();
+        std::fs::write(&p2, "content b").unwrap();
+
+        let files = vec![("a".to_string(), p1), ("b".to_string(), p2)];
+        let (results, errors, truncated) = collect_result_content_for_json(&files).await;
+        assert_eq!(results.len(), 2);
+        assert!(errors.is_empty());
+        assert!(!truncated);
+        assert_eq!(results[0].1, "content a");
+        assert_eq!(results[1].1, "content b");
+    }
+
+    #[tokio::test]
+    async fn collect_result_content_for_json_total_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create 5 files each at per-file cap to exceed total cap (5 * 512KB = 2.5MB > 2MB)
+        let per_file = post_run::PRINT_RESULT_MAX_FILE_BYTES as usize;
+        let mut files = Vec::new();
+        for i in 0..5 {
+            let p = dir.path().join(format!("f{i}.md"));
+            std::fs::write(&p, "x".repeat(per_file)).unwrap();
+            files.push((format!("f{i}"), p));
+        }
+        let (results, _errors, truncated) = collect_result_content_for_json(&files).await;
+        // Not all 5 files can fit in 2MB total; some should be skipped
+        assert!(results.len() < 5);
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn collect_result_content_for_json_budget_limited_final_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Use files sized to exactly fill per-file cap (512KiB each).
+        // After 3 files (1536KiB used), file 4 has remaining = 2MB-1536KB = 512KB,
+        // budget_limited = false. After 4 files (2048KiB = 2MB exactly), remaining = 0 → truncated.
+        let per_file_size = post_run::PRINT_RESULT_MAX_FILE_BYTES as usize;
+        let content = "x".repeat(per_file_size);
+        let mut files = Vec::new();
+        for i in 0..5 {
+            let p = dir.path().join(format!("f{i}.md"));
+            std::fs::write(&p, &content).unwrap();
+            files.push((format!("f{i}"), p));
+        }
+
+        let (results, errors, truncated) = collect_result_content_for_json(&files).await;
+        assert!(errors.is_empty());
+        // 4 files × 512KB = 2MB = total cap. File 5 has remaining=0 → truncated.
+        assert!(truncated);
+        assert_eq!(results.len(), 4);
+    }
+
+    // -----------------------------------------------------------------------
+    // Group D: JSON output boundary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn json_no_results_key_when_flag_absent() {
+        let args = test_args(false, OutputFormat::Json);
+        let obj = build_final_result_json(&args, "ok", Some("/tmp/out"), None, None);
+        let map = obj.as_object().unwrap();
+        assert!(!map.contains_key("results"));
+        assert!(!map.contains_key("results_truncated"));
+    }
+
+    #[test]
+    fn json_no_results_key_on_cancelled() {
+        let args = test_args(true, OutputFormat::Json);
+        let obj = build_final_result_json(&args, "cancelled", Some("/tmp/out"), None, None);
+        let map = obj.as_object().unwrap();
+        assert!(!map.contains_key("results"));
+    }
+
+    #[test]
+    fn json_results_present_when_flag_set() {
+        let args = test_args(true, OutputFormat::Json);
+        let extra = FinalResultExtra {
+            consolidation: None,
+            diagnostics: None,
+            print_result_paths: vec![],
+            print_result_json: vec![("summary".to_string(), "result content".to_string())],
+            print_result_truncated: false,
+        };
+        let obj = build_final_result_json(&args, "ok", Some("/tmp/out"), None, Some(&extra));
+        let map = obj.as_object().unwrap();
+        assert!(map.contains_key("results"));
+        let arr = map["results"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"].as_str().unwrap(), "summary");
+        assert_eq!(arr[0]["content"].as_str().unwrap(), "result content");
+        assert!(!map.contains_key("results_truncated"));
+    }
+
+    #[test]
+    fn json_results_present_on_error_with_flag() {
+        let args = test_args(true, OutputFormat::Json);
+        let extra = FinalResultExtra {
+            consolidation: None,
+            diagnostics: None,
+            print_result_paths: vec![],
+            print_result_json: vec![("partial".to_string(), "partial output".to_string())],
+            print_result_truncated: false,
+        };
+        let obj = build_final_result_json(
+            &args,
+            "error",
+            Some("/tmp/out"),
+            Some("some error"),
+            Some(&extra),
+        );
+        let map = obj.as_object().unwrap();
+        assert!(map.contains_key("results"));
+        assert_eq!(map["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_results_truncated_flag_present() {
+        let args = test_args(true, OutputFormat::Json);
+        let extra = FinalResultExtra {
+            consolidation: None,
+            diagnostics: None,
+            print_result_paths: vec![],
+            print_result_json: vec![],
+            print_result_truncated: true,
+        };
+        let obj = build_final_result_json(&args, "ok", Some("/tmp/out"), None, Some(&extra));
+        let map = obj.as_object().unwrap();
+        assert_eq!(map["results_truncated"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn json_results_truncated_flag_absent_when_not_truncated() {
+        let args = test_args(true, OutputFormat::Json);
+        let extra = FinalResultExtra {
+            consolidation: None,
+            diagnostics: None,
+            print_result_paths: vec![],
+            print_result_json: vec![("x".to_string(), "y".to_string())],
+            print_result_truncated: false,
+        };
+        let obj = build_final_result_json(&args, "ok", Some("/tmp/out"), None, Some(&extra));
+        let map = obj.as_object().unwrap();
+        assert!(!map.contains_key("results_truncated"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Group E: Text streaming
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn text_results_separator_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.md");
+        let p2 = dir.path().join("b.md");
+        std::fs::write(&p1, "content a\n").unwrap();
+        std::fs::write(&p2, "content b\n").unwrap();
+
+        let files = vec![("file_a".to_string(), p1), ("file_b".to_string(), p2)];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_text_results(&mut out, &files, false, &mut err);
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("=== file_a ==="));
+        assert!(output.contains("content a"));
+        assert!(output.contains("=== file_b ==="));
+        assert!(output.contains("content b"));
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn text_results_empty_files_no_output() {
+        let files: Vec<(String, std::path::PathBuf)> = vec![];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_text_results(&mut out, &files, false, &mut err);
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn text_results_read_failure_no_header() {
+        let files = vec![(
+            "missing".to_string(),
+            PathBuf::from("/nonexistent/path/file.md"),
+        )];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_text_results(&mut out, &files, false, &mut err);
+        let output = String::from_utf8(out).unwrap();
+        let err_output = String::from_utf8(err).unwrap();
+        // No header should appear in stdout
+        assert!(!output.contains("=== missing ==="));
+        // Warning should appear on stderr
+        assert!(err_output.contains("Warning"));
+        assert!(err_output.contains("missing"));
+    }
+
+    #[test]
+    fn text_results_read_failure_quiet_suppresses_warning() {
+        let files = vec![(
+            "missing".to_string(),
+            PathBuf::from("/nonexistent/path/file.md"),
+        )];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_text_results(&mut out, &files, true, &mut err);
+        assert!(out.is_empty());
+        assert!(err.is_empty()); // quiet suppresses warnings
+    }
+
+    #[test]
+    fn text_results_truncation_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.md");
+        let data = "x".repeat(post_run::PRINT_RESULT_MAX_FILE_BYTES as usize + 100);
+        std::fs::write(&path, &data).unwrap();
+
+        let files = vec![("big".to_string(), path)];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_text_results(&mut out, &files, false, &mut err);
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("[...truncated...]"));
+    }
+
+    #[test]
+    fn text_results_aggregate_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create many large files that exceed total cap
+        let content = "x".repeat(post_run::PRINT_RESULT_MAX_FILE_BYTES as usize);
+        let mut files = Vec::new();
+        for i in 0..10 {
+            let p = dir.path().join(format!("f{i}.md"));
+            std::fs::write(&p, &content).unwrap();
+            files.push((format!("f{i}"), p));
+        }
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_text_results(&mut out, &files, false, &mut err);
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("[...additional results truncated...]"));
+    }
+
+    #[test]
+    fn text_results_empty_file_no_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("empty.md");
+        std::fs::write(&p, "").unwrap();
+
+        let files = vec![("empty".to_string(), p)];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_text_results(&mut out, &files, false, &mut err);
+        let output = String::from_utf8(out).unwrap();
+        // Empty file: no header, no content
+        assert!(!output.contains("=== empty ==="));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn text_results_mixed_readable_and_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("good.md");
+        std::fs::write(&p1, "good content\n").unwrap();
+
+        let files = vec![
+            ("good".to_string(), p1),
+            ("bad".to_string(), PathBuf::from("/nonexistent/file.md")),
+        ];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        write_text_results(&mut out, &files, false, &mut err);
+        let output = String::from_utf8(out).unwrap();
+        let err_output = String::from_utf8(err).unwrap();
+        // Good file gets header + content
+        assert!(output.contains("=== good ==="));
+        assert!(output.contains("good content"));
+        // Bad file: no header in stdout, warning in stderr
+        assert!(!output.contains("=== bad ==="));
+        assert!(err_output.contains("Warning"));
+    }
+
+    #[test]
+    fn text_results_invalid_utf8_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("binary.md");
+        std::fs::write(&p, [0xFF, 0xFE, 0xFD, 0xFC]).unwrap();
+
+        let files = vec![("binary".to_string(), p)];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (bytes, had_errors) = write_text_results(&mut out, &files, false, &mut err);
+        // No header or content in stdout — the file is all invalid UTF-8
+        assert!(out.is_empty());
+        assert_eq!(bytes, 0);
+        assert!(had_errors);
+        // Warning emitted to stderr
+        let err_output = String::from_utf8(err).unwrap();
+        assert!(err_output.contains("Warning"));
+        assert!(err_output.contains("no valid UTF-8"));
+    }
+
+    #[test]
+    fn text_results_invalid_utf8_quiet_suppresses_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("binary.md");
+        std::fs::write(&p, [0xFF, 0xFE, 0xFD]).unwrap();
+
+        let files = vec![("binary".to_string(), p)];
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (_, had_errors) = write_text_results(&mut out, &files, true, &mut err);
+        assert!(had_errors);
+        // quiet mode: no stderr output
+        assert!(err.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional tests (S8: coverage gaps)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn read_file_bounded_zero_max_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("any.md");
+        std::fs::write(&path, "content").unwrap();
+
+        let (content, truncated) = read_file_bounded(&path, 0).await.unwrap();
+        assert!(content.is_empty());
+        assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn read_file_bounded_invalid_utf8_small_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary.md");
+        // Write pure invalid UTF-8 bytes (small file within cap)
+        std::fs::write(&path, [0xFF, 0xFE, 0xFD, 0xFC]).unwrap();
+
+        // Non-empty file with zero valid UTF-8 bytes returns InvalidData error
+        let result = read_file_bounded(&path, 1024).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("no valid UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn read_file_bounded_invalid_utf8_large_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary_large.md");
+        // Write invalid UTF-8 bytes that exceed the cap
+        let data = vec![0xFF; 200];
+        std::fs::write(&path, &data).unwrap();
+
+        // Non-empty file with zero valid UTF-8 bytes returns InvalidData error
+        let result = read_file_bounded(&path, 100).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn read_file_bounded_mixed_utf8_truncates_at_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mixed.md");
+        // Write mix: valid ASCII followed by invalid bytes, padded to exceed cap
+        let mut mixed = b"hello".to_vec();
+        mixed.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
+        mixed.extend_from_slice(&[0x41; 200]);
+        std::fs::write(&path, &mixed).unwrap();
+
+        let (content, truncated) = read_file_bounded(&path, 7).await.unwrap();
+        assert!(truncated);
+        assert_eq!(content, "hello"); // truncated at UTF-8 boundary before 0xFF
+    }
+
+    #[tokio::test]
+    async fn collect_result_content_for_json_per_file_truncation_sets_flag() {
+        // Verifies M2 fix: a single large file triggers results_truncated
+        // even when aggregate budget has room.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.md");
+        let data = "x".repeat(post_run::PRINT_RESULT_MAX_FILE_BYTES as usize + 100);
+        std::fs::write(&p, &data).unwrap();
+
+        let files = vec![("big".to_string(), p)];
+        let (results, errors, truncated) = collect_result_content_for_json(&files).await;
+        assert_eq!(results.len(), 1);
+        assert!(errors.is_empty());
+        // Per-file truncation now sets the flag regardless of aggregate budget
+        assert!(truncated);
+        assert!(results[0].1.contains("[...truncated...]"));
+    }
+
+    #[tokio::test]
+    async fn collect_result_content_for_json_unreadable_file() {
+        let files = vec![(
+            "missing".to_string(),
+            PathBuf::from("/nonexistent/result.md"),
+        )];
+        let (results, errors, truncated) = collect_result_content_for_json(&files).await;
+        assert!(results.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].0 == "missing");
+        assert!(!truncated);
+    }
 }
