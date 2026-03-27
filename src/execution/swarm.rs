@@ -126,6 +126,8 @@ pub async fn run_swarm(
                     }
                 }
 
+                let pre_send_session_id = provider.session_id().map(|s| s.to_string());
+
                 let result = run_with_cancellation(
                     provider.as_mut(),
                     &message,
@@ -239,7 +241,7 @@ pub async fn run_swarm(
                         )
                     }
                     Err(e) => {
-                        if let Some(sid) = provider.session_id() {
+                        if let Some(ref sid) = pre_send_session_id {
                             let dedupe_key = (agent_name.clone(), sid.to_string());
                             if task_logged.lock().expect("lock").insert(dedupe_key) {
                                 let _ = tx.send(ProgressEvent::AgentLog {
@@ -362,7 +364,7 @@ fn build_swarm_file_message(
 mod tests {
     use super::*;
     use crate::execution::test_utils::{
-        collect_progress_events, ok_response, MockProvider, PanicProvider,
+        collect_progress_events, ok_response, MockProvider, PanicProvider, SessionMutatingProvider,
     };
     use crate::provider::ProviderKind;
     use std::sync::{Arc, Mutex};
@@ -855,5 +857,54 @@ mod tests {
         assert!(content.contains("swarm-sess-aaa"));
         assert!(content.contains("swarm-sess-bbb"));
         assert_eq!(content.matches("[[sessions]]").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn swarm_error_path_logs_pre_send_session_id_not_phantom() {
+        let dir = tempdir().expect("tempdir");
+        let out = OutputManager::new(dir.path(), None).expect("out");
+        let provider = SessionMutatingProvider::new(
+            ProviderKind::Anthropic,
+            "swarm-real-id",
+            "swarm-phantom-id",
+            "simulated failure",
+        );
+        let agents = vec![named("Claude", ProviderKind::Anthropic, Box::new(provider))];
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        run_swarm(
+            &context("p"),
+            agents,
+            1,
+            1,
+            HashMap::new(),
+            true,
+            HashMap::new(),
+            &out,
+            tx,
+            cancel,
+        )
+        .await
+        .expect("run");
+
+        let sessions_path = out.run_dir().join("_sessions.toml");
+        let content = std::fs::read_to_string(&sessions_path).expect("_sessions.toml must exist");
+        assert!(
+            content.contains("swarm-real-id"),
+            "should contain pre-send ID, got: {content}"
+        );
+        assert!(
+            !content.contains("swarm-phantom-id"),
+            "must NOT contain phantom ID, got: {content}"
+        );
+
+        let events = collect_progress_events(rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::AgentError { .. })),
+            "expected an AgentError event"
+        );
     }
 }

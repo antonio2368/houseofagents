@@ -122,6 +122,8 @@ pub async fn run_relay(
                 .join(format!("{sanitized}_iter{iteration}.md"));
             agents[i].1.set_output_path(Some(output_file_path));
 
+            let pre_send_session_id = agents[i].1.session_id().map(|s| s.to_string());
+
             // Use run_with_cancellation so cancel aborts the in-flight request
             let result = run_with_cancellation(
                 agents[i].1.as_mut(),
@@ -234,7 +236,7 @@ pub async fn run_relay(
                     last_output = resp.content;
                 }
                 Err(e) => {
-                    if let Some(sid) = agents[i].1.session_id() {
+                    if let Some(ref sid) = pre_send_session_id {
                         let dedupe_key = (name.to_string(), sid.to_string());
                         if logged_sessions.insert(dedupe_key) {
                             let _ = progress_tx.send(ProgressEvent::AgentLog {
@@ -288,7 +290,9 @@ pub async fn run_relay(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::execution::test_utils::{collect_progress_events, ok_response, MockProvider};
+    use crate::execution::test_utils::{
+        collect_progress_events, ok_response, MockProvider, SessionMutatingProvider,
+    };
     use crate::provider::ProviderKind;
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
@@ -755,5 +759,55 @@ mod tests {
         let content = std::fs::read_to_string(out.run_dir().join("_sessions.toml")).expect("read");
         assert!(content.contains("test-session-123"));
         assert!(content.contains(r#"block = "Claude""#));
+    }
+
+    #[tokio::test]
+    async fn relay_error_path_logs_pre_send_session_id_not_phantom() {
+        let dir = tempdir().expect("tempdir");
+        let out = OutputManager::new(dir.path(), None).expect("out");
+        let provider = SessionMutatingProvider::new(
+            ProviderKind::Anthropic,
+            "relay-real-id",
+            "relay-phantom-id",
+            "simulated failure",
+        );
+        let agents = vec![named("Claude", ProviderKind::Anthropic, Box::new(provider))];
+        let (tx, rx) = mpsc::unbounded_channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        run_relay(
+            &context("p"),
+            agents,
+            1,
+            1,
+            None,
+            false,
+            true,
+            HashMap::new(),
+            &out,
+            tx,
+            cancel,
+        )
+        .await
+        .expect("run");
+
+        let sessions_path = out.run_dir().join("_sessions.toml");
+        let content = std::fs::read_to_string(&sessions_path).expect("_sessions.toml must exist");
+        assert!(
+            content.contains("relay-real-id"),
+            "should contain pre-send ID, got: {content}"
+        );
+        assert!(
+            !content.contains("relay-phantom-id"),
+            "must NOT contain phantom ID, got: {content}"
+        );
+
+        let events = collect_progress_events(rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::AgentError { .. })),
+            "expected an AgentError event"
+        );
     }
 }

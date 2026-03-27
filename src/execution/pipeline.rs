@@ -3502,6 +3502,8 @@ async fn run_pipeline_with_provider_factory(
                                 }
                             }
 
+                            let pre_send_session_id = guard.session_id().map(|s| s.to_string());
+
                             let result = tokio::select! {
                                 res = crate::execution::send_with_streaming(
                                     &mut **guard,
@@ -3525,7 +3527,7 @@ async fn run_pipeline_with_provider_factory(
                             };
 
                             guard.set_live_log_sender(None);
-                            let provider_session_id = guard.session_id().map(|s| s.to_string());
+                            let post_send_session_id = guard.session_id().map(|s| s.to_string());
                             let cancelled = result.is_none();
                             drop(guard);
                             finish_live_log_forwarder(live_forward, cancelled).await;
@@ -3581,7 +3583,7 @@ async fn run_pipeline_with_provider_factory(
                                     (rid, Err("Cancelled".to_string()))
                                 }
                                 Some(Ok(resp)) => {
-                                    if let Some(ref sid) = provider_session_id {
+                                    if let Some(ref sid) = post_send_session_id {
                                         log_session(sid);
                                     }
                                     for log in &resp.debug_logs {
@@ -3632,7 +3634,7 @@ async fn run_pipeline_with_provider_factory(
                                     }
                                 }
                                 Some(Err(e)) => {
-                                    if let Some(ref sid) = provider_session_id {
+                                    if let Some(ref sid) = pre_send_session_id {
                                         log_session(sid);
                                     }
                                     let error = e.to_string();
@@ -5773,7 +5775,8 @@ mod tests {
     use super::*;
     use crate::config::ProviderConfig;
     use crate::execution::test_utils::{
-        collect_progress_events, MockProvider, PanicProvider, SuccessThenPanicProvider,
+        collect_progress_events, MockProvider, PanicProvider, SessionMutatingProvider,
+        SuccessThenPanicProvider,
     };
     use crate::output::OutputManager;
     use crate::provider::ProviderKind;
@@ -11473,6 +11476,69 @@ position = [0, 0]
         assert!(
             content.contains("block_id = "),
             "pipeline session entries should include block_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_error_path_logs_pre_send_session_id_not_phantom() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("phantom-test")).unwrap();
+        let def = def_with(vec![block(1, 0, 0)], vec![]);
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_kind, _cfg| {
+                Box::new(SessionMutatingProvider::new(
+                    ProviderKind::Anthropic,
+                    "real-session-aaa",
+                    "phantom-session-zzz",
+                    "simulated failure",
+                )) as Box<dyn crate::provider::Provider>
+            }),
+        )
+        .await
+        .expect("run");
+
+        let sessions_path = output.run_dir().join("_sessions.toml");
+        let content = std::fs::read_to_string(&sessions_path).expect("_sessions.toml must exist");
+        assert!(
+            content.contains("real-session-aaa"),
+            "_sessions.toml should contain pre-send session ID, got: {content}"
+        );
+        assert!(
+            !content.contains("phantom-session-zzz"),
+            "_sessions.toml must NOT contain phantom session ID, got: {content}"
+        );
+
+        let events = collect_progress_events(rx);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ProgressEvent::BlockError { .. })),
+            "expected a BlockError event"
         );
     }
 }

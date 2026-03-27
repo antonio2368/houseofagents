@@ -17,6 +17,14 @@ const CLI_STDERR_MAX_BYTES: usize = 256 * 1024;
 const CLI_POST_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const CLI_LIVE_LOG_LINE_MAX_BYTES: usize = 4096;
 
+const CLI_TRANSIENT_MAX_RETRIES: u32 = 2;
+
+#[cfg(not(test))]
+const CLI_TRANSIENT_BASE_BACKOFF: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+const CLI_TRANSIENT_BASE_BACKOFF: Duration = Duration::from_millis(50);
+
 #[derive(Debug)]
 struct BoundedBytes {
     bytes: Vec<u8>,
@@ -44,6 +52,8 @@ pub struct CliProvider {
     history: Vec<Message>,
     live_log_tx: Option<mpsc::UnboundedSender<String>>,
     output_path: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) test_bin_path: Option<String>,
 }
 
 impl CliProvider {
@@ -77,6 +87,8 @@ impl CliProvider {
             history: Vec::new(),
             live_log_tx: None,
             output_path: None,
+            #[cfg(test)]
+            test_bin_path: None,
         }
     }
 
@@ -307,6 +319,20 @@ impl CliProvider {
         if let Some(tx) = self.live_log_tx.as_ref() {
             let _ = tx.send(message);
         }
+    }
+
+    /// Returns true if the CLI process output indicates a transient API error
+    /// worth retrying after a backoff. Only checks stderr — stdout may contain
+    /// model output or Codex JSONL telemetry where numeric codes like "502"
+    /// could appear in unrelated content.
+    fn is_transient_cli_error(stderr: &str) -> bool {
+        let lower = stderr.to_ascii_lowercase();
+        lower.contains("529")
+            || lower.contains("overloaded")
+            || lower.contains("502")
+            || lower.contains("503")
+            || lower.contains("504")
+            || lower.contains("rate limit")
     }
 
     async fn read_bounded_bytes<R>(
@@ -588,7 +614,6 @@ impl Provider for CliProvider {
                 });
             }
 
-            let started_at = Instant::now();
             let mut debug_logs: Vec<String> = Vec::new();
             self.history.push(Message {
                 role: Role::User,
@@ -622,7 +647,9 @@ impl Provider for CliProvider {
 
             let bin = self.bin_name();
             let mut session_retried = false;
+            let mut transient_retries: u32 = 0;
             let (content, output_file_was_written) = 'cli: loop {
+                let started_at = Instant::now();
                 let mut codex_output_path: Option<PathBuf> = None;
                 let mut args: Vec<String> = match self.kind {
                     ProviderKind::Anthropic => {
@@ -717,7 +744,14 @@ impl Provider for CliProvider {
                     }
                 }
 
-                let mut child = match Command::new(bin)
+                // In test builds, allow overriding the spawned binary so tests
+                // can provide a fake executable without mutating process PATH.
+                #[cfg(test)]
+                let spawn_bin: &str = self.test_bin_path.as_deref().unwrap_or(bin);
+                #[cfg(not(test))]
+                let spawn_bin: &str = bin;
+
+                let mut child = match Command::new(spawn_bin)
                     .args(&args)
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
@@ -920,6 +954,37 @@ impl Provider for CliProvider {
                         self.emit_live_log("session conflict, retrying with --resume".into());
                         continue 'cli;
                     }
+
+                    // Transient API error: retry with exponential backoff.
+                    // The CLI tool does its own internal retries, so we only
+                    // add a small number of outer retries for transient failures
+                    // that the inner tool couldn't recover from.
+                    if transient_retries < CLI_TRANSIENT_MAX_RETRIES
+                        && Self::is_transient_cli_error(&stderr_result.text)
+                    {
+                        transient_retries += 1;
+                        let backoff = CLI_TRANSIENT_BASE_BACKOFF * 2u32.pow(transient_retries - 1);
+                        let msg = format!(
+                            "transient error detected (attempt {}/{}), retrying in {}s",
+                            transient_retries + 1,
+                            CLI_TRANSIENT_MAX_RETRIES + 1,
+                            backoff.as_secs(),
+                        );
+                        debug_logs.push(msg.clone());
+                        self.emit_live_log(msg);
+
+                        // The server may have created the session before the
+                        // error.  Mark session_started so the next attempt uses
+                        // --resume instead of --session-id.
+                        if self.kind == ProviderKind::Anthropic {
+                            self.session_started = true;
+                        }
+
+                        tokio::time::sleep(backoff).await;
+
+                        continue 'cli;
+                    }
+
                     self.reset_after_send_error();
                     let mut msg = format!("exit {}: {}", status, stderr_result.text);
                     let stdout_trimmed = stdout_text.trim();
@@ -1064,6 +1129,7 @@ impl Provider for CliProvider {
 mod tests {
     use super::{
         CliProvider, CLI_POST_EXIT_DRAIN_TIMEOUT, CLI_STDERR_MAX_BYTES, CLI_STDOUT_MAX_BYTES,
+        CLI_TRANSIENT_BASE_BACKOFF, CLI_TRANSIENT_MAX_RETRIES,
     };
     use crate::provider::ProviderKind;
     use serde_json::json;
@@ -1528,5 +1594,193 @@ not json
         assert!(path.to_string_lossy().contains("houseofagents-codex-last-"));
         assert!(args.contains(&"-o".to_string()));
         assert!(args.contains(&path.display().to_string()));
+    }
+
+    // -- Transient error detection tests --
+
+    #[test]
+    fn transient_detects_529_overloaded() {
+        assert!(CliProvider::is_transient_cli_error("Error: 529 Overloaded"));
+    }
+
+    #[test]
+    fn transient_detects_gateway_errors() {
+        assert!(CliProvider::is_transient_cli_error("502 Bad Gateway"));
+        assert!(CliProvider::is_transient_cli_error(
+            "503 Service Unavailable"
+        ));
+        assert!(CliProvider::is_transient_cli_error("HTTP 504 timeout"));
+    }
+
+    #[test]
+    fn transient_detects_overloaded_case_insensitive() {
+        assert!(CliProvider::is_transient_cli_error("Server Overloaded"));
+        assert!(CliProvider::is_transient_cli_error("OVERLOADED"));
+        assert!(CliProvider::is_transient_cli_error("overloaded"));
+    }
+
+    #[test]
+    fn transient_detects_rate_limit_case_insensitive() {
+        assert!(CliProvider::is_transient_cli_error("Rate Limit exceeded"));
+        assert!(CliProvider::is_transient_cli_error("rate limit hit"));
+        assert!(CliProvider::is_transient_cli_error("RATE LIMIT"));
+    }
+
+    #[test]
+    fn transient_rejects_non_transient_errors() {
+        assert!(!CliProvider::is_transient_cli_error("401 Unauthorized"));
+        assert!(!CliProvider::is_transient_cli_error("invalid API key"));
+        assert!(!CliProvider::is_transient_cli_error("permission denied"));
+        assert!(!CliProvider::is_transient_cli_error("already in use"));
+        assert!(!CliProvider::is_transient_cli_error(""));
+    }
+
+    #[test]
+    fn transient_retry_constants_and_backoff_schedule() {
+        assert_eq!(CLI_TRANSIENT_MAX_RETRIES, 2);
+        assert_eq!(CLI_TRANSIENT_BASE_BACKOFF, Duration::from_millis(50));
+        let b1 = CLI_TRANSIENT_BASE_BACKOFF * 2u32.pow(0);
+        let b2 = CLI_TRANSIENT_BASE_BACKOFF * 2u32.pow(1);
+        assert_eq!(b2, b1 * 2);
+    }
+
+    // -- Integration tests using test_bin_path --
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_retries_on_transient_error_then_succeeds() {
+        use crate::provider::Provider;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("call_count");
+        std::fs::write(&state_file, "0").unwrap();
+
+        let script = format!(
+            r#"#!/bin/sh
+COUNT=$(cat "{state}")
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "{state}"
+if [ "$COUNT" -le 1 ]; then
+    cat > /dev/null
+    echo "Error: 529 Overloaded" >&2
+    exit 1
+fi
+cat > /dev/null
+echo "retry succeeded"
+"#,
+            state = state_file.display(),
+        );
+        let script_path = dir.path().join("claude");
+        std::fs::write(&script_path, &script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut provider = CliProvider::new(
+            ProviderKind::Anthropic,
+            String::new(),
+            None,
+            None,
+            String::new(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        provider.test_bin_path = Some(script_path.to_string_lossy().into_owned());
+
+        let result = provider.send("test prompt").await;
+
+        let resp = result.expect("should succeed after retry");
+        assert!(resp.content.contains("retry succeeded"));
+        assert!(resp
+            .debug_logs
+            .iter()
+            .any(|l| l.contains("transient error detected")));
+        assert!(provider.session_started);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_exhausts_transient_retries_and_fails() {
+        use crate::provider::Provider;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let script = r#"#!/bin/sh
+cat > /dev/null
+echo "Error: 529 Overloaded" >&2
+exit 1
+"#;
+        let script_path = dir.path().join("claude");
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut provider = CliProvider::new(
+            ProviderKind::Anthropic,
+            String::new(),
+            None,
+            None,
+            String::new(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        provider.test_bin_path = Some(script_path.to_string_lossy().into_owned());
+
+        let result = provider.send("test prompt").await;
+
+        let err = result.expect_err("should fail after all retries");
+        assert!(err.to_string().contains("529"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_does_not_retry_non_transient_error() {
+        use crate::provider::Provider;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_file = dir.path().join("call_count");
+        std::fs::write(&state_file, "0").unwrap();
+
+        let script = format!(
+            r#"#!/bin/sh
+COUNT=$(cat "{state}")
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "{state}"
+cat > /dev/null
+echo "401 Unauthorized" >&2
+exit 1
+"#,
+            state = state_file.display(),
+        );
+        let script_path = dir.path().join("claude");
+        std::fs::write(&script_path, &script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut provider = CliProvider::new(
+            ProviderKind::Anthropic,
+            String::new(),
+            None,
+            None,
+            String::new(),
+            Vec::new(),
+            30,
+            50,
+            0,
+        );
+        provider.test_bin_path = Some(script_path.to_string_lossy().into_owned());
+
+        let result = provider.send("test prompt").await;
+
+        assert!(result.is_err());
+        let count: i32 = std::fs::read_to_string(&state_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(count, 1, "non-transient error should not trigger retry");
     }
 }

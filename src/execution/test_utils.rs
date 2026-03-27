@@ -161,6 +161,54 @@ impl Provider for SuccessThenPanicProvider {
     }
 }
 
+/// A mock provider that changes its session ID when send() returns an error,
+/// simulating CliProvider::reset_after_send_error() behavior.
+pub(crate) struct SessionMutatingProvider {
+    kind: ProviderKind,
+    session_id: String,
+    post_error_session_id: String,
+    error_message: String,
+}
+
+impl SessionMutatingProvider {
+    pub(crate) fn new(
+        kind: ProviderKind,
+        initial_id: &str,
+        post_error_id: &str,
+        error_message: &str,
+    ) -> Self {
+        Self {
+            kind,
+            session_id: initial_id.to_string(),
+            post_error_session_id: post_error_id.to_string(),
+            error_message: error_message.to_string(),
+        }
+    }
+}
+
+impl Provider for SessionMutatingProvider {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    fn clear_history(&mut self) {}
+
+    fn session_id(&self) -> Option<&str> {
+        Some(&self.session_id)
+    }
+
+    fn send(&mut self, _message: &str) -> SendFuture<'_> {
+        Box::pin(async move {
+            // Simulate reset_after_send_error changing the session ID
+            self.session_id = self.post_error_session_id.clone();
+            Err(AppError::Provider {
+                provider: "mock".to_string(),
+                message: self.error_message.clone(),
+            })
+        })
+    }
+}
+
 pub(crate) fn ok_response(content: &str) -> Result<CompletionResponse, AppError> {
     Ok(CompletionResponse {
         content: content.to_string(),
