@@ -3017,7 +3017,7 @@ fn write_text_results(
         // redundant syscall and any TOCTOU divergence from the path-based stat.
         let prealloc = file
             .metadata()
-            .map(|m| (m.len().min(file_cap) as usize + 1))
+            .map(|m| m.len().min(file_cap) as usize + 1)
             .unwrap_or(64 * 1024)
             .min(file_cap as usize + 1);
         let mut buf = Vec::with_capacity(prealloc);
