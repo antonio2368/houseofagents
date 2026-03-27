@@ -351,11 +351,13 @@ async fn evaluate_loop_break(
     total_passes: u32,
     sub_dag_blocks: &HashSet<BlockId>,
     loop_from: BlockId,
+    loop_to: BlockId,
     rt: &RuntimeReplicaTable,
     output: &crate::output::OutputManager,
     agent_configs: &PipelineAgentConfigs,
     provider_factory: &ProviderFactory,
     cancel: &Arc<AtomicBool>,
+    progress_tx: &mpsc::UnboundedSender<ProgressEvent>,
 ) -> bool {
     let (kind, cfg, _) = match agent_configs.get(break_agent) {
         Some(v) => v,
@@ -438,18 +440,70 @@ async fn evaluate_loop_break(
     }
 
     let mut provider = provider_factory(*kind, cfg);
+
+    let pre_send_session_id = provider.session_id().map(|s| s.to_string());
+
     let result = tokio::select! {
-        res = provider.send(&prompt) => res,
-        _ = wait_for_cancel(cancel) => return false,
+        res = provider.send(&prompt) => Some(res),
+        _ = wait_for_cancel(cancel) => None,
     };
+
+    let post_send_session_id = provider.session_id().map(|s| s.to_string());
+
+    // Log session ID: post-send on success, pre-send on error, nothing on cancel.
+    // This mirrors the main execution path pattern to avoid the phantom-session
+    // bug from reset_after_send_error().
+    //
+    // Use the runtime ID (not logical block ID) for BlockLog so the TUI
+    // running screen attributes the log line to the correct step row.
+    let break_eval_rid = rt
+        .logical_to_runtime
+        .get(&loop_from)
+        .and_then(|rids| rids.first().copied())
+        .unwrap_or(loop_from);
+    let log_sid = |sid: &str| {
+        let label = format!("BreakEval(loop {loop_from}->{loop_to})");
+        // Use "Session ID: " prefix to match is_notable_log() filter in running screen.
+        let _ = progress_tx.send(ProgressEvent::BlockLog {
+            block_id: break_eval_rid,
+            agent_name: break_agent.to_string(),
+            iteration: 1,
+            loop_pass: current_pass,
+            message: format!("Session ID: {sid}"),
+        });
+        if let Err(e) = output.append_session_entry(&label, break_agent, sid, None, None) {
+            let _ = progress_tx.send(ProgressEvent::BlockLog {
+                block_id: break_eval_rid,
+                agent_name: break_agent.to_string(),
+                iteration: 1,
+                loop_pass: current_pass,
+                message: format!("Failed to write break-eval session entry: {e}"),
+            });
+        }
+    };
+
     match result {
-        Ok(resp) => parse_break_decision(&resp.content),
-        // Evaluator is best-effort: on provider error, default to CONTINUE.
-        // The caller emits a LoopBreakEval progress event for visibility.
-        // We intentionally avoid append_error here because a non-empty
-        // _errors.log marks the entire run as failed, which is wrong for
-        // a non-fatal evaluator failure.
-        Err(_) => false,
+        Some(Ok(resp)) => {
+            if let Some(ref sid) = post_send_session_id {
+                log_sid(sid);
+            }
+            parse_break_decision(&resp.content)
+        }
+        Some(Err(_)) => {
+            // Evaluator is best-effort: on provider error, default to CONTINUE.
+            // The caller emits a LoopBreakEval progress event for visibility.
+            // We intentionally avoid append_error here because a non-empty
+            // _errors.log marks the entire run as failed, which is wrong for
+            // a non-fatal evaluator failure.
+            if let Some(ref sid) = pre_send_session_id {
+                log_sid(sid);
+            }
+            false
+        }
+        None => {
+            // Cancelled — don't log session (may not exist server-side)
+            false
+        }
     }
 }
 
@@ -3875,11 +3929,13 @@ async fn run_pipeline_with_provider_factory(
                                                 total,
                                                 &blocks,
                                                 loop_from,
+                                                loop_to,
                                                 &rt,
                                                 output,
                                                 &agent_configs,
                                                 &provider_factory,
                                                 &cancel,
+                                                &progress_tx,
                                             )
                                             .await;
 
@@ -5047,6 +5103,67 @@ fn write_finalization_toml(
     Ok(())
 }
 
+/// Log a finalization block's session ID to `_sessions.toml` and emit a TUI progress event.
+///
+/// Selects post-send ID on success, pre-send ID on error, nothing on cancel
+/// (matching the main DAG pattern to avoid the phantom-session bug).
+///
+/// **Note:** In batch-mode finalization, callers (`tui/execution.rs`, `headless.rs`)
+/// create a private `(fin_tx, fin_rx)` channel and drain it immediately, so the
+/// `BlockLog` events emitted here never reach the TUI running screen or headless
+/// JSON output. The `_sessions.toml` disk write still works. The progress events
+/// are only visible in single-run finalization mode.
+#[allow(clippy::too_many_arguments)]
+fn log_finalization_session(
+    result: &Option<Result<provider::CompletionResponse, AppError>>,
+    pre_send_session_id: &Option<String>,
+    post_send_session_id: &Option<String>,
+    progress_tx: &mpsc::UnboundedSender<ProgressEvent>,
+    rid: u32,
+    agent_name: &str,
+    display_label: &str,
+    output_root: &Path,
+    block_replicas: u32,
+    replica_index: u32,
+    block_id: BlockId,
+) {
+    let sid = match result {
+        Some(Ok(_)) => post_send_session_id.as_deref(),
+        Some(Err(_)) => pre_send_session_id.as_deref(),
+        None => None,
+    };
+    if let Some(sid) = sid {
+        let _ = progress_tx.send(ProgressEvent::BlockLog {
+            block_id: rid,
+            agent_name: agent_name.to_string(),
+            iteration: 1,
+            loop_pass: 0,
+            message: format!("Session ID: {sid}"),
+        });
+        let replica_field = if block_replicas > 1 {
+            Some(replica_index + 1)
+        } else {
+            None
+        };
+        if let Err(e) = crate::output::append_session_entry_to_path(
+            output_root,
+            display_label,
+            agent_name,
+            sid,
+            replica_field,
+            Some(block_id),
+        ) {
+            let _ = progress_tx.send(ProgressEvent::BlockLog {
+                block_id: rid,
+                agent_name: agent_name.to_string(),
+                iteration: 1,
+                loop_pass: 0,
+                message: format!("Failed to write session entry: {e}"),
+            });
+        }
+    }
+}
+
 /// Core finalization runner. Executes the finalization DAG after the execution phase completes.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_pipeline_finalization(
@@ -5322,6 +5439,8 @@ pub(crate) async fn run_pipeline_finalization(
                     let agent_name = entry.agent.clone();
                     let label = entry.display_label.clone();
 
+                    let pre_send_session_id = provider.session_id().map(|s| s.to_string());
+
                     let result = crate::execution::run_with_cancellation(
                         &mut *provider,
                         &full_message,
@@ -5358,6 +5477,22 @@ pub(crate) async fn run_pipeline_finalization(
                         },
                     )
                     .await;
+
+                    let post_send_session_id = provider.session_id().map(|s| s.to_string());
+
+                    log_finalization_session(
+                        &result,
+                        &pre_send_session_id,
+                        &post_send_session_id,
+                        &progress_tx,
+                        rid,
+                        &agent_name,
+                        &entry.display_label,
+                        output_root,
+                        block.replicas,
+                        entry.replica_index,
+                        block.id,
+                    );
 
                     match result {
                         Some(Ok(resp)) => {
@@ -5631,6 +5766,8 @@ pub(crate) async fn run_pipeline_finalization(
                 let agent_name = entry.agent.clone();
                 let label = entry.display_label.clone();
 
+                let pre_send_session_id = provider.session_id().map(|s| s.to_string());
+
                 let result = crate::execution::run_with_cancellation(
                     &mut *provider,
                     &full_message,
@@ -5667,6 +5804,22 @@ pub(crate) async fn run_pipeline_finalization(
                     },
                 )
                 .await;
+
+                let post_send_session_id = provider.session_id().map(|s| s.to_string());
+
+                log_finalization_session(
+                    &result,
+                    &pre_send_session_id,
+                    &post_send_session_id,
+                    &progress_tx,
+                    rid,
+                    &agent_name,
+                    &entry.display_label,
+                    output_root,
+                    block.replicas,
+                    entry.replica_index,
+                    block.id,
+                );
 
                 match result {
                     Some(Ok(resp)) => {
@@ -11540,5 +11693,471 @@ position = [0, 0]
                 .any(|e| matches!(e, ProgressEvent::BlockError { .. })),
             "expected a BlockError event"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Break-eval and finalization session logging integration tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn break_eval_session_id_written_to_sessions_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("break-sess")).unwrap();
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0), block(3, 2, 0)],
+            vec![conn(1, 2), conn(2, 3)],
+            vec![LoopConnection {
+                from: 2,
+                to: 1,
+                count: 5,
+                prompt: String::new(),
+                break_condition: "always break".into(),
+                break_agent: "Claude".into(),
+            }],
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let recv_clone = received.clone();
+        let counter = call_count.clone();
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move |_kind, _cfg| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::new(
+                    MockProvider::ok(ProviderKind::Anthropic, "BREAK", recv_clone.clone())
+                        .with_session_id(&format!("sess-{n}")),
+                ) as Box<dyn crate::provider::Provider>
+            }),
+        )
+        .await
+        .expect("pipeline should succeed");
+
+        let sessions_path = output.run_dir().join("_sessions.toml");
+        let content = std::fs::read_to_string(&sessions_path).expect("_sessions.toml must exist");
+        let parsed: toml::Value = toml::from_str(&content).expect("valid TOML");
+        let sessions = parsed
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .expect("sessions array");
+
+        let break_entries: Vec<&toml::Value> = sessions
+            .iter()
+            .filter(|s| {
+                s.get("block")
+                    .and_then(|b| b.as_str())
+                    .is_some_and(|b| b.starts_with("BreakEval(loop"))
+            })
+            .collect();
+
+        assert_eq!(
+            break_entries.len(),
+            1,
+            "exactly one BreakEval session entry expected (BREAK on first pass)"
+        );
+        for entry in &break_entries {
+            let sid = entry
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .expect("session_id");
+            assert!(!sid.is_empty(), "BreakEval session_id must not be empty");
+            assert!(
+                entry.get("block_id").is_none(),
+                "BreakEval should not have block_id"
+            );
+            assert!(
+                entry.get("replica").is_none(),
+                "BreakEval should not have replica"
+            );
+        }
+
+        let non_break: Vec<&toml::Value> = sessions
+            .iter()
+            .filter(|s| {
+                s.get("block")
+                    .and_then(|b| b.as_str())
+                    .is_some_and(|b| !b.starts_with("BreakEval"))
+            })
+            .collect();
+        assert!(
+            !non_break.is_empty(),
+            "main block session entries should also exist"
+        );
+
+        let break_sid = break_entries[0]
+            .get("session_id")
+            .unwrap()
+            .as_str()
+            .unwrap();
+        let main_sids: Vec<&str> = non_break
+            .iter()
+            .filter_map(|e| e.get("session_id").and_then(|v| v.as_str()))
+            .collect();
+        assert!(
+            main_sids.iter().any(|&s| s != break_sid),
+            "BreakEval session_id ({break_sid}) should differ from at least one main block's ({main_sids:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalization_session_id_written_both_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_root = dir.path().to_path_buf();
+
+        let mut def = def_with(vec![block(1, 0, 0)], vec![]);
+        def.finalization_blocks = vec![
+            PipelineBlock {
+                id: 10,
+                name: "RunSummary".into(),
+                agents: vec!["Claude".into()],
+                prompt: "summarize per run".into(),
+                profiles: vec![],
+                session_id: None,
+                position: (0, 1),
+                replicas: 1,
+                sub_pipeline: None,
+            },
+            PipelineBlock {
+                id: 20,
+                name: "GlobalSummary".into(),
+                agents: vec!["Claude".into()],
+                prompt: "summarize all runs".into(),
+                profiles: vec![],
+                session_id: None,
+                position: (1, 1),
+                replicas: 1,
+                sub_pipeline: None,
+            },
+        ];
+        def.data_feeds = vec![
+            DataFeed {
+                from: WILDCARD_BLOCK_ID,
+                to: 10,
+                collection: FeedCollection::LastPass,
+                granularity: FeedGranularity::PerRun,
+            },
+            DataFeed {
+                from: WILDCARD_BLOCK_ID,
+                to: 20,
+                collection: FeedCollection::LastPass,
+                granularity: FeedGranularity::AllRuns,
+            },
+        ];
+
+        assert!(def.is_per_run_finalization_block(10));
+        assert!(!def.is_per_run_finalization_block(20));
+
+        let run1_dir = output_root.join("run_1");
+        std::fs::create_dir_all(&run1_dir).unwrap();
+        let exec_rt = build_runtime_table(&def);
+        for entry in &exec_rt.entries {
+            std::fs::write(
+                run1_dir.join(format!("{}.md", entry.filename_stem)),
+                "execution output from block 1",
+            )
+            .unwrap();
+        }
+
+        let agent_configs: PipelineAgentConfigs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let factory: ProviderFactory = Arc::new(|_kind, _cfg| {
+            Box::new(
+                MockProvider::ok(
+                    ProviderKind::Anthropic,
+                    "fin output",
+                    Arc::new(Mutex::new(Vec::new())),
+                )
+                .with_session_id("fin-sess-XYZ"),
+            ) as Box<dyn crate::provider::Provider>
+        });
+
+        let fin_scope = FinalizationRunScope::Batch {
+            successful_runs: vec![(1, run1_dir)],
+        };
+
+        run_pipeline_finalization(
+            &def,
+            fin_scope,
+            &exec_rt,
+            agent_configs,
+            &output_root,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            factory,
+        )
+        .await
+        .expect("finalization should succeed");
+
+        let sessions_path = output_root.join("_sessions.toml");
+        let content = std::fs::read_to_string(&sessions_path).expect("_sessions.toml must exist");
+        let parsed: toml::Value = toml::from_str(&content).expect("valid TOML");
+        let sessions = parsed
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .expect("sessions array");
+
+        let fin10: Vec<&toml::Value> = sessions
+            .iter()
+            .filter(|s| s.get("block_id").and_then(|v| v.as_integer()) == Some(10))
+            .collect();
+        let fin20: Vec<&toml::Value> = sessions
+            .iter()
+            .filter(|s| s.get("block_id").and_then(|v| v.as_integer()) == Some(20))
+            .collect();
+
+        assert_eq!(fin10.len(), 1, "per-run fin block 10 should have one entry");
+        assert_eq!(
+            fin20.len(),
+            1,
+            "all-runs fin block 20 should have one entry"
+        );
+
+        assert_eq!(
+            fin10[0].get("session_id").unwrap().as_str().unwrap(),
+            "fin-sess-XYZ"
+        );
+        assert_eq!(
+            fin20[0].get("session_id").unwrap().as_str().unwrap(),
+            "fin-sess-XYZ"
+        );
+
+        let label10 = fin10[0].get("block").unwrap().as_str().unwrap();
+        assert!(
+            label10.contains("[run 1]"),
+            "per-run label should have [run 1], got: {label10}"
+        );
+        assert!(
+            label10.starts_with("Fin:"),
+            "per-run label should start with 'Fin:', got: {label10}"
+        );
+
+        let label20 = fin20[0].get("block").unwrap().as_str().unwrap();
+        assert!(
+            !label20.contains("[run"),
+            "all-runs label should not have [run N], got: {label20}"
+        );
+        assert!(
+            label20.starts_with("Fin:"),
+            "all-runs label should start with 'Fin:', got: {label20}"
+        );
+
+        assert!(fin10[0].get("replica").is_none());
+        assert!(fin20[0].get("replica").is_none());
+
+        // Verify log_finalization_session emits "Session ID:" progress events
+        let events = collect_progress_events(rx);
+        let session_logs: Vec<&ProgressEvent> = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    ProgressEvent::BlockLog { message, .. }
+                    if message.contains("Session ID: fin-sess-XYZ")
+                )
+            })
+            .collect();
+        assert!(
+            session_logs.len() >= 2,
+            "at least 2 finalization session log events (one per phase), got {}",
+            session_logs.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn finalization_error_path_uses_pre_send_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_root = dir.path().to_path_buf();
+
+        let mut def = def_with(vec![block(1, 0, 0)], vec![]);
+        def.finalization_blocks = vec![PipelineBlock {
+            id: 10,
+            name: "Summary".into(),
+            agents: vec!["Claude".into()],
+            prompt: "summarize".into(),
+            profiles: vec![],
+            session_id: None,
+            position: (0, 1),
+            replicas: 1,
+            sub_pipeline: None,
+        }];
+        def.data_feeds = vec![DataFeed {
+            from: WILDCARD_BLOCK_ID,
+            to: 10,
+            collection: FeedCollection::LastPass,
+            granularity: FeedGranularity::PerRun,
+        }];
+
+        let exec_rt = build_runtime_table(&def);
+        for entry in &exec_rt.entries {
+            std::fs::write(
+                output_root.join(format!("{}.md", entry.filename_stem)),
+                "exec output",
+            )
+            .unwrap();
+        }
+
+        let agent_configs: PipelineAgentConfigs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let factory: ProviderFactory = Arc::new(|_kind, _cfg| {
+            Box::new(SessionMutatingProvider::new(
+                ProviderKind::Anthropic,
+                "real-fin-sess",
+                "phantom-fin-sess",
+                "simulated failure",
+            )) as Box<dyn crate::provider::Provider>
+        });
+
+        let fin_scope = FinalizationRunScope::SingleRun {
+            run_id: 1,
+            run_dir: output_root.clone(),
+        };
+
+        let result = run_pipeline_finalization(
+            &def,
+            fin_scope,
+            &exec_rt,
+            agent_configs,
+            &output_root,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            factory,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "finalization should return Err when provider fails"
+        );
+
+        let sessions_path = output_root.join("_sessions.toml");
+        let content = std::fs::read_to_string(&sessions_path).expect("_sessions.toml must exist");
+        assert!(
+            content.contains("real-fin-sess"),
+            "should contain pre-send session ID, got: {content}"
+        );
+        assert!(
+            !content.contains("phantom-fin-sess"),
+            "must NOT contain phantom session ID, got: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_session_entries_for_break_eval_when_provider_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = OutputManager::new(dir.path(), Some("no-session")).unwrap();
+        let def = def_with_loops(
+            vec![block(1, 0, 0), block(2, 1, 0)],
+            vec![conn(1, 2)],
+            vec![LoopConnection {
+                from: 2,
+                to: 1,
+                count: 2,
+                prompt: String::new(),
+                break_condition: "always break".into(),
+                break_agent: "Claude".into(),
+            }],
+        );
+
+        let agent_configs = HashMap::from([(
+            "Claude".to_string(),
+            (
+                ProviderKind::Anthropic,
+                ProviderConfig {
+                    api_key: String::new(),
+                    model: "test".to_string(),
+                    reasoning_effort: None,
+                    thinking_effort: None,
+                    use_cli: false,
+                    extra_cli_args: String::new(),
+                },
+                false,
+            ),
+        )]);
+        let context = PromptRuntimeContext::new(def.initial_prompt.clone(), false);
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let recv_clone = received.clone();
+        run_pipeline_with_provider_factory(
+            &def,
+            0,
+            agent_configs,
+            &context,
+            &output,
+            tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move |_kind, _cfg| {
+                Box::new(MockProvider::ok(
+                    ProviderKind::Anthropic,
+                    "BREAK",
+                    recv_clone.clone(),
+                )) as Box<dyn crate::provider::Provider>
+            }),
+        )
+        .await
+        .expect("pipeline should succeed");
+
+        let sessions_path = output.run_dir().join("_sessions.toml");
+        if sessions_path.exists() {
+            let content = std::fs::read_to_string(&sessions_path).unwrap();
+            assert!(
+                !content.contains("BreakEval"),
+                "no BreakEval session entries should be written when providers return None, got: {content}"
+            );
+        }
     }
 }

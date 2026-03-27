@@ -611,34 +611,49 @@ impl OutputManager {
         replica: Option<u32>,
         block_id: Option<u32>,
     ) -> Result<(), AppError> {
-        use std::fmt::Write as _;
-        use std::io::Write;
-        let mut entry = String::with_capacity(128);
-        writeln!(entry, "[[sessions]]").unwrap();
-        writeln!(entry, "block = {}", toml::Value::String(block.to_string())).unwrap();
-        if let Some(id) = block_id {
-            writeln!(entry, "block_id = {id}").unwrap();
-        }
-        writeln!(entry, "agent = {}", toml::Value::String(agent.to_string())).unwrap();
-        if let Some(r) = replica {
-            writeln!(entry, "replica = {r}").unwrap();
-        }
-        writeln!(
-            entry,
-            "session_id = {}",
-            toml::Value::String(session_id.to_string())
-        )
-        .unwrap();
-        writeln!(entry).unwrap();
-
-        let path = self.run_dir.join("_sessions.toml");
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        file.write_all(entry.as_bytes())?;
-        Ok(())
+        append_session_entry_to_path(&self.run_dir, block, agent, session_id, replica, block_id)
     }
+}
+
+/// Append a session entry to `_sessions.toml` inside `dir`.
+///
+/// Standalone version of [`OutputManager::append_session_entry`] for use
+/// where only a directory path is available (e.g. finalization blocks).
+pub(crate) fn append_session_entry_to_path(
+    dir: &Path,
+    block: &str,
+    agent: &str,
+    session_id: &str,
+    replica: Option<u32>,
+    block_id: Option<u32>,
+) -> Result<(), AppError> {
+    use std::fmt::Write as _;
+    use std::io::Write;
+    let mut entry = String::with_capacity(128);
+    writeln!(entry, "[[sessions]]").unwrap();
+    writeln!(entry, "block = {}", toml::Value::String(block.to_string())).unwrap();
+    if let Some(id) = block_id {
+        writeln!(entry, "block_id = {id}").unwrap();
+    }
+    writeln!(entry, "agent = {}", toml::Value::String(agent.to_string())).unwrap();
+    if let Some(r) = replica {
+        writeln!(entry, "replica = {r}").unwrap();
+    }
+    writeln!(
+        entry,
+        "session_id = {}",
+        toml::Value::String(session_id.to_string())
+    )
+    .unwrap();
+    writeln!(entry).unwrap();
+
+    let path = dir.join("_sessions.toml");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(entry.as_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1224,6 +1239,43 @@ mod tests {
         let first_block = content.find(r#"block = "Researcher""#).unwrap();
         let second_block = content.find(r#"block = "Writer""#).unwrap();
         let between = &content[first_block..second_block];
+        assert!(!between.contains("replica"));
+        assert!(!between.contains("block_id"));
+    }
+
+    #[test]
+    fn append_session_entry_to_path_writes_toml() {
+        let dir = tempdir().expect("tempdir");
+        append_session_entry_to_path(
+            dir.path(),
+            "BreakEval(loop 2->1)",
+            "claude-agent",
+            "break-sess-1",
+            None,
+            None,
+        )
+        .expect("append");
+        append_session_entry_to_path(
+            dir.path(),
+            "Fin: Summary",
+            "gpt-agent",
+            "fin-sess-2",
+            Some(1),
+            Some(10),
+        )
+        .expect("append");
+        let content = std::fs::read_to_string(dir.path().join("_sessions.toml")).expect("read");
+        assert!(content.contains("[[sessions]]"));
+        assert!(content.contains(r#"block = "BreakEval(loop 2->1)""#));
+        assert!(content.contains(r#"session_id = "break-sess-1""#));
+        assert!(content.contains(r#"block = "Fin: Summary""#));
+        assert!(content.contains("block_id = 10"));
+        assert!(content.contains("replica = 1"));
+        assert!(content.contains(r#"session_id = "fin-sess-2""#));
+        // First entry should have no replica or block_id field
+        let first = content.find("BreakEval").unwrap();
+        let second = content.find("Fin: Summary").unwrap();
+        let between = &content[first..second];
         assert!(!between.contains("replica"));
         assert!(!between.contains("block_id"));
     }
